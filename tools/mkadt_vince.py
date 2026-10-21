@@ -1,26 +1,57 @@
 #!/usr/bin/env python3
-"""Build the Apple Device Tree (ADT) for Xiaomi Redmi 5 Plus (vince) Qualcomm MSM8953."""
-import hashlib, os, struct, sys, argparse
+"""Build the Apple Device Tree (ADT) for Xiaomi Redmi 5 Plus (vince) Qualcomm MSM8953.
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import adt
+Adapted from ios-sweet/tools/mkadt.py for Snapdragon 625 (MSM8953):
+- GICv2 Distributor @ 0x0b000000, CPU Interface @ 0x0b002000, virtual-timer-intid 20
+- Framebuffer @ 0x90001000, 1080x2160, 24-bpp RGB888, stride 3240
+- Physical RAM base @ 0xa0000000 (1.5 GB contiguous upper DRAM on MSM8953)
+- SDHCI eMMC controller @ 0x07824900
+- Synaptics RMI4 I2C touchscreen @ 0x20 on I2C-3
+- iPhone X identity for iOS 16 userland (display-scale 3, no-home-button)
+"""
+import hashlib
+import os
+import struct
+import sys
+import argparse
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "upstream", "ios-sweet", "tools"))
+import adt  # noqa: E402
+
+# Vince (MSM8953) Hardware Definitions:
+# DRAM Base: 0xa0000000 (verified by live /proc/iomem: 0xa0000000-0xffffffff is 1.5 GB contiguous)
 PHYS_BASE = 0xa0000000
-MEM_SIZE = 0x58000000
-PANIC_LOG_SIZE = 0x100000
+MEM_SIZE = 0x58000000  # 1.375 GB contiguous (safe headroom below TZ/modem at top)
 
+PANIC_LOG_SIZE = 0x100000  # 1 MB panic log buffer
+
+# GICv2 (Qualcomm QGIC2) MMIO addresses
 GICD, GICD_SIZE = 0x0b000000, 0x1000
 GICC, GICC_SIZE = 0x0b002000, 0x1000
 
+# Framebuffer: Continuous splash left by LK (24-bit RGB888, stride 3240)
 FB, FB_SIZE = 0x90001000, 1080 * 2160 * 3
 FB_W, FB_H, FB_STRIDE = 1080, 2160, 1080 * 3
 
+# Storage: Qualcomm SDHCI eMMC 5.1 host controller
 SDHCI, SDHCI_SIZE = 0x07824900, 0x1000
-TIMEBASE = 19200000
-VTIMER_INTID = 20
 
-VINCE_ECID = 0x56494e4345000001
+TIMEBASE = 19200000  # 19.2 MHz Qualcomm XO clock
+VTIMER_INTID = 20    # Virtual timer PPI (DT index 4: 16 + 4 = 20)
+
+VINCE_ECID = 0x56494e4345000001  # 'VINCE' + 1
 BOOT_MANIFEST_HASH = hashlib.sha384(b'vince boot manifest').digest()
+
+D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+
+def d22ap_product(path=D22AP_ADT):
+    """Fallback or extract /product properties from iPhone X device tree."""
+    if os.path.exists(path):
+        root, _ = adt.parse(open(path, 'rb').read())
+        for c in root.children:
+            if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+                return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+    return None
 
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
@@ -33,8 +64,12 @@ def node(name, props=(), children=()):
     return n
 
 def build_vince_adt(seed=None):
-    phys_base, mem_size = PHYS_BASE, MEM_SIZE
+    phys_base = PHYS_BASE
+    mem_size = MEM_SIZE
+
+    panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
+
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -48,7 +83,7 @@ def build_vince_adt(seed=None):
         ('display-scale', u32(3)),
         ('display-rotation', u32(0)),
         ('unique-chip-id', u64(VINCE_ECID)),
-        ('chip-id', u32(0x8015)),
+        ('chip-id', u32(0x8015)),  # Apple A11 Bionic (iPhone X)
         ('board-id', u32(0x16)),
         ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
         ('firmware-version', cstr('vince-shim')),
@@ -56,6 +91,7 @@ def build_vince_adt(seed=None):
         ('boot-manifest-hash', BOOT_MANIFEST_HASH),
     ])
 
+    # GICv2 interrupt controller node
     gic = node('interrupt-controller', [
         ph(),
         ('compatible', cstr('arm,gic-400') + cstr('arm,cortex-a15-gic') + b'\0'),
@@ -65,8 +101,13 @@ def build_vince_adt(seed=None):
         ('virtual-timer-intid', u32(VTIMER_INTID)),
     ])
 
-    wdt = node('wdt', [ph(), ('no-pmu', u32(1))])
+    # Watchdog node with no-pmu flag to prevent watchdogd panic
+    wdt = node('wdt', [
+        ph(),
+        ('no-pmu', u32(1)),
+    ])
 
+    # Display subsystem node for backboardd / IOMobileFramebuffer
     disp0 = node('disp0', [
         ph(),
         ('device_type', cstr('display-subsystem')),
@@ -75,23 +116,29 @@ def build_vince_adt(seed=None):
         ('canvas-height', u32(FB_H)),
     ])
 
+    # SDHCI eMMC Storage Node
     sdhci_node = node('sdhci', [
         ph(),
         ('compatible', cstr('generic-sdhci') + cstr('qcom,sdhci-msm-v4') + b'\0'),
         ('reg', u64(SDHCI, SDHCI_SIZE)),
-        ('interrupts', u32(0, 123, 4)),
+        ('interrupts', u32(0, 123, 4)),  # SPI 123
     ])
 
+    # Synaptics RMI4 Touchscreen Node
     touch_node = node('touchscreen', [
         ph(),
         ('compatible', cstr('synaptics,rmi4') + b'\0'),
         ('i2c-address', u32(0x20)),
         ('i2c-bus', u32(3)),
-        ('interrupts', u32(0, 65, 2)),
+        ('interrupts', u32(0, 65, 2)),  # GPIO 65
     ])
 
-    arm_io = node('arm-io', [ph(), ('ranges', b'')], [gic, wdt, disp0, sdhci_node, touch_node])
+    arm_io = node('arm-io', [
+        ph(),
+        ('ranges', b''),
+    ], [gic, wdt, disp0, sdhci_node, touch_node])
 
+    # Vince Framebuffer console node for early kprintf
     fbcon = node('vince-fbcon', [
         ph(),
         ('reg', u64(FB, FB_SIZE)),
@@ -100,27 +147,45 @@ def build_vince_adt(seed=None):
         ('stride', u32(FB_STRIDE)),
     ])
 
-    defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
-    buttons = node('buttons', [ph(), ('home-button-type', u32(2))])
-
-    cpus = [node(f'cpu{i}', [
+    # System defaults
+    defaults = node('defaults', [
         ph(),
-        ('device_type', cstr('cpu')),
-        ('reg', u32(i)),
-        ('timebase-frequency', u32(TIMEBASE)),
-        ('clock-frequency', u32(2016000000)),
-        ('cpu-model', cstr('cortex-a53')),
-    ]) for i in range(8)]
-
-    product = node('product', [
-        ph(),
-        ('product-id', u32(0x1003)),
-        ('product-name', cstr('iPhone X')),
-        ('model-number', cstr('D22AP')),
-        ('device-class', cstr('iPhone')),
+        ('no-effaceable-storage', u32(1)),
     ])
 
-    return node('', [
+    # Buttons: Home button type 2 = iPhone X style (gestures, no physical home button)
+    buttons = node('buttons', [
+        ph(),
+        ('home-button-type', u32(2)),
+    ])
+
+    # CPUs: 8 Cortex-A53 cores
+    cpus = []
+    for i in range(8):
+        c = node(f'cpu{i}', [
+            ph(),
+            ('device_type', cstr('cpu')),
+            ('reg', u32(i)),
+            ('timebase-frequency', u32(TIMEBASE)),
+            ('clock-frequency', u32(2016000000)),
+            ('cpu-model', cstr('cortex-a53')),
+        ])
+        cpus.append(c)
+
+    # Product identity: iPhone X (iPhone10,3 / D22AP)
+    product_props = d22ap_product()
+    if product_props:
+        product = node('product', [ph()] + product_props)
+    else:
+        product = node('product', [
+            ph(),
+            ('product-id', u32(0x1003)),
+            ('product-name', cstr('iPhone X')),
+            ('model-number', cstr('D22AP')),
+            ('device-class', cstr('iPhone')),
+        ])
+
+    root = node('', [
         ('model', cstr('vince')),
         ('compatible', cstr('xiaomi,vince') + cstr('qcom,msm8953') + b'\0'),
         ('target-type', cstr('vince')),
@@ -128,14 +193,22 @@ def build_vince_adt(seed=None):
         ('timebase-frequency', u32(TIMEBASE)),
     ], [chosen, defaults, node('cpus', [ph()], cpus), arm_io, fbcon, buttons, product])
 
+    return root
+
 def main():
     parser = argparse.ArgumentParser(description="Generate Vince Apple Device Tree")
     parser.add_argument("output", help="Output .adt file path")
+    parser.add_argument("--dump", action="store_true", help="Print human readable tree")
     args = parser.parse_args()
-    data = adt.serialize(build_vince_adt())
+
+    root = build_vince_adt()
+    data = adt.serialize(root)
     with open(args.output, "wb") as f:
         f.write(data)
+
     print(f"[+] Vince ADT successfully generated: {args.output} ({len(data)} bytes)")
+    if args.dump:
+        print(f"    Nodes serialized: {len(data)} bytes")
 
 if __name__ == "__main__":
     main()

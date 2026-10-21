@@ -1,9 +1,5 @@
-#ifndef FDT_H
-#define FDT_H
+#pragma once
 #include <stdint.h>
 
-int fdt_check_header(const void *fdt);
-const void *fdt_getprop(const void *fdt, int nodeoffset, const char *name, int *lenp);
-int fdt_path_offset(const void *fdt, const char *path);
-
-#endif
+/* Read a u32/u64 (cell-size agnostic) property of /chosen. Returns 0 if absent. */
+int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out);
