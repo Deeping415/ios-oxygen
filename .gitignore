@@ -1,0 +1,12 @@
+# Build and local test artifacts
+artifacts/
+build/
+out/
+*.img
+*.payload
+*.adt
+*.o
+*.a
+*.dSYM
+*.log
+.DS_Store
