@@ -93,23 +93,27 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
-@@ -2,12 +2,16 @@
+@@ -2,6 +2,19 @@
   * Bootstrap console for Qualcomm platforms (vince / sweet).
   */
  #include <arm64/sweet_early.h>
- 
- void
- sweet_early_relocate(uint64_t base)
- {
- 	sweet_early_mark(8, "leaving bootstrap TTBR0");
++
++void
++sweet_early_relocate(uint64_t base)
++{
++	sweet_early_mark(8, "leaving bootstrap TTBR0");
 +#if defined(VINCE)
 +	early_fb = (volatile uint8_t *)(uintptr_t)(base + 0x1000);
 +#else
- 	early_fb = (volatile uint8_t *)(uintptr_t)base;
++	early_fb = (volatile uint8_t *)(uintptr_t)base;
 +#endif
- 	__asm__ volatile("dsb sy" ::: "memory");
- 	sweet_early_mark(9, "kernel framebuffer VA live");
- }
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_early_mark(9, "kernel framebuffer VA live");
++}
+ 
+ #if defined(VINCE) || defined(SWEET)
+ #include <stdint.h>
+
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
