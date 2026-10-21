@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..6c63bbd
 --- /dev/null
 +++ b/config/MASTER.arm64.vince
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,111 @@
 +#
 +# vince (Redmi 5 Plus, MSM8953): MASTER.arm64.MacOSX plus open-source
 +# arm64 assembly and pmap (nos_arm_asm, nos_arm_pmap).

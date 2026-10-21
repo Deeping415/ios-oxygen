@@ -2,7 +2,7 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 index 997a4ab..db26bbe 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -697,6 +697,162 @@ register_serial_functions(struct pe_serial_functions *fns)
+@@ -697,6 +697,160 @@ register_serial_functions(struct pe_serial_functions *fns)
  	gPESF = fns;
  }
  

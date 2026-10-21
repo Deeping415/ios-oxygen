@@ -1,6 +1,6 @@
 --- a/bsd/net/rtsock.c
 +++ b/bsd/net/rtsock.c
-@@ -510,6 +510,25 @@
+@@ -510,7 +510,26 @@
  		SIN6(info.rti_info[RTAX_DST])->sin6_addr.s6_addr16[1] = 0;
  	}
  

@@ -1,6 +1,6 @@
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -691,6 +691,12 @@
+@@ -691,7 +691,13 @@
  	bsd_init_kprintf("calling vfsinit\n");
  	vfsinit();
  
@@ -227,7 +227,7 @@
  }
  
  static const amfi_t sweet_amfi = {
-@@ -170,7 +242,52 @@
+@@ -170,8 +242,53 @@
  sweet_amfi_register(void)
  {
  	amfi_interface_register(&sweet_amfi);
@@ -283,7 +283,7 @@
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -10,3 +10,4 @@
+@@ -10,4 +10,5 @@
  iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
  
  iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp

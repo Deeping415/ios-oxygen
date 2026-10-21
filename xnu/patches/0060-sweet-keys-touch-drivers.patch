@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -106,6 +106,8 @@
+@@ -106,7 +106,9 @@
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
  bsd/dev/sweet_sample.c			standard
@@ -20,7 +20,7 @@
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -599,6 +601,9 @@
+@@ -599,7 +601,10 @@
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
  	sweet_sample_start();
@@ -32,7 +32,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_keys.c
-@@ -0,0 +1,182 @@
+@@ -0 +1,183 @@
 +/*
 + * Minimal polled SWEET keys. Call once after the scheduler is running.
 + * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.

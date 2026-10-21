@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -105,6 +105,7 @@
+@@ -105,7 +105,8 @@
  
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
@@ -18,7 +18,7 @@
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -597,6 +598,7 @@
+@@ -597,7 +598,8 @@
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
@@ -28,7 +28,7 @@
  
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -971,6 +971,56 @@
+@@ -971,7 +971,57 @@
  	printf("STR done: %llu KiB scanned, %d strings\n", scanned >> 10, lines);
  	kfree_data(buf, 65536);
  }
@@ -96,7 +96,7 @@
   * "-" turns it off) are printed as "IOK name: ...", at most 400 lines per
   * boot, to find out what a daemon looks for before it gives up.
   */
-@@ -2616,7 +2616,7 @@
+@@ -2616,8 +2616,8 @@
  {
  	if (!sweet_iolog_parsed) {
  		if (!PE_parse_boot_argn("sweetiolog", sweet_iolog_names, sizeof(sweet_iolog_names))) {
@@ -115,7 +115,7 @@
  
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  void
-@@ -224,6 +225,10 @@
+@@ -224,7 +225,11 @@
  {
  	uint32_t mask = get32(rec, 0x104);
  

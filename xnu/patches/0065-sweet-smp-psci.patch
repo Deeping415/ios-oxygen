@@ -212,7 +212,7 @@
  	unsigned int aff0 = mpidr & 0xff;
  	if (aff0 >= 16) {
  		panic("SWEET CPU: SGI target requires unsupported range selector");
-@@ -146,9 +229,25 @@
+@@ -146,10 +229,26 @@
  }
  
  kern_return_t
@@ -262,7 +262,7 @@
  #if defined(KERNEL_INTEGRITY_CTRR)
  
  		/* First CPU being started within a cluster goes ahead to lock CTRR for cluster;
-@@ -950,6 +963,21 @@
+@@ -950,7 +963,22 @@
  }
  
  
@@ -303,7 +303,7 @@
  	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
  	// so that we trigger a panic later in the boot process, once serial is enabled.
  	if (cpus_boot_arg_present && cpumask_boot_arg_present) {
-@@ -1077,8 +1087,14 @@
+@@ -1077,9 +1087,15 @@
  		}
  #endif
  
@@ -388,7 +388,7 @@
  	.align 2
  	.globl EXT(resume_idle_cpu)
  LEXT(resume_idle_cpu)
-@@ -743,6 +793,12 @@
+@@ -743,7 +793,13 @@
  	ic		iallu
  #endif
  

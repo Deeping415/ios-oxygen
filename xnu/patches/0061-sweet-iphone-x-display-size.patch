@@ -76,7 +76,7 @@
  		if (w > (int32_t)s->width - sx) {
  			w = (int32_t)s->width - sx;
  		}
-@@ -444,8 +479,8 @@
+@@ -444,9 +479,9 @@
  		outCount = 1;
  		break;
  	case kSweetFBGetDisplaySize:

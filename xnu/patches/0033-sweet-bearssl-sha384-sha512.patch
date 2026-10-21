@@ -1,6 +1,6 @@
 --- a/libkern/conf/files
 +++ b/libkern/conf/files
-@@ -109,6 +109,9 @@
+@@ -109,7 +109,10 @@
  libkern/crypto/sweet_sha1.c	optional crypto
  libkern/crypto/sweet_dec32be.c	optional crypto
  libkern/crypto/sweet_enc32be.c	optional crypto
@@ -12,7 +12,7 @@
  libkern/crypto/corecrypto_rsa.c		    optional crypto
 --- a/libkern/conf/Makefile.template
 +++ b/libkern/conf/Makefile.template
-@@ -53,6 +53,15 @@
+@@ -53,7 +53,16 @@
  sweet_dec32be.o_CFLAGS_ADD += -mgeneral-regs-only
  sweet_enc32be.o_CFLAGS_ADD += -mgeneral-regs-only
  corecrypto_sha1.o_CFLAGS_ADD += -mgeneral-regs-only
@@ -93,7 +93,7 @@
  void
  SHA384_Init(SHA384_CTX *ctx)
  {
-@@ -147,6 +194,8 @@
+@@ -147,7 +194,9 @@
  	ccdigest_final(di, ctx->ctx, digest);
  }
  
@@ -104,14 +104,14 @@
  /* As these are part of the KPI, we need to stub them out for any kernel configuration that does not support SHA2. */
 --- /dev/null
 +++ b/libkern/crypto/sweet_sha2big.c
-@@ -0,0 +1,4 @@
+@@ -0 +1,5 @@
 +/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include "sweet_bearssl/src/hash/sha2big.c"
 +#endif
 --- /dev/null
 +++ b/libkern/crypto/sweet_dec64be.c
-@@ -0,0 +1,4 @@
+@@ -0 +1,5 @@
 +/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include "sweet_bearssl/src/codec/dec64be.c"

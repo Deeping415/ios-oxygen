@@ -22,7 +22,7 @@
  	case kAKSUnloadSessionBags:
  	case kAKSNotifyStateSet:
  		args->scalarOutputCount = 0;
-@@ -220,6 +223,7 @@
+@@ -220,7 +223,8 @@
  		args->scalarOutputCount = 1;
  		break;
  	case kAKSGetDeviceState:
@@ -41,7 +41,7 @@
  		int n;
  		uint64_t fp;
  
-@@ -1005,7 +1005,7 @@
+@@ -1005,8 +1005,8 @@
  		fp = get_saved_state_fp(ss);
  		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
  		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));

@@ -1,6 +1,6 @@
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -15,3 +15,7 @@
+@@ -15,4 +15,8 @@
  iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
  iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
  iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
@@ -10,7 +10,7 @@
 +iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -67,6 +67,16 @@
+@@ -67,7 +67,17 @@
      "     'IOProviderClass' = IOPlatformDevice;"
      "     'IONameMatch'     = 'sweet,display';"
      "   },"
@@ -29,7 +29,7 @@
      "     'IOClass'         = IOPanicPlatform;"
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/AppleHIDUsageTables.h
-@@ -0,0 +1,22 @@
+@@ -0 +1,23 @@
 +/*
 + * @APPLE_LICENSE_HEADER_START@
 + * 
@@ -54,7 +54,7 @@
 + */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOGraphicsTypes.h
-@@ -0,0 +1,22 @@
+@@ -0 +1,23 @@
 +/*
 + * SWEET: the two IOGraphics types the HID headers use (IOGraphicsFamily
 + * is not part of xnu). Layouts as in IOKit/graphics/IOGraphicsTypes.h.
@@ -79,7 +79,7 @@
 +#endif /* _IOKIT_IOGRAPHICSTYPES_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDDebug.h
-@@ -0,0 +1,31 @@
+@@ -0 +1,32 @@
 +//
 +//  IOHIDDebug.h
 +//  IOHIDFamily
@@ -113,7 +113,7 @@
 +
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDDeviceKeys.h
-@@ -0,0 +1,228 @@
+@@ -0 +1,229 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -344,7 +344,7 @@
 +#endif /* IOHIDDeviceKeys_h */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDDeviceTypes.h
-@@ -0,0 +1,311 @@
+@@ -0 +1,312 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -658,7 +658,7 @@
 +#endif /* IOHIDDeviceTypes_h */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEvent.cpp
-@@ -0,0 +1,1814 @@
+@@ -0 +1,1815 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -2475,7 +2475,7 @@
 +}
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEvent.h
-@@ -0,0 +1,483 @@
+@@ -0 +1,484 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -2961,7 +2961,7 @@
 +#endif /* _IOKIT_IOHIDEVENT_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventData.h
-@@ -0,0 +1,254 @@
+@@ -0 +1,255 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -3218,7 +3218,7 @@
 +#endif /* _IOKIT_HID_IOHIDEVENTDATA_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventFieldDefs.h
-@@ -0,0 +1,324 @@
+@@ -0 +1,325 @@
 +/*
 +*
 +* @APPLE_LICENSE_HEADER_START@
@@ -3545,7 +3545,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventMacroDefs.h
-@@ -0,0 +1,8571 @@
+@@ -0 +1,8572 @@
 +/*
 +*
 +* @APPLE_LICENSE_HEADER_START@
@@ -12119,7 +12119,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventService.h
-@@ -0,0 +1,75 @@
+@@ -0 +1,76 @@
 +/*
 + * SWEET: minimal IOHIDEventService.
 + *
@@ -12197,7 +12197,7 @@
 +#endif /* _IOKIT_HID_IOHIDEVENTSERVICE_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventServiceKeys.h
-@@ -0,0 +1,144 @@
+@@ -0 +1,145 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -12344,7 +12344,7 @@
 +#endif /* IOHIDDeviceTypes_h */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventServiceKeys_Private.h
-@@ -0,0 +1,330 @@
+@@ -0 +1,331 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -12677,7 +12677,7 @@
 +#endif /* IOHIDEventServiceKeys_Private_h */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp
-@@ -0,0 +1,298 @@
+@@ -0 +1,299 @@
 +/*
 + * @APPLE_LICENSE_HEADER_START@
 + *
@@ -12978,7 +12978,7 @@
 +}
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventServiceQueue.h
-@@ -0,0 +1,74 @@
+@@ -0 +1,75 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -13055,7 +13055,7 @@
 +#endif /* !_IOKIT_HID_IOHIDEVENTSERVICEQUEUE_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventServiceTypes.h
-@@ -0,0 +1,74 @@
+@@ -0 +1,75 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -13132,7 +13132,7 @@
 +#endif /* IOHIDEventServiceTypes_h */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp
-@@ -0,0 +1,706 @@
+@@ -0 +1,707 @@
 +/*
 + * @APPLE_LICENSE_HEADER_START@
 + * 
@@ -13841,7 +13841,7 @@
 +}
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.h
-@@ -0,0 +1,148 @@
+@@ -0 +1,149 @@
 +/*
 + * @APPLE_LICENSE_HEADER_START@
 + * 
@@ -13992,7 +13992,7 @@
 +#endif /* _IOKIT_IOHIDEVENTSERVICEUSERCLIENT_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventStructDefs.h
-@@ -0,0 +1,811 @@
+@@ -0 +1,812 @@
 +/*
 +*
 +* @APPLE_LICENSE_HEADER_START@
@@ -14806,7 +14806,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDEventTypes.h
-@@ -0,0 +1,799 @@
+@@ -0 +1,800 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -15608,7 +15608,7 @@
 +#endif /* _IOKIT_HID_IOHIDEVENTTYPES_H } */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDFamilyTrace.h
-@@ -0,0 +1,72 @@
+@@ -0 +1,73 @@
 +/*
 + * @APPLE_LICENSE_HEADER_START@
 + * 
@@ -15683,7 +15683,7 @@
 +#endif // _IOKIT_HID_IOHIDFAMILYTRACE_H }
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDKeys.h
-@@ -0,0 +1,466 @@
+@@ -0 +1,467 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -16152,7 +16152,7 @@
 +#endif /* !_IOKIT_HID_IOHIDKEYS_H_ */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDParameter.h
-@@ -0,0 +1,350 @@
+@@ -0 +1,351 @@
 +/*
 + * @APPLE_LICENSE_HEADER_START@
 + * 
@@ -16505,7 +16505,7 @@
 +#endif /* !_DEV_EVSIO_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDPrivateKeys.h
-@@ -0,0 +1,212 @@
+@@ -0 +1,213 @@
 +/*
 + *
 + * @APPLE_LICENSE_HEADER_START@
@@ -16720,7 +16720,7 @@
 +#endif /* !_IOKIT_HID_IOHIDPRIVATEKEYS_H_ */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDProperties.h
-@@ -0,0 +1,105 @@
+@@ -0 +1,106 @@
 +/*
 + * Copyright (c) 2016 Apple Computer, Inc. All rights reserved.
 + *
@@ -16828,7 +16828,7 @@
 +#endif /* IOHIDProperties_h */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDShared.h
-@@ -0,0 +1,291 @@
+@@ -0 +1,292 @@
 +/*
 + * @APPLE_LICENSE_HEADER_START@
 + * 
@@ -17122,7 +17122,7 @@
 +#endif /* !_DEV_EVIO_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDTypes.h
-@@ -0,0 +1,182 @@
+@@ -0 +1,183 @@
 +/*
 + * @APPLE_LICENSE_HEADER_START@
 + * 
@@ -17307,7 +17307,7 @@
 +
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOHIDUsageTables.h
-@@ -0,0 +1,2694 @@
+@@ -0 +1,2695 @@
 +/*
 + * @APPLE_LICENSE_HEADER_START@
 + * 
@@ -17645,7 +17645,7 @@
 +};
 +
 +/* KeyboardOrKeypad Page (0x07) */
-+/* This section is the Usage Page for key codes to be used in implementing a USB keyboard. A Boot Keyboard (84-, 101- or 104-key) should at a minimum support all associated usage codes as indicated in the “Boot” */
++/* This section is the Usage Page for key codes to be used in implementing a USB keyboard. A Boot Keyboard (84-, 101- or 104-key) should at a minimum support all associated usage codes as indicated in the Boot */
 +/* column below. */
 +/* The usage type of all key codes is Selectors (Sel), except for the modifier keys Keyboard Left Control (0x224) to Keyboard Right GUI (0x231) which are Dynamic Flags (DV). */
 +/* Note: A general note on Usages and languages: Due to the variation of keyboards from language to language, it is not feasible to specify exact key mappings for every language. Where this list is not specific for a key function in a language, the closest equivalent key position should be used, so that a keyboard may be modified for a different language by simply printing different keycaps. One example is the Y key on a North American keyboard. In Germany this is typically Z. Rather than changing the keyboard firmware to put the Z Usage into that place in the descriptor list, the vendor should use the Y Usage on both the North American and German keyboards. This continues to be the existing practice in the industry, in order to minimize the number of changes to the electronics to accommodate otherlanguages. */
@@ -17829,7 +17829,7 @@
 +};
 +
 +/* LEDs Page (0x08) */
-+/* An LED or indicator is implemented as an On/Off Control (OOF) using the “Single button toggle” mode, where a value of 1 will turn on the indicator, and a value of 0 will turn it off. The exceptions are described below. */
++/* An LED or indicator is implemented as an On/Off Control (OOF) using the Single button toggle mode, where a value of 1 will turn on the indicator, and a value of 0 will turn it off. The exceptions are described below. */
 +enum
 +{
 +    kHIDUsage_LED_NumLock    = 0x01,    /* On/Off Control */
@@ -17924,12 +17924,12 @@
 +
 +/* Button Page (0x09) */
 +/* The Button page is the first place an application should look for user selection controls. System graphical user interfaces typically employ a pointer and a set of hierarchical selectors to select, move and otherwise manipulate their environment. For these purposes the following assignment of significance can be applied to the Button usages: */
-+/* • Button 1, Primary Button. Used for object selecting, dragging, and double click activation. On MacOS, this is the only button. Microsoft operating systems call this a logical left button, because it */
++/*  Button 1, Primary Button. Used for object selecting, dragging, and double click activation. On MacOS, this is the only button. Microsoft operating systems call this a logical left button, because it */
 +/* is not necessarily physically located on the left of the pointing device. */
-+/* • Button 2, Secondary Button. Used by newer graphical user interfaces to browse object properties. Exposed by systems to applications that typically assign application-specific functionality. */
-+/* • Button 3, Tertiary Button. Optional control. Exposed to applications, but seldom assigned functionality due to prevalence of two- and one-button devices. */
-+/* • Buttons 4 -55. As the button number increases, its significance as a selector decreases. */
-+/* In many ways the assignment of button numbers is similar to the assignment of Effort in Physical descriptors. Button 1 would be used to define the button a finger rests on when the hand is in the “at rest” position, that is, virtually no effort is required by the user to activate the button. Button values increment as the finger has to stretch to reach a control. See Section 6.2.3, “Physical Descriptors,” in the HID Specification for methods of further qualifying buttons. */
++/*  Button 2, Secondary Button. Used by newer graphical user interfaces to browse object properties. Exposed by systems to applications that typically assign application-specific functionality. */
++/*  Button 3, Tertiary Button. Optional control. Exposed to applications, but seldom assigned functionality due to prevalence of two- and one-button devices. */
++/*  Buttons 4 -55. As the button number increases, its significance as a selector decreases. */
++/* In many ways the assignment of button numbers is similar to the assignment of Effort in Physical descriptors. Button 1 would be used to define the button a finger rests on when the hand is in the at rest position, that is, virtually no effort is required by the user to activate the button. Button values increment as the finger has to stretch to reach a control. See Section 6.2.3, Physical Descriptors, in the HID Specification for methods of further qualifying buttons. */
 +enum
 +{
 +    kHIDUsage_Button_1    = 0x01,    /* (primary/trigger) */
@@ -18193,7 +18193,7 @@
 +
 +/* Ordinal Page (0x0A) */
 +/* The Ordinal page allows multiple instances of a control or sets of controls to be declared without requiring individual enumeration in the native usage page. For example, it is not necessary to declare usages of Pointer 1, Pointer 2, and so forth on the Generic Desktop page. When parsed, the ordinal instance number is, in essence, concatenated to the usages attached to the encompassing collection to create Pointer 1, Pointer 2, and so forth. */
-+/* For an example, see Section A.5, “Multiple Instances of a Control,” in Appendix A, “Usage Examples.” By convention, an Ordinal collection is placed inside the collection for which it is declaring multiple instances. */
++/* For an example, see Section A.5, Multiple Instances of a Control, in Appendix A, Usage Examples. By convention, an Ordinal collection is placed inside the collection for which it is declaring multiple instances. */
 +/* Instances do not have to be identical. */
 +enum
 +{
@@ -18208,7 +18208,7 @@
 +/* Telephony Page (0x0B) */
 +/* This usage page defines the keytop and control usages for telephony devices. */
 +/* Indicators on a phone are handled by wrapping them in LED: Usage In Use Indicator and LED: Usage Selected Indicator usages. For example, a message-indicator LED would be identified by a Telephony: Message usage declared as a Feature or Output in a LED: Usage In Use Indicator collection. */
-+/* See Section 14, “Consumer Page (0x0C),” for audio volume and tone controls. */
++/* See Section 14, Consumer Page (0x0C), for audio volume and tone controls. */
 +enum
 +{
 +    kHIDUsage_Tfon_Phone    = 0x01,    /* Application Collection */
@@ -20004,7 +20004,7 @@
 +#endif /* _IOHIDUSAGETABLES_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/IOLLEvent.h
-@@ -0,0 +1,586 @@
+@@ -0 +1,587 @@
 +/*
 + * @APPLE_LICENSE_HEADER_START@
 + * 
@@ -20593,7 +20593,7 @@
 +
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
-@@ -0,0 +1,539 @@
+@@ -0 +1,540 @@
 +/*
 + * SWEET: HID event services for the iOS userland (backboardd's HID event
 + * system).

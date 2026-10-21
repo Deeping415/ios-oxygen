@@ -1,6 +1,6 @@
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -820,6 +820,60 @@
+@@ -820,7 +820,61 @@
  	return exception_triage_thread(exception, code, codeCnt, thread);
  }
  
@@ -63,7 +63,7 @@
  	exception_type_t        exception,
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1884,6 +1884,13 @@
+@@ -1884,7 +1884,14 @@
  		subcode = ut->uu_subcode;
  		etype = ut->uu_exception;
  

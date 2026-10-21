@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -110,6 +110,7 @@
+@@ -110,7 +110,8 @@
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
@@ -18,7 +18,7 @@
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -658,6 +659,7 @@
+@@ -658,7 +659,8 @@
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
  	sweet_keys_init();
  	sweet_touch_init();

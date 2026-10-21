@@ -1,6 +1,6 @@
 --- a/bsd/vfs/vfs_subr.c
 +++ b/bsd/vfs/vfs_subr.c
-@@ -1257,6 +1257,18 @@
+@@ -1257,7 +1257,19 @@
  
  		mp = vfs_rootmountalloc_internal(vfsp, "root_device");
  		mp->mnt_devvp = rootvp;

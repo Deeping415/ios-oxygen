@@ -1,13 +1,13 @@
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -12,3 +12,4 @@
+@@ -12,4 +12,5 @@
  iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
  iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
  iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
 +iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -52,6 +52,11 @@
+@@ -52,7 +52,12 @@
      "     'IOProviderClass' = IOResources;"
      "     'IOMatchCategory' = AppleKeyStore;"
      "   },"

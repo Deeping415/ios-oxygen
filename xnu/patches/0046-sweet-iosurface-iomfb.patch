@@ -1,6 +1,6 @@
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -13,3 +13,5 @@
+@@ -13,4 +13,6 @@
  iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
  iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
  iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
@@ -8,7 +8,7 @@
 +iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -57,6 +57,16 @@
+@@ -57,7 +57,17 @@
      "     'IOProviderClass' = IOResources;"
      "     'IOMatchCategory' = IOWatchdog;"
      "   },"
@@ -27,7 +27,7 @@
      "     'IOClass'         = IOPanicPlatform;"
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -62,6 +62,18 @@
+@@ -62,7 +62,19 @@
  		cpus->release();
  	}
  	createNubs(this, IODTFindMatchingEntries(root, kIODTExclusive, excludeList()));
@@ -48,7 +48,7 @@
  bool
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -0,0 +1,65 @@
+@@ -0 +1,66 @@
 +/*
 + * Built-in IOSurface for SWEET (see SweetSurface.cpp).
 + *
@@ -116,7 +116,7 @@
 +#endif /* _SWEET_SURFACE_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -0,0 +1,872 @@
+@@ -0 +1,873 @@
 +/*
 + * Built-in IOSurface for SWEET.
 + *

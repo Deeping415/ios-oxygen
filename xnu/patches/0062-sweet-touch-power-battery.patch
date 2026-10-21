@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,8 @@
+@@ -108,7 +108,9 @@
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
@@ -48,7 +48,7 @@
  	}
  	cfg &= ~0x3ffu;
  	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
-@@ -490,16 +491,26 @@
+@@ -490,17 +491,27 @@
  	if (!touch_clocks() || !touch_se_init()) {
  		goto out;
  	}
@@ -85,7 +85,7 @@
  	printf("SWEET TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -15,6 +15,7 @@
+@@ -15,7 +15,8 @@
  iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
  iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
  iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
@@ -95,7 +95,7 @@
  iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -77,6 +77,11 @@
+@@ -77,7 +77,12 @@
      "     'IOProviderClass' = IOResources;"
      "     'IOMatchCategory' = SweetHIDTouch;"
      "   },"
@@ -109,7 +109,7 @@
      "     'IOClass'         = IOPanicPlatform;"
 --- /dev/null
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -0,0 +1,358 @@
+@@ -0 +1,359 @@
 +/*
 + * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
 + * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
@@ -470,7 +470,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_spmi.c
-@@ -0,0 +1,126 @@
+@@ -0 +1,127 @@
 +/*
 + * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
 + * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
@@ -599,7 +599,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_spmi.h
-@@ -0,0 +1,14 @@
+@@ -0 +1,15 @@
 +/* Shared C/C++ interface. Init once, on the SweetBattery start thread. */
 +#ifndef SWEET_BATTERY_SPMI_H
 +#define SWEET_BATTERY_SPMI_H

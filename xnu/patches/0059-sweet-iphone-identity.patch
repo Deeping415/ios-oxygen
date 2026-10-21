@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_mib.c
 +++ b/bsd/kern/kern_mib.c
-@@ -518,7 +518,9 @@
+@@ -518,8 +518,10 @@
  		 * Deprecated variables.  We still support these for
  		 * backwards compatibility purposes only.
  		 */
