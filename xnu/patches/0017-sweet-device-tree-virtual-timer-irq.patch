@@ -9,16 +9,12 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  #include <arm64/proc_reg.h>
  #include <kern/clock.h>
  #include <mach/mach_time.h>
-@@ -15,6 +16,15 @@
+@@ -15,6 +16,11 @@
  #if HAS_GIC_V3
  #define GICR_WAKE_TIMEOUT_NS (1000000000ULL) // timeout for redistributor wakeup (default 1s)
  MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS, MACHINE_TIMEOUT_UNIT_NSEC, NULL);
 +
-+#if defined(VINCE)
-+vm_offset_t vince_gicd_base = 0;
-+vm_offset_t vince_gicc_base = 0;
-+uint32_t vince_vtimer_intid = VINCE_VTIMER_INTID;
-+#elif defined(SWEET)
++#if defined(SWEET)
 +/* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
 +SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
 +#endif
