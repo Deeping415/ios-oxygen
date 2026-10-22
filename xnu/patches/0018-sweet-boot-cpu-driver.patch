@@ -185,28 +185,14 @@ new file mode 100644
 +	return cpuName;
 +}
 +#endif /* SWEET || VINCE */
-diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
---- a/iokit/KernelConfigTables.cpp
-+++ b/iokit/KernelConfigTables.cpp
-@@ -41,6 +41,12 @@
-     "     'IONameMatch'     = 'xiaomi,sweet';"
-     "     'IOProbeScore'    = 10000:32;"
-     "   },"
-+    "   {"
-+    "     'IOClass'         = SweetCPU;"
-+    "     'IOProviderClass' = IOPlatformDevice;"
-+    "     'IONameMatch'     = 'arm,cortex-a53';"
-+    "     'IOProbeScore'    = 10000:32;"
-+    "   },"
- #endif
-     "   {"
-     "     'IOClass'         = IOPanicPlatform;"
-diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
---- a/iokit/conf/files.arm64
-+++ b/iokit/conf/files.arm64
-@@ -8,3 +8,5 @@
+diff --git a/iokit/Kernel/arm/Makefile b/iokit/Kernel/arm/Makefile
+--- a/iokit/Kernel/arm/Makefile
++++ b/iokit/Kernel/arm/Makefile
+@@ -3,4 +3,6 @@
  
- # SWEET device-tree platform (empty translation unit on other boards)
- iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+ CXXWARNFLAGS := $(filter-out -Woverloaded-virtual,$(CXXWARNFLAGS))
+ 
++EXTRA_CXXFLAGS += -Wno-c++11-extensions
 +
-+iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+-MODULE_SEARCH_PATHS += $(SRCROOT)/osfmk
++MODULE_SEARCH_PATHS += $(SRCROOT)/osfmk $(OBJPATH)/osfmk

@@ -20,7 +20,7 @@ index 8460893..9a748ea 100644
  
  
  #
-@@ -259,8 +261,11 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+@@ -259,11 +261,12 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
  # Without embdedded device map, use a default arch string
  export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
  ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
@@ -74,7 +74,7 @@ index c40c6ea..9888608 100644
  #include <arm/trap.h> /* for IS_ARM_GDB_TRAP() et al */
  #include <arm64/proc_reg.h>
  #include <arm64/machine_machdep.h>
-@@ -1855,6 +1856,76 @@ sleh_irq(arm_saved_state_t *state)
+@@ -1855,6 +1856,78 @@ sleh_irq(arm_saved_state_t *state)
  #endif
  
  
@@ -249,7 +249,7 @@ new file mode 100644
 index 0000000..a044ad0
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/VINCE.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,38 @@
 +/*
 + * Board config for Xiaomi Redmi 5 Plus ("vince", Qualcomm MSM8953 / Snapdragon 625)
 + * 8x ARM Cortex-A53 ARMv8.0-A, GICv2 MMIO, 24-bit RGB888 display.
@@ -292,7 +292,7 @@ diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_
 index 9454534..88e524a 100644
 --- a/pexpert/pexpert/arm64/board_config.h
 +++ b/pexpert/pexpert/arm64/board_config.h
-@@ -97,6 +97,27 @@
+@@ -97,5 +97,27 @@
  #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
  #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
  
