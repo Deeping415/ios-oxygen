@@ -1,5 +1,5 @@
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
-index 2a4e4ec..2a0b236 100644
+index 2a4e4ec..04f7989 100755
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
 @@ -62,7 +62,7 @@ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
@@ -11,7 +11,7 @@ index 2a4e4ec..2a0b236 100644
  
  
  #
-@@ -339,6 +339,12 @@ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+@@ -339,9 +339,15 @@ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
  ARM64_LINK_ADDR    =0xfffffe0007004000
  endif
  
@@ -23,9 +23,13 @@ index 2a4e4ec..2a0b236 100644
 +
  
  CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
- 			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
+-			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
++			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel -mstrict-align
+ 
+ CFLAGS_RELEASEX86_64 = -O2
+ CFLAGS_DEVELOPMENTX86_64 = -O2
 diff --git a/pexpert/pexpert/arm64/VINCE.h b/pexpert/pexpert/arm64/VINCE.h
-index 4a50b6e..ab3b03a 100644
+index 4a50b6e..ab3b03a 100755
 --- a/pexpert/pexpert/arm64/VINCE.h
 +++ b/pexpert/pexpert/arm64/VINCE.h
 @@ -6,20 +6,28 @@
@@ -65,7 +69,7 @@ index 4a50b6e..ab3b03a 100644
  #define HAS_GIC_V2                1
  
 diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
-index aa05d9e..87208f9 100644
+index aa05d9e..87208f9 100755
 --- a/pexpert/pexpert/arm64/board_config.h
 +++ b/pexpert/pexpert/arm64/board_config.h
 @@ -99,6 +99,8 @@
@@ -78,7 +82,7 @@ index aa05d9e..87208f9 100644
  #define MAX_L2_CLINE                   6
  #define MAX_CPUS                       8
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e3579f1..bd2c5b2 100644
+index e3579f1..bd2c5b2 100755
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -348,16 +348,21 @@ arm_init(
@@ -141,7 +145,7 @@ index e3579f1..bd2c5b2 100644
  		if (PE_parse_boot_argn("cpus_defeatures", &cpus_defeatures, sizeof(cpus_defeatures))) {
  			if ((cpus_defeatures & 0xF) != 0) {
 diff --git a/osfmk/arm/commpage/commpage.c b/osfmk/arm/commpage/commpage.c
-index ee9f8de..292a62c 100644
+index ee9f8de..292a62c 100755
 --- a/osfmk/arm/commpage/commpage.c
 +++ b/osfmk/arm/commpage/commpage.c
 @@ -175,8 +175,13 @@ commpage_populate(void)
@@ -159,7 +163,7 @@ index ee9f8de..292a62c 100644
  
  	commpage_update_timebase();
 diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
-index 75f3db0..c7fa876 100644
+index 75f3db0..c7fa876 100755
 --- a/osfmk/arm/pmap/pmap.h
 +++ b/osfmk/arm/pmap/pmap.h
 @@ -105,7 +105,9 @@
@@ -174,7 +178,7 @@ index 75f3db0..c7fa876 100644
   * 2 L1 tables (Linear KVA and V=P), plus 2*16 L2 tables map up to (16*64GB) 1TB of DRAM
   * Upper limit on how many pages can be consumed by bootstrap page tables
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index 00568d3..20b396e 100644
+index 00568d3..20b396e 100755
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
 @@ -6881,7 +6881,7 @@ void
@@ -197,7 +201,7 @@ index 00568d3..20b396e 100644
  #error Nested shared page mapping is unsupported on this config
  #endif
 diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
-index c3eb554..fbeb6ee 100644
+index c3eb554..fbeb6ee 100755
 --- a/osfmk/arm64/proc_reg.h
 +++ b/osfmk/arm64/proc_reg.h
 @@ -642,6 +642,9 @@
@@ -211,7 +215,7 @@ index c3eb554..fbeb6ee 100644
  #define SCTLR_CSEH_DEFAULT        (SCTLR_EIS | SCTLR_EOS)
  #define SCTLR_DSSBS_DEFAULT       (0)
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 37289cb..aed4136 100644
+index 37289cb..d2bd6fe 100755
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -232,6 +232,54 @@ LEXT(_start)
@@ -398,7 +402,25 @@ index 37289cb..aed4136 100644
  
  #if defined(BCM2837)
  	// Setup timer interrupt routing; must be done before MMU is enabled
-@@ -801,11 +885,21 @@ common_start:
+@@ -790,10 +874,17 @@ common_start:
+ 
+ 	cbnz		x21, 1f
+ #endif /* __ARM_KERNEL_PROTECT__ */
++#if defined(VINCE)
++	adrp	x0, EXT(LowExceptionVectorBase)@page
++	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
++	add		x0, x0, x22
++	sub		x0, x0, x23
++#else
+ 	adrp	x0, EXT(ExceptionVectorsBase)@page			// Load exception vectors base address
+ 	add		x0, x0, EXT(ExceptionVectorsBase)@pageoff
+ 	add		x0, x0, x22									// Convert exception vector address to KVA
+ 	sub		x0, x0, x23
++#endif
+ 1:
+ 	MSR_VBAR_EL1_X0
+ 
+@@ -801,11 +892,21 @@ common_start:
  	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
  #endif /* HAS_APPLE_PAC */
  
@@ -420,7 +442,7 @@ index 37289cb..aed4136 100644
  #if !VMAPPLE && !defined(SWEET) && !defined(VINCE)
  	MOV64   x1, SCTLR_EL1_DEFAULT
  	cmp		x0, x1
-@@ -868,6 +962,11 @@ common_start:
+@@ -868,6 +969,11 @@ common_start:
  	mov	lr, x21
  #endif
  
@@ -433,7 +455,7 @@ index 37289cb..aed4136 100644
  	ret
  
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
-index f103a9f..c8e2fc2 100644
+index f103a9f..c8e2fc2 100755
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
 @@ -8,6 +8,9 @@
@@ -447,7 +469,7 @@ index f103a9f..c8e2fc2 100644
  void sweet_early_relocate(uint64_t base);
  void sweet_early_disable(void);
 diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
-index 9a73607..c9effe4 100644
+index 9a73607..c9effe4 100755
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
 @@ -127,6 +127,34 @@ sweet_early_string(const char *s)
@@ -486,7 +508,7 @@ index 9a73607..c9effe4 100644
  sweet_early_mark(unsigned int stage, const char *label)
  {
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 505e727..4ccbe44 100644
+index 505e727..4ccbe44 100755
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
 @@ -1831,29 +1831,33 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
@@ -535,8 +557,57 @@ index 505e727..4ccbe44 100644
  	__asm__ volatile("dsb ishst" ::: "memory");
  }
  #endif
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 94e9130..c0bf530 100755
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -32,6 +32,9 @@
+  */
+ 
+ #include <pexpert/arm64/board_config.h>
++#if defined(SWEET) || defined(VINCE)
++extern void sweet_early_putc(char c);
++#endif
+ #include <kern/kalloc.h>
+ #include <kern/machine.h>
+ #include <kern/cpu_number.h>
+@@ -788,6 +791,10 @@ cpu_data_init(cpu_data_t *cpu_data_ptr)
+ {
+ 	uint32_t i;
+ 
++#if defined(SWEET) || defined(VINCE)
++	sweet_early_putc('i');
++#endif
++
+ 	cpu_data_ptr->cpu_flags = 0;
+ 	cpu_data_ptr->cpu_int_state = 0;
+ 	cpu_data_ptr->cpu_pending_ast = AST_NONE;
+@@ -840,7 +847,12 @@ cpu_data_init(cpu_data_t *cpu_data_ptr)
+ 	pmap_cpu_data_ptr->pv_free.count = 0;
+ 	pmap_cpu_data_ptr->pv_free_spill_marker = NULL;
+ 	pmap_cpu_data_ptr->cpu_nested_pmap = (struct pmap *) NULL;
+-	bzero(&(pmap_cpu_data_ptr->cpu_sw_asids[0]), sizeof(pmap_cpu_data_ptr->cpu_sw_asids));
++#if defined(SWEET) || defined(VINCE)
++	sweet_early_putc('j');
++#endif
++	for (unsigned int j = 0; j < sizeof(pmap_cpu_data_ptr->cpu_sw_asids); j++) {
++		pmap_cpu_data_ptr->cpu_sw_asids[j] = 0;
++	}
+ #endif /* !XNU_MONITOR */
+ 	cpu_data_ptr->halt_status = CPU_NOT_HALTED;
+ #if __ARM_KERNEL_PROTECT__
+@@ -851,6 +863,9 @@ cpu_data_init(cpu_data_t *cpu_data_ptr)
+ 	cpu_data_ptr->rop_key = 0;
+ 	cpu_data_ptr->jop_key = ml_default_jop_pid();
+ #endif
++#if defined(SWEET) || defined(VINCE)
++	sweet_early_putc('k');
++#endif
+ }
+ 
+ kern_return_t
 diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
-index 04dda53..4fb117a 100644
+index 04dda53..4fb117a 100755
 --- a/pexpert/arm/pe_init.c
 +++ b/pexpert/arm/pe_init.c
 @@ -21,6 +21,9 @@
@@ -586,7 +657,7 @@ index 04dda53..4fb117a 100644
  			    (void const **)&prop, &size)) {
  				if (size > sizeof(gTargetTypeBuffer)) {
 diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
-index aa75c0a..0b2fe99 100644
+index aa75c0a..0b2fe99 100755
 --- a/pexpert/arm/pe_identify_machine.c
 +++ b/pexpert/arm/pe_identify_machine.c
 @@ -8,6 +8,9 @@
@@ -659,7 +730,7 @@ index aa75c0a..0b2fe99 100644
  		return gPESoCBasePhys;
  	}
 diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
-index 1756185..066c7ed 100644
+index 1756185..066c7ed 100755
 --- a/bsd/kern/mach_loader.c
 +++ b/bsd/kern/mach_loader.c
 @@ -509,8 +509,12 @@ load_machfile(
@@ -676,7 +747,7 @@ index 1756185..066c7ed 100644
  		vm_map_set_page_shift(map, page_shift_user32);
  	}
 diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
-index db1d613..50d0fe8 100644
+index db1d613..50d0fe8 100755
 --- a/osfmk/vm/vm_shared_region.c
 +++ b/osfmk/vm/vm_shared_region.c
 @@ -774,11 +774,15 @@ vm_shared_region_create(
