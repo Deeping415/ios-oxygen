@@ -330,17 +330,17 @@ index c803e4e..c90ec1a 100644
  	return dec;
  }
  
-+#if defined(SWEET)
++#if defined(SWEET) || defined(VINCE)
 +/*
-+ * sweet: arm_vm_init() calls this unconditionally; Apple's definition (it
++ * sweet/vince: arm_vm_init() calls this unconditionally; Apple's definition (it
 + * enters the PPL/monitor) ships only in the closed per-SoC library. There is
-+ * no monitor on SWEET.
++ * no monitor on SWEET / VINCE.
 + */
 +void
 +ml_enable_monitor(void)
 +{
 +}
-+#endif /* SWEET */
++#endif /* SWEET || VINCE */
 +
  boolean_t
  ml_get_timer_pending(void)

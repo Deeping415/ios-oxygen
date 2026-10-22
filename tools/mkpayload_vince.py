@@ -186,7 +186,7 @@ if __name__ == '__main__':
     ap.add_argument('kernel', help='Path to kernel.development.vince Mach-O')
     ap.add_argument('adt', help='Path to vince.adt')
     ap.add_argument('out', help='Output payload path (e.g. artifacts/vince.payload)')
-    ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
+    ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 wdt_test=no_user_checkin sweettouch=0 sweetkeys=0')
     ap.add_argument('--ramdisk', help='Optional root image for md0')
     a = ap.parse_args()
     blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)

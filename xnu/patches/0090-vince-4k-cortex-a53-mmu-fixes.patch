@@ -1,0 +1,281 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 2a4e4ec..f38137e 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -62,7 +62,7 @@ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+-MACHINE_FLAGS_ARM64_VINCE = -DARM64_BOARD_CONFIG_VINCE                -march=armv8-a+crc+crypto -mcpu=cortex-a53
++MACHINE_FLAGS_ARM64_VINCE = -DARM64_BOARD_CONFIG_VINCE -march=armv8-a -mcpu=cortex-a53
+ 
+ 
+ #
+diff --git a/pexpert/pexpert/arm64/VINCE.h b/pexpert/pexpert/arm64/VINCE.h
+index 4a50b6e..ab3b03a 100644
+--- a/pexpert/pexpert/arm64/VINCE.h
++++ b/pexpert/pexpert/arm64/VINCE.h
+@@ -6,20 +6,28 @@
+ #ifndef _PEXPERT_ARM64_VINCE_H
+ #define _PEXPERT_ARM64_VINCE_H
+ 
+-#define NO_MONITOR                1
+-#define NO_ECORE                  1
+-
+-#define VINCE                     1
+-
+-#define ARM_ARCH_TIMER
++#define ARM64_ARCH_FAMILY         1
+ #define __ARM_ARCH__              8
+ #define __ARM_VMSA__              8
+ #define __ARM_VFP__               4
+ #define __ARM_COHERENT_CACHE__    1
++#define __ARM_COHERENT_IO__       1
+ #define __ARM_DEBUG__             7
++#define ARM_BOARD_WFE_TIMEOUT_NS  1000
++#define KERNEL_INTEGRITY_WT       0
++#define NO_MONITOR                1
++#define NO_ECORE                  1
++
++#define VINCE                     1
++#define ARM_ARCH_TIMER
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+-#define __ARM_16K_PG__            1
++
++#undef __ARM_16K_PG__
++#undef __ARM_PAN_AVAILABLE__
++#undef __ARM_WKDM_POPCNT__
++#undef __ARM64_PMAP_SUBPAGE_L1__
++#undef ARM_PARAMETERIZED_PMAP
+ 
+ #define HAS_GIC_V2                1
+ 
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index aa05d9e..87208f9 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -99,6 +99,8 @@
+ 
+ #ifdef ARM64_BOARD_CONFIG_VINCE
+ #include <pexpert/arm64/VINCE.h>
++#undef __ARM_16K_PG__
++#undef __ARM_PAN_AVAILABLE__
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index 75f3db0..c7fa876 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -105,7 +105,9 @@
+ 
+ #if defined(__arm64__)
+ 
+-#if defined(ARM_LARGE_MEMORY)
++#if defined(ARM64_BOARD_CONFIG_VINCE) || !defined(__ARM_16K_PG__)
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
++#elif defined(ARM_LARGE_MEMORY)
+ /*
+  * 2 L1 tables (Linear KVA and V=P), plus 2*16 L2 tables map up to (16*64GB) 1TB of DRAM
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..9120c55 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,7 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	flush_dcache(ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 37289cb..84f3c4a 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -561,7 +561,11 @@ Lsweet_mark_pixel:
+ 	mov		x0, #(ARM_TTE_EMPTY)				// Load invalid entry template
+ 	mov		x1, x25								// Start at V=P pagetable root
+ 	mov		x2, #(TTE_PGENTRIES)				// Load number of entries per page
++#if defined(VINCE) || !defined(__ARM_16K_PG__)
++	lsl		x2, x2, #4							// Shift by 4 for num entries on 16 pages (64 KiB)
++#else
+ 	lsl		x2, x2, #2							// Shift by 2 for num entries on 4 pages
++#endif
+ 
+ Linvalidate_bootstrap:							// do {
+ 	str		x0, [x1], #(1 << TTE_SHIFT)			//   Invalidate and advance
+@@ -647,15 +651,22 @@ Lkernelcache_base_found:
+ 
+ #if defined(VINCE)
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block at 0x90000000 in V=P L2 table.
++	 * Splash framebuffer: 4x 2MB Normal-NC blocks (8MB total) at 0x90000000 in V=P L2 table.
++	 * Covers 1080x2160x3 (6.998MB) from 0x90001000 to 0x906ADA00 without translation faults.
+ 	 */
+ 	MOV64	x10, 0x90000000
+-	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+-	orr		x11, x11, x10
++	MOV64	x14, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
++	mov		x15, #4
++1:
++	orr		x11, x14, x10
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	add		x10, x10, #0x200, lsl #12			// +2 MiB per L2 block
++	add		x12, x12, #1
++	subs	x15, x15, #1
++	b.ne	1b
+ #elif defined(SWEET)
+ 	/*
+ 	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 505e727..aa01972 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1837,23 +1837,27 @@ static void
+ sweet_early_map_final(void)
+ {
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+-	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
++	assert(va + 4 * ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+-	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+-	assert(*slot == ARM_TTE_EMPTY);
+ #if defined(VINCE)
+-	*slot = 0x90000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+-	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+-	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	const uint64_t fb_phys_base = 0x90000000ULL;
++	const unsigned int fb_num_blocks = 4;
+ #else
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+-	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+-	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	const uint64_t fb_phys_base = 0x9c000000ULL;
++	const unsigned int fb_num_blocks = 4;
+ #endif
++	for (unsigned int i = 0; i < fb_num_blocks; i++) {
++		vm_map_address_t block_va = va + ((uint64_t)i * ARM_TT_L2_SIZE);
++		tt_entry_t *slot = &l2[(block_va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++		assert(*slot == ARM_TTE_EMPTY);
++		*slot = (fb_phys_base + ((uint64_t)i * ARM_TT_L2_SIZE)) |
++		    ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index e3579f1..4a41d62 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -399,23 +399,17 @@ arm_init(
+ 		/*
+ 		 * Select the advertised kernel page size.
+ 		 */
++#if defined(ARM64_BOARD_CONFIG_VINCE) || !defined(__ARM_16K_PG__)
++		PAGE_SHIFT_CONST = ARM_PGSHIFT;
++		page_shift_user32 = ARM_PGSHIFT;
++#else
+ 		if (args->memSize > 1ULL * 1024 * 1024 * 1024) {
+-			/*
+-			 * arm64 device with > 1GB of RAM:
+-			 * kernel uses 16KB pages.
+-			 */
+ 			PAGE_SHIFT_CONST = PAGE_MAX_SHIFT;
+ 		} else {
+-			/*
+-			 * arm64 device with <= 1GB of RAM:
+-			 * kernel uses hardware page size
+-			 * (4KB for H6/H7, 16KB for H8+).
+-			 */
+ 			PAGE_SHIFT_CONST = ARM_PGSHIFT;
+ 		}
+-
+-		/* 32-bit apps always see 16KB page size */
+ 		page_shift_user32 = PAGE_MAX_SHIFT;
++#endif
+ #ifdef  APPLETYPHOON
+ 		if (PE_parse_boot_argn("cpus_defeatures", &cpus_defeatures, sizeof(cpus_defeatures))) {
+ 			if ((cpus_defeatures & 0xF) != 0) {
+diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+index 1756185..066c7ed 100644
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -509,8 +509,12 @@ load_machfile(
+ 
+ #if defined(__arm64__)
+ 	if (result->is_64bit_addr) {
++#if !defined(__ARM_16K_PG__) || defined(ARM64_BOARD_CONFIG_VINCE)
++		vm_map_set_page_shift(map, FOURK_PAGE_SHIFT);
++#else
+ 		/* enforce 16KB alignment of VM map entries */
+ 		vm_map_set_page_shift(map, SIXTEENK_PAGE_SHIFT);
++#endif
+ 	} else {
+ 		vm_map_set_page_shift(map, page_shift_user32);
+ 	}
+diff --git a/osfmk/arm/commpage/commpage.c b/osfmk/arm/commpage/commpage.c
+index ee9f8de..292a62c 100644
+--- a/osfmk/arm/commpage/commpage.c
++++ b/osfmk/arm/commpage/commpage.c
+@@ -175,8 +175,13 @@ commpage_populate(void)
+ #if __arm64__
+ 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_32_LEGACY + _COMM_PAGE_RW_OFFSET)) = (uint8_t) page_shift_user32;
+ 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_32 + _COMM_PAGE_RO_OFFSET)) = (uint8_t) page_shift_user32;
++#if !defined(__ARM_16K_PG__) || defined(ARM64_BOARD_CONFIG_VINCE)
++	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64_LEGACY + _COMM_PAGE_RW_OFFSET)) = (uint8_t) FOURK_PAGE_SHIFT;
++	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64 + _COMM_PAGE_RO_OFFSET)) = (uint8_t) FOURK_PAGE_SHIFT;
++#else
+ 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64_LEGACY + _COMM_PAGE_RW_OFFSET)) = (uint8_t) SIXTEENK_PAGE_SHIFT;
+ 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64 + _COMM_PAGE_RO_OFFSET)) = (uint8_t) SIXTEENK_PAGE_SHIFT;
++#endif
+ #endif /* __arm64__ */
+ 
+ 	commpage_update_timebase();
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index db1d613..50d0fe8 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -774,11 +774,15 @@ vm_shared_region_create(
+ 			sub_map = vm_map_create_options(pmap_nested, 0,
+ 			    (vm_map_offset_t)size, VM_MAP_CREATE_PAGEABLE);
+ 
++#if !defined(__ARM_16K_PG__) || defined(ARM64_BOARD_CONFIG_VINCE)
++			vm_map_set_page_shift(sub_map, FOURK_PAGE_SHIFT);
++#else
+ 			if (is_64bit ||
+ 			    page_shift_user32 == SIXTEENK_PAGE_SHIFT) {
+ 				/* enforce 16KB alignment of VM map entries */
+ 				vm_map_set_page_shift(sub_map, SIXTEENK_PAGE_SHIFT);
+ 			}
++#endif
+ #if __ARM_MIXED_PAGE_SIZE__
+ 			if (cputype == CPU_TYPE_ARM64 &&
+ 			    target_page_shift == FOURK_PAGE_SHIFT) {
+@@ -1514,9 +1518,13 @@ vm_shared_region_map_file_setup(
+ 		}
+ 
+ #if __arm64__
++#if !defined(__ARM_16K_PG__) || defined(ARM64_BOARD_CONFIG_VINCE)
++		if (((srfmp->slide & FOURK_PAGE_MASK) != 0)) {
++#else
+ 		if ((shared_region->sr_64bit ||
+ 		    page_shift_user32 == SIXTEENK_PAGE_SHIFT) &&
+ 		    ((srfmp->slide & SIXTEENK_PAGE_MASK) != 0)) {
++#endif
+ 			printf("FOURK_COMPAT: %s: rejecting mis-aligned slide 0x%x\n",
+ 			    __FUNCTION__, srfmp->slide);
+ 			kr = KERN_INVALID_ARGUMENT;

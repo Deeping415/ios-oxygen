@@ -34,6 +34,7 @@ env:
 
 jobs:
   build:
+    # macos-14 ships Xcode 15.x whose iig matches the xnu-8796 IORPC ABI
     runs-on: macos-15
     timeout-minutes: 120
     steps:
@@ -46,8 +47,8 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           # Copy Vince-specific and open-source Darwin patches
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the VINCE kernel is plain arm64 (Cortex-A53)
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          # Patch dxb/build.sh: arm64 support for libfirehose and strict set -e git apply -v for all patches
+          python3 tools/patch_dxb.py dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches
 

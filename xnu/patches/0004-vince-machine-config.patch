@@ -20,18 +20,16 @@ index 8460893..9a748ea 100644
  
  
  #
-@@ -259,11 +261,12 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+@@ -259,8 +261,12 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
  # Without embdedded device map, use a default arch string
  export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
  ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
--# vince Cortex-A53 and sweet Kryo 470 have no pointer authentication: stay plain arm64
--ifneq ($(CURRENT_MACHINE_CONFIG),$(filter $(CURRENT_MACHINE_CONFIG),SWEET VINCE))
 +ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
 +ifneq ($(CURRENT_MACHINE_CONFIG),VINCE)
  export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
- endif
- endif
 +endif
++endif
+ endif
  
  endif
  
@@ -183,18 +181,84 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index 3ad743f..4ec6989 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -141,6 +141,45 @@ pe_init_fiq()
+@@ -141,11 +141,25 @@ pe_init_fiq()
  		}
  	}
  
++#if defined(SWEET)
++	/*
++	 * Real hardware with two security states: Group 0 is TrustZone's and
++	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
++	 * and arrives as an IRQ (see sleh_irq). GICR_IGROUPR0 reads as zero
++	 * from the non-secure side even after this write; delivery still works.
++	 */
++	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
++	}
++	gicr_write32(GICR_ISENABLER0, (1U << SWEET_VTIMER_INTID) | (1U << SWEET_IPI_SGI));
++#else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+ 
+ 	// Enable PPI 27
+ 	gicr_write32(GICR_ISENABLER0, (1 << 27));
++#endif /* SWEET */
+ 
+ 	// Enable system register access
+ 	uint64_t icc_sre = __builtin_arm_rsr64("ICC_SRE_EL1");
+@@ -153,8 +167,12 @@ pe_init_fiq()
+ 	__builtin_arm_wsr64("ICC_SRE_EL1", icc_sre);
+ 	__builtin_arm_isb(ISB_SY);
+ 
++#if defined(SWEET)
++	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
++#else
+ 	// Set priority masks and binary point for group 0
+ 	__builtin_arm_wsr64("ICC_BPR0_EL1", 0);
++#endif /* SWEET */
+ 	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
+ 
+ 	// Set EOI mode of this processor
+@@ -162,16 +180,67 @@ pe_init_fiq()
+ 	icc_ctlr &= ~ICC_CTLR_EOIMODE;
+ 	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
+ 
++#if defined(SWEET)
++	// ABL leaves only ARE_NS set; Linux writes ARE_NS | EnableGrp1A | EnableGrp1
++	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
++	gicd_ctlr |= GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1;
++	gicd_write32(GICD_CTLR, gicd_ctlr);
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
++	__builtin_arm_isb(ISB_SY);
++#else
+ 	// Enable the forwarding of the vtimer interrupt
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+ 	gicd_ctlr |= GICD_CTLR_ENABLEGRP0;
+ 	gicd_write32(GICD_CTLR, gicd_ctlr);
+ 	__builtin_arm_wsr64("ICC_IGRPEN0_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
++#endif /* SWEET */
+ }
+ #else
++#if defined(VINCE)
++vm_offset_t vince_gicd_base = 0;
++vm_offset_t vince_gicc_base = 0;
++uint32_t vince_vtimer_intid = VINCE_VTIMER_INTID;
++#endif
+ void
+-pe_init_fiq()
+-{
+-}
++pe_init_fiq()
++{
 +#if defined(VINCE)
 +	/*
 +	 * vince (MSM8953): ARM GICv2 MMIO controller.
 +	 */
-+	extern vm_offset_t vince_gicd_base;
-+	extern vm_offset_t vince_gicc_base;
-+	extern uint32_t vince_vtimer_intid;
-+
 +	DTEntry entry;
 +	if (SecureDTFindEntry("name", "interrupt-controller", &entry) == kSuccess) {
 +		uint64_t const *reg;
@@ -224,11 +288,9 @@ index 3ad743f..4ec6989 100644
 +	/* Enable Distributor (bit 0) */
 +	*(volatile uint32_t *)(vince_gicd_base + 0x000) = 1;
 +	__builtin_arm_isb(ISB_SY);
-+	return;
-+#elif defined(SWEET)
- 	/*
- 	 * Real hardware with two security states: Group 0 is TrustZone's and
- 	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
++#endif /* VINCE */
++}
+ #endif
 diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
 index 8226b8c..c7d274f 100644
 --- a/pexpert/pexpert/arm64/Makefile
@@ -271,7 +333,7 @@ index 0000000..a044ad0
 +#define __ARM_DEBUG__             7
 +#define __ARM_ENABLE_SWAP__       1
 +#define __ARM_V8_CRYPTO_EXTENSIONS__ 1
-+#define __ARM64_PMAP_SUBPAGE_L1__ 1
++#define __ARM_16K_PG__            1
 +
 +#define HAS_GIC_V2                1
 +
@@ -288,6 +350,87 @@ index 0000000..a044ad0
 +#define MSM8953_GICC_BASE         0x0b002000ULL
 +
 +#endif /* ! _PEXPERT_ARM64_VINCE_H */
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+new file mode 100644
+index 0000000..a044ad0
+--- /dev/null
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -0,0 +1,75 @@
++/*
++ * Board config for the Redmi Note 10 Pro ("sweet", Qualcomm SM7150 /
++ * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
++ *
++ * Generic ARM like BCM2837 (no APPLE_ARM64_ARCH_FAMILY: none of Apple's
++ * implementation-defined system registers exist), 16K pages and GICv3 like
++ * VMAPPLE. Unlike VMAPPLE the GIC has two security states (GICD_TYPER
++ * SecurityExtn=1): Group 0 belongs to TrustZone, so every interrupt,
++ * including the timer, is a Group 1 IRQ taken through sleh_irq().
++ */
++
++#ifndef _PEXPERT_ARM64_SWEET_H
++#define _PEXPERT_ARM64_SWEET_H
++
++#define NO_MONITOR                1
++#define NO_ECORE                  1
++
++#define SWEET                     1
++
++#define ARM_ARCH_TIMER
++#define __ARM_ARCH__              8
++#define __ARM_VMSA__              8
++#define __ARM_VFP__               4
++#define __ARM_COHERENT_CACHE__    1
++#define __ARM_DEBUG__             7
++#define __ARM_ENABLE_SWAP__       1
++#define __ARM_V8_CRYPTO_EXTENSIONS__ 1
++#define __ARM_PAN_AVAILABLE__     1
++#define __ARM_16K_PG__            1
++
++#define HAS_GIC_V3                1
++
++#ifndef ASSEMBLER
++#define PLATFORM_PANIC_LOG_DISABLED
++#endif /* ! ASSEMBLER */
++
++/*
++ * Qualcomm numbers the architected timer PPIs 1/2/3/0 (secure phys, phys,
++ * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
++ * (CNTV) is INTID 16 + 3 = 19.
++ */
++#define SWEET_VTIMER_INTID        19
++#define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
++
++#define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
++
++#define GICR_PE_SIZE              0x20000 // Size of each redistributor region
++
++/* GICv3 register definitions; see GICv3 spec (Arm IHI 0069G) */
++#define GICD_CTLR                 0x0
++
++/* Non-secure view of GICD_CTLR (DS=0) */
++#define GICD_CTLR_ENABLEGRP1      0x1
++#define GICD_CTLR_ENABLEGRP1A     0x2
++#define GICD_CTLR_ARE_NS          0x10
++#define GICD_CTLR_RWP             0x80000000
++
++#define GICR_TYPER                              0x08
++#define GICR_WAKER                              0x14
++#define GICR_IGROUPR0                           0x10080
++#define GICR_ISENABLER0                         0x10100
++#define GICR_IPRIORITYR0                        0x10400
++
++#define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
++#define GICR_TYPER_LAST                         0x10
++
++#define GICR_WAKER_PROCESSORSLEEP               0x2
++#define GICR_WAKER_CHILDRENASLEEP               0x4
++
++#define ICC_CTLR_EOIMODE                        0x2
++
++#define ICC_SRE_SRE                             0x1
++/* End of GICv3 register definitions */
++
++#endif /* ! _PEXPERT_ARM64_SWEET_H */
 diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
 index 9454534..88e524a 100644
 --- a/pexpert/pexpert/arm64/board_config.h
