@@ -64,6 +64,57 @@ index aa05d9e..87208f9 100644
  
  #define MAX_L2_CLINE                   6
  #define MAX_CPUS                       8
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index e3579f1..4a41d62 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -399,23 +399,17 @@ arm_init(
+ 		/*
+ 		 * Select the advertised kernel page size.
+ 		 */
++#if defined(ARM64_BOARD_CONFIG_VINCE) || !defined(__ARM_16K_PG__)
++		PAGE_SHIFT_CONST = ARM_PGSHIFT;
++		page_shift_user32 = ARM_PGSHIFT;
++#else
+ 		if (args->memSize > 1ULL * 1024 * 1024 * 1024) {
+-			/*
+-			 * arm64 device with > 1GB of RAM:
+-			 * kernel uses 16KB pages.
+-			 */
+ 			PAGE_SHIFT_CONST = PAGE_MAX_SHIFT;
+ 		} else {
+-			/*
+-			 * arm64 device with <= 1GB of RAM:
+-			 * kernel uses hardware page size
+-			 * (4KB for H6/H7, 16KB for H8+).
+-			 */
+ 			PAGE_SHIFT_CONST = ARM_PGSHIFT;
+ 		}
+-
+-		/* 32-bit apps always see 16KB page size */
+ 		page_shift_user32 = PAGE_MAX_SHIFT;
++#endif
+ #ifdef  APPLETYPHOON
+ 		if (PE_parse_boot_argn("cpus_defeatures", &cpus_defeatures, sizeof(cpus_defeatures))) {
+ 			if ((cpus_defeatures & 0xF) != 0) {
+diff --git a/osfmk/arm/commpage/commpage.c b/osfmk/arm/commpage/commpage.c
+index ee9f8de..292a62c 100644
+--- a/osfmk/arm/commpage/commpage.c
++++ b/osfmk/arm/commpage/commpage.c
+@@ -175,8 +175,13 @@ commpage_populate(void)
+ #if __arm64__
+ 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_32_LEGACY + _COMM_PAGE_RW_OFFSET)) = (uint8_t) page_shift_user32;
+ 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_32 + _COMM_PAGE_RO_OFFSET)) = (uint8_t) page_shift_user32;
++#if !defined(__ARM_16K_PG__) || defined(ARM64_BOARD_CONFIG_VINCE)
++	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64_LEGACY + _COMM_PAGE_RW_OFFSET)) = (uint8_t) FOURK_PAGE_SHIFT;
++	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64 + _COMM_PAGE_RO_OFFSET)) = (uint8_t) FOURK_PAGE_SHIFT;
++#else
+ 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64_LEGACY + _COMM_PAGE_RW_OFFSET)) = (uint8_t) SIXTEENK_PAGE_SHIFT;
+ 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64 + _COMM_PAGE_RO_OFFSET)) = (uint8_t) SIXTEENK_PAGE_SHIFT;
++#endif
+ #endif /* __arm64__ */
+ 
+ 	commpage_update_timebase();
 diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
 index 75f3db0..c7fa876 100644
 --- a/osfmk/arm/pmap/pmap.h
@@ -80,7 +131,7 @@ index 75f3db0..c7fa876 100644
   * 2 L1 tables (Linear KVA and V=P), plus 2*16 L2 tables map up to (16*64GB) 1TB of DRAM
   * Upper limit on how many pages can be consumed by bootstrap page tables
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index 00568d3..9120c55 100644
+index 00568d3..20b396e 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
 @@ -6881,7 +6881,7 @@ void
@@ -92,6 +143,16 @@ index 00568d3..9120c55 100644
  }
  
  #if CONFIG_COREDUMP
+@@ -10985,7 +10985,9 @@ static_assert((_COMM_PAGE32_BASE_ADDRESS & ~ARM_TT_L2_OFFMASK) >= VM_MAX_ADDRESS
+  * Ensure that 64-bit devices using 4K pages can nest the commpage completely
+  * above the maximum userspace VA.
+  */
++#if !defined(ARM64_BOARD_CONFIG_VINCE)
+ static_assert((_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK) >= MACH_VM_MAX_ADDRESS);
++#endif
+ #else
+ #error Nested shared page mapping is unsupported on this config
+ #endif
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index 37289cb..84f3c4a 100644
 --- a/osfmk/arm64/start.s
@@ -177,39 +238,6 @@ index 505e727..aa01972 100644
  	__asm__ volatile("dsb ishst" ::: "memory");
  }
  #endif
-diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e3579f1..4a41d62 100644
---- a/osfmk/arm/arm_init.c
-+++ b/osfmk/arm/arm_init.c
-@@ -399,23 +399,17 @@ arm_init(
- 		/*
- 		 * Select the advertised kernel page size.
- 		 */
-+#if defined(ARM64_BOARD_CONFIG_VINCE) || !defined(__ARM_16K_PG__)
-+		PAGE_SHIFT_CONST = ARM_PGSHIFT;
-+		page_shift_user32 = ARM_PGSHIFT;
-+#else
- 		if (args->memSize > 1ULL * 1024 * 1024 * 1024) {
--			/*
--			 * arm64 device with > 1GB of RAM:
--			 * kernel uses 16KB pages.
--			 */
- 			PAGE_SHIFT_CONST = PAGE_MAX_SHIFT;
- 		} else {
--			/*
--			 * arm64 device with <= 1GB of RAM:
--			 * kernel uses hardware page size
--			 * (4KB for H6/H7, 16KB for H8+).
--			 */
- 			PAGE_SHIFT_CONST = ARM_PGSHIFT;
- 		}
--
--		/* 32-bit apps always see 16KB page size */
- 		page_shift_user32 = PAGE_MAX_SHIFT;
-+#endif
- #ifdef  APPLETYPHOON
- 		if (PE_parse_boot_argn("cpus_defeatures", &cpus_defeatures, sizeof(cpus_defeatures))) {
- 			if ((cpus_defeatures & 0xF) != 0) {
 diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
 index 1756185..066c7ed 100644
 --- a/bsd/kern/mach_loader.c
@@ -227,24 +255,6 @@ index 1756185..066c7ed 100644
  	} else {
  		vm_map_set_page_shift(map, page_shift_user32);
  	}
-diff --git a/osfmk/arm/commpage/commpage.c b/osfmk/arm/commpage/commpage.c
-index ee9f8de..292a62c 100644
---- a/osfmk/arm/commpage/commpage.c
-+++ b/osfmk/arm/commpage/commpage.c
-@@ -175,8 +175,13 @@ commpage_populate(void)
- #if __arm64__
- 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_32_LEGACY + _COMM_PAGE_RW_OFFSET)) = (uint8_t) page_shift_user32;
- 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_32 + _COMM_PAGE_RO_OFFSET)) = (uint8_t) page_shift_user32;
-+#if !defined(__ARM_16K_PG__) || defined(ARM64_BOARD_CONFIG_VINCE)
-+	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64_LEGACY + _COMM_PAGE_RW_OFFSET)) = (uint8_t) FOURK_PAGE_SHIFT;
-+	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64 + _COMM_PAGE_RO_OFFSET)) = (uint8_t) FOURK_PAGE_SHIFT;
-+#else
- 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64_LEGACY + _COMM_PAGE_RW_OFFSET)) = (uint8_t) SIXTEENK_PAGE_SHIFT;
- 	*((uint8_t*)(_COMM_PAGE_USER_PAGE_SHIFT_64 + _COMM_PAGE_RO_OFFSET)) = (uint8_t) SIXTEENK_PAGE_SHIFT;
-+#endif
- #endif /* __arm64__ */
- 
- 	commpage_update_timebase();
 diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
 index db1d613..50d0fe8 100644
 --- a/osfmk/vm/vm_shared_region.c
