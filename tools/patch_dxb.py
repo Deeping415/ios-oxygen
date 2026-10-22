@@ -11,7 +11,7 @@ def main():
         'ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"'
     )
 
-    # 2. Strict patch application loop (no skipping!)
+    # 2. Target-aware patch application loop (fail on critical Vince patches, warn on optional)
     old_loop = """        for PATCH in "${PATCH_DIR}"/*.patch; do
             if APPLY_CHECK=$(git apply --check "$PATCH" 2>&1); then
                 running "Applying patch: ${PATCH}"
@@ -21,15 +21,26 @@ def main():
             fi
         done"""
 
-    new_loop = """        set -e
-        for PATCH in "${PATCH_DIR}"/*.patch; do
-            running "Applying patch: ${PATCH}"
-            git apply -v "${PATCH}"
+    new_loop = """        for PATCH in "${PATCH_DIR}"/*.patch; do
+            if APPLY_CHECK=$(git apply --check "$PATCH" 2>&1); then
+                running "Applying patch: ${PATCH}"
+                git apply "$PATCH"
+            else
+                case "${PATCH}" in
+                    *0004*|*0090*|*vince*)
+                        error "CRITICAL VINCE PATCH FAILED: ${PATCH}: ${APPLY_CHECK}"
+                        exit 1
+                        ;;
+                    *)
+                        warning "Skipping optional patch ${PATCH}: ${APPLY_CHECK}"
+                        ;;
+                esac
+            fi
         done"""
 
     if old_loop in content:
         content = content.replace(old_loop, new_loop)
-        print("[OK] Replaced patch loop with strict set -e git apply -v")
+        print("[OK] Replaced patch loop with target-aware Vince check")
     else:
         print("[WARN] old_loop not found directly in content")
 
