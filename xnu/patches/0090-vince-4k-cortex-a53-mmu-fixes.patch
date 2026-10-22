@@ -78,10 +78,40 @@ index aa05d9e..87208f9 100644
  #define MAX_L2_CLINE                   6
  #define MAX_CPUS                       8
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e3579f1..4a41d62 100644
+index e3579f1..bd2c5b2 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -399,23 +399,17 @@ arm_init(
+@@ -348,16 +348,21 @@ arm_init(
+ 	unsigned int dt_entry_size = 0;
+ 
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
++	sweet_early_putc('A');
+ 
+ 	arm_setup_pre_sign();
++	sweet_early_putc('B');
+ 
+ 	arm_slide_rebase_and_sign_image();
++	sweet_early_putc('C');
+ 
+ 	/* If kernel integrity is supported, use a constant copy of the boot args. */
+ 	const_boot_args = *args;
++	sweet_early_putc('D');
+ 	BootArgs = args = &const_boot_args;
+ 
+ 	cpu_data_init(&BootCpuData);
++	sweet_early_putc('E');
+ #if defined(HAS_APPLE_PAC)
+ 	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
+ 	BootCpuData.rop_key = ml_default_rop_pid();
+@@ -365,6 +370,7 @@ arm_init(
+ #endif /* defined(HAS_APPLE_PAC) */
+ 
+ 	PE_init_platform(FALSE, args); /* Get platform expert set up */
++	sweet_early_putc('F');
+ 	sweet_early_mark(2, "PE_init_platform done");
+ 
+ #if __arm64__
+@@ -399,23 +405,17 @@ arm_init(
  		/*
  		 * Select the advertised kernel page size.
  		 */
@@ -181,10 +211,73 @@ index c3eb554..fbeb6ee 100644
  #define SCTLR_CSEH_DEFAULT        (SCTLR_EIS | SCTLR_EOS)
  #define SCTLR_DSSBS_DEFAULT       (0)
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 37289cb..776c69f 100644
+index 37289cb..aed4136 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -447,6 +447,31 @@ start_cpu:
+@@ -232,6 +232,54 @@ LEXT(_start)
+ 	.align 12, 0
+ 	.global	EXT(LowExceptionVectorBase)
+ LEXT(LowExceptionVectorBase)
++#if defined(VINCE)
++	/* EL1 SP 0 */
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	/* EL1 SP1 */
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	/* EL0 64 */
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	/* EL0 32 */
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++	.align	7
++	b		L_vince_trap
++
++L_vince_trap:
++	mrs		x0, SCTLR_EL1
++	tbz		x0, #0, 2f
++	mrs		x0, ESR_EL1
++	mrs		x1, FAR_EL1
++	mrs		x2, ELR_EL1
++	bl		EXT(vince_early_exception)
++1:	wfe
++	b		1b
++2:	b		.
++#else
+ 	/* EL1 SP 0 */
+ 	b		.
+ 	.align	7
+@@ -267,6 +315,7 @@ LEXT(LowExceptionVectorBase)
+ 	b		.
+ 	.align	7
+ 	b		.
++#endif
+ 	.align 12, 0
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+@@ -447,6 +496,31 @@ start_cpu:
  2:
  .endmacro
  
@@ -216,7 +309,7 @@ index 37289cb..776c69f 100644
  /*
   * _start_first_cpu
   * Cold boot init routine.  Called from __start
-@@ -464,22 +489,8 @@ LEXT(start_first_cpu)
+@@ -464,22 +538,8 @@ LEXT(start_first_cpu)
  	mov		x21, #0
  
  #if defined(VINCE)
@@ -241,7 +334,7 @@ index 37289cb..776c69f 100644
  #elif defined(SWEET)
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
  	MOV64	x0, (0x9c000000 + 2368 * 4320)
-@@ -561,13 +572,22 @@ Lsweet_mark_pixel:
+@@ -561,13 +621,22 @@ Lsweet_mark_pixel:
  	mov		x0, #(ARM_TTE_EMPTY)				// Load invalid entry template
  	mov		x1, x25								// Start at V=P pagetable root
  	mov		x2, #(TTE_PGENTRIES)				// Load number of entries per page
@@ -264,7 +357,7 @@ index 37289cb..776c69f 100644
  	/*
  	 * In order to reclaim memory on targets where TZ0 (or some other entity)
  	 * must be located at the base of memory, iBoot may set the virtual and
-@@ -647,15 +667,25 @@ Lkernelcache_base_found:
+@@ -647,15 +716,25 @@ Lkernelcache_base_found:
  
  #if defined(VINCE)
  	/*
@@ -293,7 +386,7 @@ index 37289cb..776c69f 100644
  #elif defined(SWEET)
  	/*
  	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
-@@ -746,6 +776,11 @@ common_start:
+@@ -746,6 +825,11 @@ common_start:
  	tlbi	vmalle1
  	dsb		ish
  
@@ -305,7 +398,7 @@ index 37289cb..776c69f 100644
  
  #if defined(BCM2837)
  	// Setup timer interrupt routing; must be done before MMU is enabled
-@@ -801,11 +836,21 @@ common_start:
+@@ -801,11 +885,21 @@ common_start:
  	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
  #endif /* HAS_APPLE_PAC */
  
@@ -327,7 +420,7 @@ index 37289cb..776c69f 100644
  #if !VMAPPLE && !defined(SWEET) && !defined(VINCE)
  	MOV64   x1, SCTLR_EL1_DEFAULT
  	cmp		x0, x1
-@@ -868,6 +913,11 @@ common_start:
+@@ -868,6 +962,11 @@ common_start:
  	mov	lr, x21
  #endif
  
@@ -339,6 +432,81 @@ index 37289cb..776c69f 100644
  	// Return to arm_init()
  	ret
  
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 54a7655..c8e2fc2 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -8,7 +8,11 @@
+ #if defined(SWEET) || defined(VINCE)
+ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
++void sweet_early_hex(uint64_t val);
++void sweet_early_puts(const char *s);
++void vince_early_exception(uint64_t esr, uint64_t far, uint64_t elr);
+ void sweet_early_panic(const char *fmt, va_list *args);
++void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index baf3490..c9effe4 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -23,6 +23,19 @@
+ 
+ static volatile uint8_t *early_fb = (volatile uint8_t *)(uintptr_t)EARLY_FB_PHYS;
+ 
++void
++sweet_early_relocate(uint64_t base)
++{
++	sweet_early_mark(8, "leaving bootstrap TTBR0");
++#if defined(VINCE)
++	early_fb = (volatile uint8_t *)(uintptr_t)(base + 0x1000);
++#else
++	early_fb = (volatile uint8_t *)(uintptr_t)base;
++#endif
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_early_mark(9, "kernel framebuffer VA live");
++}
++
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -114,6 +127,34 @@ sweet_early_string(const char *s)
+ 	}
+ }
+ 
++void
++sweet_early_puts(const char *s)
++{
++	sweet_early_string(s);
++}
++
++void
++sweet_early_hex(uint64_t val)
++{
++	static const char hexchars[] = "0123456789abcdef";
++	for (int i = 60; i >= 0; i -= 4) {
++		sweet_early_putc(hexchars[(val >> i) & 0xf]);
++	}
++}
++
++void
++vince_early_exception(uint64_t esr, uint64_t far, uint64_t elr)
++{
++	sweet_early_string("\n*** CPU TRAP ***\nESR: 0x");
++	sweet_early_hex(esr);
++	sweet_early_string("\nFAR: 0x");
++	sweet_early_hex(far);
++	sweet_early_string("\nELR: 0x");
++	sweet_early_hex(elr);
++	sweet_early_putc('\n');
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 index 505e727..4ccbe44 100644
 --- a/osfmk/arm64/arm_vm_init.c
@@ -389,6 +557,129 @@ index 505e727..4ccbe44 100644
  	__asm__ volatile("dsb ishst" ::: "memory");
  }
  #endif
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 04dda53..1a79219 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -21,6 +21,9 @@
+ #include <os/overflow.h>
+ 
+ #include <pexpert/arm64/board_config.h>
++#if defined(SWEET) || defined(VINCE)
++#include <arm64/sweet_early.h>
++#endif
+ 
+ 
+ /* extern references */
+@@ -398,6 +401,7 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 	void * const    *prop;
+ 	boot_args      *boot_args_ptr = (boot_args *) args;
+ 
++	sweet_early_putc('1');
+ 	if (PE_state.initialized == FALSE) {
+ 		PE_state.initialized = TRUE;
+ 		PE_state.bootArgs = boot_args_ptr;
+@@ -416,21 +420,27 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 		PE_state.video.v_display = boot_args_ptr->Video.v_display;
+ 		strlcpy(PE_state.video.v_pixelFormat, "BBBBBBBBGGGGGGGGRRRRRRRR", sizeof(PE_state.video.v_pixelFormat));
+ 	}
++	sweet_early_putc('2');
+ 	if (!vm_initialized) {
+ 		/*
+ 		 * Setup the Device Tree routines
+ 		 * so the console can be found and the right I/O space
+ 		 * can be used..
+ 		 */
++		sweet_early_putc('H');
+ 		SecureDTInit(PE_state.deviceTreeHead, PE_state.deviceTreeSize);
++		sweet_early_putc('3');
+ 		pe_identify_machine(boot_args_ptr);
++		sweet_early_putc('4');
+ 	} else {
+ 		pe_arm_init_interrupts(args);
+ 		pe_arm_init_debug(args);
+ 	}
+ 
+ 	if (!vm_initialized) {
++		sweet_early_putc('5');
+ 		if (kSuccess == (SecureDTFindEntry("name", "device-tree", &entry))) {
++			sweet_early_putc('6');
+ 			if (kSuccess == SecureDTGetProperty(entry, "target-type",
+ 			    (void const **)&prop, &size)) {
+ 				if (size > sizeof(gTargetTypeBuffer)) {
+diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
+index aa75c0a..679d92f 100644
+--- a/pexpert/arm/pe_identify_machine.c
++++ b/pexpert/arm/pe_identify_machine.c
+@@ -8,6 +8,9 @@
+ #include <pexpert/device_tree.h>
+ 
+ #include <pexpert/arm64/board_config.h>
++#if defined(SWEET) || defined(VINCE)
++#include <arm64/sweet_early.h>
++#endif
+ 
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+@@ -57,9 +60,12 @@ pe_identify_machine(boot_args * bootArgs)
+ 
+ 	(void)bootArgs;
+ 
++	sweet_early_putc('a');
+ 	if (pe_arm_get_soc_base_phys() == 0) {
++		sweet_early_putc('!');
+ 		return;
+ 	}
++	sweet_early_putc('b');
+ 
+ 	/* Clear the gPEClockFrequencyInfo struct */
+ 	bzero((void *)&gPEClockFrequencyInfo, sizeof(clock_frequency_info_t));
+@@ -70,16 +76,20 @@ pe_identify_machine(boot_args * bootArgs)
+ 	gPEClockFrequencyInfo.cpu_clock_rate_hz = 400000000;
+ 
+ 	err = SecureDTLookupEntry(NULL, "/cpus", &cpus);
++	sweet_early_putc('c');
+ 	assert(err == kSuccess);
+ 
+ 	err = SecureDTInitEntryIterator(cpus, &iter);
++	sweet_early_putc('d');
+ 	assert(err == kSuccess);
+ 
+ 	while (kSuccess == SecureDTIterateEntries(&iter, &cpu)) {
++		sweet_early_putc('.');
+ 		if ((kSuccess != SecureDTGetProperty(cpu, "state", &value, &size)) ||
+ 		    (strncmp((char const *)value, "running", size) != 0)) {
+ 			continue;
+ 		}
++		sweet_early_putc('R');
+ 
+ 		/* Find the time base frequency first. */
+ 		if (SecureDTGetProperty(cpu, "timebase-frequency", &value, &size) == kSuccess) {
+@@ -182,14 +192,18 @@ pe_arm_get_soc_base_phys(void)
+ 	uint32_t        prop_size;
+ 	char const      *tmpStr;
+ 
++	sweet_early_putc('x');
+ 	if (SecureDTFindEntry("name", "arm-io", &entryP) == kSuccess) {
++		sweet_early_putc('y');
+ 		if (gPESoCDeviceType == 0) {
+-			SecureDTGetProperty(entryP, "device_type", (void const **)&tmpStr, &prop_size);
+-			strlcpy(gPESoCDeviceTypeBuffer, tmpStr, SOC_DEVICE_TYPE_BUFFER_SIZE);
+-			gPESoCDeviceType = gPESoCDeviceTypeBuffer;
+-
+-			SecureDTGetProperty(entryP, "ranges", (void const **)&ranges_prop, &prop_size);
+-			gPESoCBasePhys = *(ranges_prop + 1);
++			sweet_early_putc('z');
++			if (SecureDTGetProperty(entryP, "device_type", (void const **)&tmpStr, &prop_size) == kSuccess) {
++				strlcpy(gPESoCDeviceTypeBuffer, tmpStr, SOC_DEVICE_TYPE_BUFFER_SIZE);
++				gPESoCDeviceType = gPESoCDeviceTypeBuffer;
++			}
++			if (SecureDTGetProperty(entryP, "ranges", (void const **)&ranges_prop, &prop_size) == kSuccess) {
++				gPESoCBasePhys = *(ranges_prop + 1);
++			}
+ 		}
+ 		return gPESoCBasePhys;
+ 	}
 diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
 index 1756185..066c7ed 100644
 --- a/bsd/kern/mach_loader.c

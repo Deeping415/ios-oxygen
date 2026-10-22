@@ -7,7 +7,7 @@ Adapted from ios-sweet/tools/mkadt.py for Snapdragon 625 (MSM8953):
 - Physical RAM base @ 0xa0000000 (1.5 GB contiguous upper DRAM on MSM8953)
 - SDHCI eMMC controller @ 0x07824900
 - Synaptics RMI4 I2C touchscreen @ 0x20 on I2C-3
-- iPhone X identity for iOS 16 userland (display-scale 3, no-home-button)
+- iPhone X identity for iOS userland (display-scale 3, no-home-button)
 """
 import hashlib
 import os
@@ -24,6 +24,9 @@ PHYS_BASE = 0xa0000000
 MEM_SIZE = 0x58000000  # 1.375 GB contiguous (safe headroom below TZ/modem at top)
 
 PANIC_LOG_SIZE = 0x100000  # 1 MB panic log buffer
+
+# Non-zero SOC base for arm-io so pe_arm_get_soc_base_phys() returns non-zero
+SOC_BASE = 0x01000000
 
 # GICv2 (Qualcomm QGIC2) MMIO addresses
 GICD, GICD_SIZE = 0x0b000000, 0x1000
@@ -89,12 +92,30 @@ def build_vince_adt(seed=None):
         ('firmware-version', cstr('vince-shim')),
         ('system-firmware-version', cstr('vince-shim')),
         ('boot-manifest-hash', BOOT_MANIFEST_HASH),
+        ('crypto-hash-method', cstr('sha2-384')),
+        ('certificate-production-status', u32(0)),
+        ('effective-production-status-ap', u32(0)),
+        ('certificate-security-mode', u32(1)),
+        ('effective-security-mode-sep', u32(1)),
+    ], [
+        node('memory-map', [ph()]),
+        node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])
     ])
 
-    # GICv2 interrupt controller node
+    # GICv2 interrupt controller node (named 'interrupt-controller' for pe_fiq.c)
     gic = node('interrupt-controller', [
         ph(),
-        ('compatible', cstr('arm,gic-400') + cstr('arm,cortex-a15-gic') + b'\0'),
+        ('compatible', cstr('arm,cortex-a15-gic') + cstr('arm,gic-400') + b'\0'),
+        ('reg', u64(GICD, GICD_SIZE, GICC, GICC_SIZE)),
+        ('interrupt-controller', b''),
+        ('#interrupt-cells', u32(3)),
+        ('virtual-timer-intid', u32(VTIMER_INTID)),
+    ])
+
+    # Also add 'gic' alias node for any lookup of /arm-io/gic
+    gic_alias = node('gic', [
+        ph(),
+        ('compatible', cstr('arm,cortex-a15-gic') + cstr('arm,gic-400') + b'\0'),
         ('reg', u64(GICD, GICD_SIZE, GICC, GICC_SIZE)),
         ('interrupt-controller', b''),
         ('#interrupt-cells', u32(3)),
@@ -133,10 +154,15 @@ def build_vince_adt(seed=None):
         ('interrupts', u32(0, 65, 2)),  # GPIO 65
     ])
 
+    # arm-io with device_type and ranges so pe_arm_get_soc_base_phys() succeeds
     arm_io = node('arm-io', [
         ph(),
-        ('ranges', b''),
-    ], [gic, wdt, disp0, sdhci_node, touch_node])
+        ('device_type', cstr('vince-io')),
+        ('compatible', cstr('vince-io') + cstr('arm-io') + b'\0'),
+        ('#address-cells', u32(2)),
+        ('#size-cells', u32(2)),
+        ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
+    ], [gic, gic_alias, wdt, disp0, sdhci_node, touch_node])
 
     # Vince Framebuffer console node for early kprintf
     fbcon = node('vince-fbcon', [
@@ -156,42 +182,65 @@ def build_vince_adt(seed=None):
     # Buttons: Home button type 2 = iPhone X style (gestures, no physical home button)
     buttons = node('buttons', [
         ph(),
+        ('button-names', cstr('volup') + cstr('voldown') + cstr('hold')),
         ('home-button-type', u32(2)),
+        ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    # CPUs: 8 Cortex-A53 cores
-    cpus = []
-    for i in range(8):
-        c = node(f'cpu{i}', [
+    # CPUs: 8 Cortex-A53 cores (all 8 cores defined, cpu0 running, cpu1-7 stopped)
+    cpu_nodes = []
+    for core in range(8):
+        c = node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('reg', u32(i)),
+            ('compatible', cstr('qcom,cortex-a53') + cstr('ARM,v8') + b'\0'),
+            ('reg', u32(core)),
+            ('cpu-id', u32(core)),
+            ('cluster-id', u32(0 if core < 4 else 1)),
+            ('cluster-type', u32(0)),
+            ('die-cluster-id', u32(0)),
+            ('cluster-core-id', u32(core % 4)),
+            ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(TIMEBASE)),
             ('clock-frequency', u32(2016000000)),
+            ('bus-frequency', u32(100000000)),
+            ('memory-frequency', u32(1866000000)),
+            ('peripheral-frequency', u32(TIMEBASE)),
+            ('fixed-frequency', u32(TIMEBASE)),
             ('cpu-model', cstr('cortex-a53')),
         ])
-        cpus.append(c)
+        cpu_nodes.append(c)
+
+    cpus = node('cpus', [ph(), ('#address-cells', u32(1)), ('#size-cells', u32(0))], cpu_nodes)
 
     # Product identity: iPhone X (iPhone10,3 / D22AP)
     product_props = d22ap_product()
     if product_props:
-        product = node('product', [ph()] + product_props)
+        product = [node('product', [ph()] + product_props)]
     else:
-        product = node('product', [
+        product = [node('product', [
             ph(),
             ('product-id', u32(0x1003)),
             ('product-name', cstr('iPhone X')),
             ('model-number', cstr('D22AP')),
             ('device-class', cstr('iPhone')),
-        ])
+        ])]
 
-    root = node('', [
-        ('model', cstr('vince')),
-        ('compatible', cstr('xiaomi,vince') + cstr('qcom,msm8953') + b'\0'),
+    # Panic log region: /pram reg = <panic_base, PANIC_LOG_SIZE>
+    pram = node('pram', [ph(), ('reg', u64(panic_base, PANIC_LOG_SIZE))])
+
+    root = node('device-tree', [
+        ph(),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,vince') + cstr('qcom,msm8953') + cstr('AppleARM') + b'\0'),
+        ('model', cstr('iPhone10,3')),
         ('target-type', cstr('vince')),
+        ('target-sub-type', cstr('vince')),
+        ('manufacturer', cstr('Apple Inc.')),
         ('device-id', u64(VINCE_ECID)),
         ('timebase-frequency', u32(TIMEBASE)),
-    ], [chosen, defaults, node('cpus', [ph()], cpus), arm_io, fbcon, buttons, product])
+        ('#address-cells', u32(2)),
+        ('#size-cells', u32(2)),
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product)
 
     return root
 
