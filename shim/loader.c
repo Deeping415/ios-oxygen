@@ -91,6 +91,7 @@ const char *loader_boot(uintptr_t dtb)
 	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
 		return "ramdisk overlaps kernel memory";
 
+	con_str("LOADER",  "Copying kernel segments...");
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
@@ -125,8 +126,33 @@ const char *loader_boot(uintptr_t dtb)
 	ba->memSizeActual = p->mem_size;
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
+	con_hex("ENTRY",   entry_pa);
+	con_hex("BOOTARG", ba_pa);
+	con_str("HANDOVER", "Flushing cache & entering XNU...");
 
-	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
+	/* Flush copied kernel code and boot_args from D-cache to physical DRAM */
+	for (uintptr_t a = p->phys_base; a < top; a += 64) {
+		__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	/* Disable MMU and D-cache so XNU enters with clean flat physical addressing */
+	uint64_t sctlr;
+	__asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+	sctlr &= ~(1ULL << 0); /* SCTLR_M = 0 */
+	sctlr &= ~(1ULL << 2); /* SCTLR_C = 0 */
+	__asm__ volatile("msr sctlr_el1, %0; isb" : : "r"(sctlr) : "memory");
+
+	/* Invalidate TLB and I-cache */
+	__asm__ volatile(
+		"tlbi vmalle1\n"
+		"dsb sy\n"
+		"ic iallu\n"
+		"dsb sy\n"
+		"isb\n"
+		::: "memory"
+	);
+
 	((xnu_entry_t)entry_pa)(ba_pa);
 	return "xnu returned";
 }

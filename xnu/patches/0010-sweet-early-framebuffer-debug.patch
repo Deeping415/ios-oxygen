@@ -90,7 +90,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index ccbb188..777aca4 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -463,6 +463,42 @@ LEXT(start_first_cpu)
+@@ -463,6 +463,40 @@ LEXT(start_first_cpu)
  	mov		x20, x0
  	mov		x21, #0
  
@@ -133,21 +133,31 @@ index ccbb188..777aca4 100644
  	// Set low reset vector before attempting any loads
  	adrp	x0, EXT(LowExceptionVectorBase)@page
  	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
-@@ -609,6 +643,31 @@ Lkernelcache_base_found:
+@@ -609,6 +643,39 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
 +#if defined(VINCE)
 +	/*
-+	 * Splash framebuffer: one 32MB Normal-NC block at 0x90000000 in V=P L2 table.
++	 * Splash framebuffer: 16MB (8x 2MB blocks) at 0x90000000 in V=P L2 table.
 +	 */
 +	MOV64	x10, 0x90000000
-+	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
-+	orr		x11, x11, x10
++	and		x12, x10, #(ARM_TT_L1_INDEX_MASK)
++	lsr		x12, x12, #(ARM_TT_L1_SHIFT)
++	ldr		x13, [x25, x12, lsl #TTE_SHIFT]
++	and		x13, x13, #(ARM_TTE_TABLE_MASK)
 +	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
 +	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
-+	add		x13, x25, #(2 * PGBYTES)
-+	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	add		x13, x13, x12, lsl #TTE_SHIFT
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	orr		x11, x11, x10
++	mov		x12, #8
++	MOV64	x10, (1 << ARM_TT_L2_SHIFT)
++Lvince_map_fb_loop:
++	str		x11, [x13], #8
++	add		x11, x11, x10
++	subs	x12, x12, #1
++	b.ne	Lvince_map_fb_loop
 +#elif defined(SWEET)
 +	/*
 +	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
@@ -170,12 +180,11 @@ new file mode 100644
 index 0000000..8f4c808
 --- /dev/null
 +++ b/osfmk/arm64/sweet_early.c
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,155 @@
 +/*
 + * Bootstrap console for Qualcomm platforms (vince / sweet).
 + */
-+#include <arm64/sweet_early.h>
-+
++#include <pexpert/arm64/board_config.h>
 +#if defined(VINCE) || defined(SWEET)
 +#include <stdint.h>
 +#include <kern/misc_protos.h>
@@ -190,26 +199,32 @@ index 0000000..8f4c808
 +#define EARLY_FB_PHYS 0x9c000000ULL
 +#define EARLY_WIDTH 1080u
 +#define EARLY_HEIGHT 2400u
-+#define EARLY_STRIDE (4320u / 4)
++#define EARLY_STRIDE 4320u
 +#define EARLY_BPP 4u
 +#endif
-+
-+static volatile uint8_t *early_fb = (volatile uint8_t *)(uintptr_t)EARLY_FB_PHYS;
 +
 +#define EARLY_SCALE 2u
 +#define EARLY_CELL_W (8u * EARLY_SCALE)
 +#define EARLY_CELL_H (16u * EARLY_SCALE)
-+#define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
 +#define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
++#define EARLY_ROWS (EARLY_HEIGHT / EARLY_CELL_H)
 +
-+extern unsigned char iso_font[256 * 16];
++extern const unsigned char iso_font[256 * 16];
 +
-+static unsigned int early_row, early_col;
-+static unsigned int early_started, early_disabled, early_panicking;
++static volatile uint8_t *early_fb = (volatile uint8_t *)EARLY_FB_PHYS;
++static unsigned int early_col = 0;
++static unsigned int early_row = 0;
++static int early_disabled = 0;
++static int early_panicking = 0;
 +
 +static void
-+early_clear_row(void)
++sweet_early_newline(void)
 +{
++	early_col = 0;
++	early_row++;
++	if (early_row >= EARLY_ROWS) {
++		early_row = 0;
++	}
 +	for (unsigned int y = 0; y < EARLY_CELL_H; y++) {
 +#if defined(VINCE)
 +		volatile uint8_t *line = early_fb + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
@@ -217,7 +232,8 @@ index 0000000..8f4c808
 +			line[x] = 0;
 +		}
 +#else
-+		volatile uint32_t *line = (volatile uint32_t *)early_fb + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
++		volatile uint32_t *line = (volatile uint32_t *)early_fb +
++		    (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
 +		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
 +			line[x] = 0xff000000u;
 +		}
@@ -231,21 +247,16 @@ index 0000000..8f4c808
 +	if (early_disabled) {
 +		return;
 +	}
-+	if (!early_started) {
-+		early_started = 1;
-+		early_clear_row();
-+	}
 +	if (c == '\r') {
 +		early_col = 0;
 +		return;
 +	}
-+	if (c == '\n' || early_col == EARLY_COLS) {
-+		early_col = 0;
-+		early_row = (early_row + 1) % EARLY_ROWS;
-+		early_clear_row();
-+		if (c == '\n') {
-+			return;
-+		}
++	if (c == '\n') {
++		sweet_early_newline();
++		return;
++	}
++	if (early_col >= EARLY_COLS) {
++		sweet_early_newline();
 +	}
 +	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
 +	for (unsigned int gy = 0; gy < 16; gy++) {
