@@ -26,7 +26,8 @@ def main():
                 running "Applying patch: ${PATCH}"
                 git apply "$PATCH"
             else
-                case "${PATCH}" in
+                PATCH_NAME=$(basename "${PATCH}")
+                case "${PATCH_NAME}" in
                     *0004*|*0090*|*vince*)
                         error "CRITICAL VINCE PATCH FAILED: ${PATCH}: ${APPLY_CHECK}"
                         exit 1
