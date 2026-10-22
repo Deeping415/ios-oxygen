@@ -536,7 +536,7 @@ index 505e727..4ccbe44 100644
  }
  #endif
 diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
-index 04dda53..1a79219 100644
+index 04dda53..4fb117a 100644
 --- a/pexpert/arm/pe_init.c
 +++ b/pexpert/arm/pe_init.c
 @@ -21,6 +21,9 @@
@@ -544,7 +544,7 @@ index 04dda53..1a79219 100644
  
  #include <pexpert/arm64/board_config.h>
 +#if defined(SWEET) || defined(VINCE)
-+#include <arm64/sweet_early.h>
++extern void sweet_early_putc(char c);
 +#endif
  
  
@@ -586,7 +586,7 @@ index 04dda53..1a79219 100644
  			    (void const **)&prop, &size)) {
  				if (size > sizeof(gTargetTypeBuffer)) {
 diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
-index aa75c0a..679d92f 100644
+index aa75c0a..0b2fe99 100644
 --- a/pexpert/arm/pe_identify_machine.c
 +++ b/pexpert/arm/pe_identify_machine.c
 @@ -8,6 +8,9 @@
@@ -594,7 +594,7 @@ index aa75c0a..679d92f 100644
  
  #include <pexpert/arm64/board_config.h>
 +#if defined(SWEET) || defined(VINCE)
-+#include <arm64/sweet_early.h>
++extern void sweet_early_putc(char c);
 +#endif
  
  #include <kern/clock.h>
