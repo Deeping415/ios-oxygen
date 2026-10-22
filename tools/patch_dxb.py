@@ -8,7 +8,7 @@ def main():
     # 1. libfirehose_kernel arm64 support (strictly ARMv8.0-A Cortex-A53 without LSE atomics)
     content = content.replace(
         'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"',
-        'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="$(inherited) -march=armv8-a -mcpu=cortex-a53"'
+        'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -march=armv8-a -mcpu=cortex-a53"'
     )
     content = content.replace(
         'sed -i \'\' \'s|$(SDKROOT)/usr/local/include|$(FAKEROOT_DIR)/usr/local/include|g\' "${SRCROOT}/xcodeconfig/libfirehose_kernel.xcconfig"\n        echo \'OTHER_CFLAGS[arch=arm64] = $(inherited) -march=armv8-a -mcpu=cortex-a53 -mstrict-align\' >> "${SRCROOT}/xcodeconfig/libfirehose_kernel.xcconfig"',
