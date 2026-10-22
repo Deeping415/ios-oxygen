@@ -5,10 +5,14 @@ def main():
     with open(target, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # 1. libfirehose_kernel arm64 support
+    # 1. libfirehose_kernel arm64 support (strictly ARMv8.0-A Cortex-A53 without LSE atomics)
     content = content.replace(
         'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"',
         'ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"'
+    )
+    content = content.replace(
+        'sed -i \'\' \'s|$(SDKROOT)/usr/local/include|$(FAKEROOT_DIR)/usr/local/include|g\' "${SRCROOT}/xcodeconfig/libfirehose_kernel.xcconfig"',
+        'sed -i \'\' \'s|$(SDKROOT)/usr/local/include|$(FAKEROOT_DIR)/usr/local/include|g\' "${SRCROOT}/xcodeconfig/libfirehose_kernel.xcconfig"\n        echo \'OTHER_CFLAGS[arch=arm64] = $(inherited) -march=armv8-a -mcpu=cortex-a53 -mstrict-align\' >> "${SRCROOT}/xcodeconfig/libfirehose_kernel.xcconfig"'
     )
 
     # 2. Target-aware patch application loop (fail on critical Vince patches, warn on optional)

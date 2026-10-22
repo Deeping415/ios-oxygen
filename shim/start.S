@@ -36,7 +36,8 @@ _start:
 	cmp	x1, #2
 	b.ne	.Lat_el1
 
-	/* Running at EL2: set HCR_EL2.RW = 1 (64-bit EL1) and drop to EL1h */
+	/* Running at EL2: set HCR_EL2.RW = 1 (64-bit EL1), clear CPTR_EL2, and drop to EL1h */
+	msr	cptr_el2, xzr
 	mov	x1, #(1 << 31)
 	msr	hcr_el2, x1
 	mov	x1, #0x3c5		/* DAIF masked, EL1h mode */
@@ -47,6 +48,8 @@ _start:
 
 .Lat_el1:
 	msr	daifset, #0xf
+	mov	x1, #(3 << 20)		/* Enable FP/SIMD at EL1 & EL0 (CPACR_EL1.FPEN = 0b11) */
+	msr	cpacr_el1, x1
 	mov	x19, x0			/* DTB pointer from ABL */
 	msr	spsel, #1
 	adr	x1, _stack_top
@@ -84,6 +87,8 @@ secondary_entry:
 
 .Lsec_el1:
 	msr	daifset, #0xf
+	mov	x2, #(3 << 20)
+	msr	cpacr_el1, x2
 	msr	spsel, #1
 	adr	x1, _sec_stacks
 	add	x1, x1, x0, lsl #12

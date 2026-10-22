@@ -29,7 +29,7 @@ index 2a4e4ec..04f7989 100755
  CFLAGS_RELEASEX86_64 = -O2
  CFLAGS_DEVELOPMENTX86_64 = -O2
 diff --git a/pexpert/pexpert/arm64/VINCE.h b/pexpert/pexpert/arm64/VINCE.h
-index 4a50b6e..b768ee9 100755
+index 4a50b6e..e008bb3 100755
 --- a/pexpert/pexpert/arm64/VINCE.h
 +++ b/pexpert/pexpert/arm64/VINCE.h
 @@ -6,20 +6,28 @@
@@ -50,7 +50,7 @@ index 4a50b6e..b768ee9 100755
 +#define __ARM_COHERENT_IO__       1
  #define __ARM_DEBUG__             7
 +#define ARM_BOARD_WFE_TIMEOUT_NS  1000
-+#undef  KERNEL_INTEGRITY_WT
++#undef KERNEL_INTEGRITY_WT
 +#define NO_MONITOR                1
 +#define NO_ECORE                  1
 +
@@ -82,7 +82,7 @@ index aa05d9e..87208f9 100755
  #define MAX_L2_CLINE                   6
  #define MAX_CPUS                       8
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e3579f1..bd2c5b2 100755
+index e3579f1..aafc0ff 100755
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -348,16 +348,21 @@ arm_init(
@@ -144,6 +144,30 @@ index e3579f1..bd2c5b2 100755
  #ifdef  APPLETYPHOON
  		if (PE_parse_boot_argn("cpus_defeatures", &cpus_defeatures, sizeof(cpus_defeatures))) {
  			if ((cpus_defeatures & 0xF) != 0) {
+@@ -590,6 +590,15 @@ arm_init(
+ 
+ 	cpu_machine_idle_init(TRUE);
+ 
++	sweet_early_mark(12, "switching VBAR_EL1 to ExceptionVectorsBase");
++#if defined(VINCE)
++	{
++		extern void ExceptionVectorsBase;
++		__builtin_arm_wsr64("VBAR_EL1", (uint64_t)(uintptr_t)&ExceptionVectorsBase);
++		__builtin_arm_isb(ISB_SY);
++	}
++#endif
++
+ 	PE_init_platform(TRUE, &BootCpuData);
+ 
+ #if __arm64__
+@@ -656,6 +665,7 @@ arm_init(
+ 	 * against string vulnerabilities
+ 	 */
+ 	__stack_chk_guard &= ~(0xFFULL << 8);
++	sweet_early_mark(13, "entering machine_startup");
+ 	machine_startup(args);
+ }
+ 
 diff --git a/osfmk/arm/commpage/commpage.c b/osfmk/arm/commpage/commpage.c
 index ee9f8de..292a62c 100755
 --- a/osfmk/arm/commpage/commpage.c
@@ -215,7 +239,7 @@ index c3eb554..fbeb6ee 100755
  #define SCTLR_CSEH_DEFAULT        (SCTLR_EIS | SCTLR_EOS)
  #define SCTLR_DSSBS_DEFAULT       (0)
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 37289cb..07f8200 100755
+index 37289cb..c8e50f2 100755
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -232,6 +232,54 @@ LEXT(_start)
@@ -313,18 +337,7 @@ index 37289cb..07f8200 100755
  /*
   * _start_first_cpu
   * Cold boot init routine.  Called from __start
-@@ -460,26 +534,19 @@ LEXT(start_first_cpu)
- 	msr		OSLAR_EL1, xzr
- 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
- 
-+#if defined(VINCE)
-+	// Enable NEON / Advanced SIMD and FP (CPACR_EL1.FPEN = 0b11)
-+	mov		x0, #(CPACR_FPEN_ENABLE)
-+	msr		CPACR_EL1, x0
-+	isb
-+#endif
-+
- 	mov		x20, x0
+@@ -464,22 +538,8 @@ LEXT(start_first_cpu)
  	mov		x21, #0
  
  #if defined(VINCE)
@@ -349,7 +362,7 @@ index 37289cb..07f8200 100755
  #elif defined(SWEET)
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
  	MOV64	x0, (0x9c000000 + 2368 * 4320)
-@@ -561,13 +628,22 @@ Lsweet_mark_pixel:
+@@ -561,13 +621,22 @@ Lsweet_mark_pixel:
  	mov		x0, #(ARM_TTE_EMPTY)				// Load invalid entry template
  	mov		x1, x25								// Start at V=P pagetable root
  	mov		x2, #(TTE_PGENTRIES)				// Load number of entries per page
@@ -372,7 +385,7 @@ index 37289cb..07f8200 100755
  	/*
  	 * In order to reclaim memory on targets where TZ0 (or some other entity)
  	 * must be located at the base of memory, iBoot may set the virtual and
-@@ -647,15 +723,25 @@ Lkernelcache_base_found:
+@@ -647,15 +716,25 @@ Lkernelcache_base_found:
  
  #if defined(VINCE)
  	/*
@@ -401,7 +414,7 @@ index 37289cb..07f8200 100755
  #elif defined(SWEET)
  	/*
  	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
-@@ -746,6 +832,11 @@ common_start:
+@@ -746,6 +825,11 @@ common_start:
  	tlbi	vmalle1
  	dsb		ish
  
@@ -413,7 +426,7 @@ index 37289cb..07f8200 100755
  
  #if defined(BCM2837)
  	// Setup timer interrupt routing; must be done before MMU is enabled
-@@ -790,10 +881,17 @@ common_start:
+@@ -790,10 +874,17 @@ common_start:
  
  	cbnz		x21, 1f
  #endif /* __ARM_KERNEL_PROTECT__ */
@@ -431,7 +444,7 @@ index 37289cb..07f8200 100755
  1:
  	MSR_VBAR_EL1_X0
  
-@@ -801,18 +899,28 @@ common_start:
+@@ -801,18 +892,28 @@ common_start:
  	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
  #endif /* HAS_APPLE_PAC */
  
@@ -461,15 +474,15 @@ index 37289cb..07f8200 100755
  	/* Watchtower
  	 *
  	 * If we have a Watchtower monitor it will setup CPACR_EL1 for us, touching
-@@ -822,6 +930,7 @@ common_start:
+@@ -822,6 +923,7 @@ common_start:
  	// Enable NEON
  	mov		x0, #(CPACR_FPEN_ENABLE)
  	msr		CPACR_EL1, x0
-+	isb
++	isb		sy
  #endif
  
  	// Clear thread pointer
-@@ -868,6 +977,11 @@ common_start:
+@@ -868,6 +970,11 @@ common_start:
  	mov	lr, x21
  #endif
  
