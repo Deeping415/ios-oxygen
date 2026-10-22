@@ -29,7 +29,7 @@ index 2a4e4ec..04f7989 100755
  CFLAGS_RELEASEX86_64 = -O2
  CFLAGS_DEVELOPMENTX86_64 = -O2
 diff --git a/pexpert/pexpert/arm64/VINCE.h b/pexpert/pexpert/arm64/VINCE.h
-index 4a50b6e..ab3b03a 100755
+index 4a50b6e..b768ee9 100755
 --- a/pexpert/pexpert/arm64/VINCE.h
 +++ b/pexpert/pexpert/arm64/VINCE.h
 @@ -6,20 +6,28 @@
@@ -50,7 +50,7 @@ index 4a50b6e..ab3b03a 100755
 +#define __ARM_COHERENT_IO__       1
  #define __ARM_DEBUG__             7
 +#define ARM_BOARD_WFE_TIMEOUT_NS  1000
-+#define KERNEL_INTEGRITY_WT       0
++#undef  KERNEL_INTEGRITY_WT
 +#define NO_MONITOR                1
 +#define NO_ECORE                  1
 +
@@ -215,7 +215,7 @@ index c3eb554..fbeb6ee 100755
  #define SCTLR_CSEH_DEFAULT        (SCTLR_EIS | SCTLR_EOS)
  #define SCTLR_DSSBS_DEFAULT       (0)
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 37289cb..d2bd6fe 100755
+index 37289cb..07f8200 100755
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -232,6 +232,54 @@ LEXT(_start)
@@ -313,7 +313,18 @@ index 37289cb..d2bd6fe 100755
  /*
   * _start_first_cpu
   * Cold boot init routine.  Called from __start
-@@ -464,22 +538,8 @@ LEXT(start_first_cpu)
+@@ -460,26 +534,19 @@ LEXT(start_first_cpu)
+ 	msr		OSLAR_EL1, xzr
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+ 
++#if defined(VINCE)
++	// Enable NEON / Advanced SIMD and FP (CPACR_EL1.FPEN = 0b11)
++	mov		x0, #(CPACR_FPEN_ENABLE)
++	msr		CPACR_EL1, x0
++	isb
++#endif
++
+ 	mov		x20, x0
  	mov		x21, #0
  
  #if defined(VINCE)
@@ -338,7 +349,7 @@ index 37289cb..d2bd6fe 100755
  #elif defined(SWEET)
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
  	MOV64	x0, (0x9c000000 + 2368 * 4320)
-@@ -561,13 +621,22 @@ Lsweet_mark_pixel:
+@@ -561,13 +628,22 @@ Lsweet_mark_pixel:
  	mov		x0, #(ARM_TTE_EMPTY)				// Load invalid entry template
  	mov		x1, x25								// Start at V=P pagetable root
  	mov		x2, #(TTE_PGENTRIES)				// Load number of entries per page
@@ -361,7 +372,7 @@ index 37289cb..d2bd6fe 100755
  	/*
  	 * In order to reclaim memory on targets where TZ0 (or some other entity)
  	 * must be located at the base of memory, iBoot may set the virtual and
-@@ -647,15 +716,25 @@ Lkernelcache_base_found:
+@@ -647,15 +723,25 @@ Lkernelcache_base_found:
  
  #if defined(VINCE)
  	/*
@@ -390,7 +401,7 @@ index 37289cb..d2bd6fe 100755
  #elif defined(SWEET)
  	/*
  	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
-@@ -746,6 +825,11 @@ common_start:
+@@ -746,6 +832,11 @@ common_start:
  	tlbi	vmalle1
  	dsb		ish
  
@@ -402,7 +413,7 @@ index 37289cb..d2bd6fe 100755
  
  #if defined(BCM2837)
  	// Setup timer interrupt routing; must be done before MMU is enabled
-@@ -790,10 +874,17 @@ common_start:
+@@ -790,10 +881,17 @@ common_start:
  
  	cbnz		x21, 1f
  #endif /* __ARM_KERNEL_PROTECT__ */
@@ -420,7 +431,7 @@ index 37289cb..d2bd6fe 100755
  1:
  	MSR_VBAR_EL1_X0
  
-@@ -801,11 +892,21 @@ common_start:
+@@ -801,18 +899,28 @@ common_start:
  	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
  #endif /* HAS_APPLE_PAC */
  
@@ -442,7 +453,23 @@ index 37289cb..d2bd6fe 100755
  #if !VMAPPLE && !defined(SWEET) && !defined(VINCE)
  	MOV64   x1, SCTLR_EL1_DEFAULT
  	cmp		x0, x1
-@@ -868,6 +969,11 @@ common_start:
+ 	bne		.
+ #endif /* !VMAPPLE && !SWEET && !VINCE */
+ 
+-#if (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))
++#if defined(VINCE) || (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))
+ 	/* Watchtower
+ 	 *
+ 	 * If we have a Watchtower monitor it will setup CPACR_EL1 for us, touching
+@@ -822,6 +930,7 @@ common_start:
+ 	// Enable NEON
+ 	mov		x0, #(CPACR_FPEN_ENABLE)
+ 	msr		CPACR_EL1, x0
++	isb
+ #endif
+ 
+ 	// Clear thread pointer
+@@ -868,6 +977,11 @@ common_start:
  	mov	lr, x21
  #endif
  
