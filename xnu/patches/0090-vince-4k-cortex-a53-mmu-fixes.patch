@@ -433,10 +433,10 @@ index 37289cb..aed4136 100644
  	ret
  
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
-index 54a7655..c8e2fc2 100644
+index f103a9f..c8e2fc2 100644
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
-@@ -8,7 +8,11 @@
+@@ -8,6 +8,9 @@
  #if defined(SWEET) || defined(VINCE)
  void sweet_early_mark(unsigned int stage, const char *label);
  void sweet_early_putc(char c);
@@ -444,35 +444,13 @@ index 54a7655..c8e2fc2 100644
 +void sweet_early_puts(const char *s);
 +void vince_early_exception(uint64_t esr, uint64_t far, uint64_t elr);
  void sweet_early_panic(const char *fmt, va_list *args);
-+void sweet_early_relocate(uint64_t base);
+ void sweet_early_relocate(uint64_t base);
  void sweet_early_disable(void);
- #else
- static inline void sweet_early_mark(unsigned int stage, const char *label)
 diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
-index baf3490..c9effe4 100644
+index 9a73607..c9effe4 100644
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
-@@ -23,6 +23,19 @@
- 
- static volatile uint8_t *early_fb = (volatile uint8_t *)(uintptr_t)EARLY_FB_PHYS;
- 
-+void
-+sweet_early_relocate(uint64_t base)
-+{
-+	sweet_early_mark(8, "leaving bootstrap TTBR0");
-+#if defined(VINCE)
-+	early_fb = (volatile uint8_t *)(uintptr_t)(base + 0x1000);
-+#else
-+	early_fb = (volatile uint8_t *)(uintptr_t)base;
-+#endif
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	sweet_early_mark(9, "kernel framebuffer VA live");
-+}
-+
- #define EARLY_SCALE 2u
- #define EARLY_CELL_W (8u * EARLY_SCALE)
- #define EARLY_CELL_H (16u * EARLY_SCALE)
-@@ -114,6 +127,34 @@ sweet_early_string(const char *s)
+@@ -127,6 +127,34 @@ sweet_early_string(const char *s)
  	}
  }
  
