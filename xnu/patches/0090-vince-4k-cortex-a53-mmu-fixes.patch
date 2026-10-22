@@ -1,5 +1,5 @@
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
-index 2a4e4ec..04f7989 100644
+index 2a4e4ec..cd1e91c 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
 @@ -62,7 +62,7 @@ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
@@ -24,7 +24,7 @@ index 2a4e4ec..04f7989 100644
  
  CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
 -			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
-+			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel -mstrict-align
++			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel -mno-implicit-float -fno-vectorize -fno-slp-vectorize -mstrict-align
  
  CFLAGS_RELEASEX86_64 = -O2
  CFLAGS_DEVELOPMENTX86_64 = -O2
@@ -868,6 +868,19 @@ index c53d45d..d1b5339 100644
  	/* Hash without depending on the absent corecrypto kext's dispatch table. */
  	const struct ccdigest_info *di = &ccsha256_ltc_di;
  	ccdigest_di_decl(di, ctx);
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 384118e..0b97535 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -2855,7 +2855,7 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ 			gc_acquired = TRUE;
+ 		} else {
+ 			if (makeMapping) {
+-#if HAS_UCNORMAL_MEM
++#if HAS_UCNORMAL_MEM || defined(SWEET) || defined(VINCE)
+ 				/*
+ 				 * Framebuffers would normally use VM_WIMG_RT, which
+ 				 * io_map doesn't support.  However this buffer is set up
 diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
 index 04dda53..4fb117a 100644
 --- a/pexpert/arm/pe_init.c
@@ -1151,6 +1164,44 @@ index 59c834e..d44759e 100644
  	/*
  	 * SWEET has no IOStorageFamily, so no service can be a block storage
  	 * driver: the root (e.g. a RAM disk) is not block media, as for image boot.
+diff --git a/bsd/kern/qsort.c b/bsd/kern/qsort.c
+index 74c506b..b7a2df5 100644
+--- a/bsd/kern/qsort.c
++++ b/bsd/kern/qsort.c
+@@ -195,14 +195,25 @@ loop:   SWAPINIT(a, es);
+ 	vecswap(a, pb - r, r);
+ 	r = min(pd - pc, pn - pd - es);
+ 	vecswap(pb, pn - r, r);
+-	if ((size_t)(r = pb - pa) > es) {
+-		qsort(a, r / es, es, cmp);
+-	}
+-	if ((size_t)(r = pd - pc) > es) {
+-		/* Iterate rather than recurse to save stack space */
+-		a = pn - r;
+-		n = r / es;
+-		goto loop;
++	if ((pb - pa) < (pd - pc)) {
++		if ((size_t)(r = pb - pa) > es) {
++			qsort(a, r / es, es, cmp);
++		}
++		if ((size_t)(r = pd - pc) > es) {
++			/* Iterate rather than recurse to save stack space */
++			a = pn - r;
++			n = r / es;
++			goto loop;
++		}
++	} else {
++		if ((size_t)(r = pd - pc) > es) {
++			qsort(pn - r, r / es, es, cmp);
++		}
++		if ((size_t)(r = pb - pa) > es) {
++			/* Iterate rather than recurse to save stack space */
++			n = r / es;
++			goto loop;
++		}
+ 	}
+ /*		qsort(pn - r, r / es, es, cmp);*/
+ }
 diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
 index 1756185..066c7ed 100644
 --- a/bsd/kern/mach_loader.c
@@ -1266,10 +1317,21 @@ index 2d5b6a3..008e7b0 100644
   * SWEET: off by default (sysctl kern.coredump=1 enables it). A crashing iOS
   * daemon maps the whole shared region, so one core is gigabytes on the root
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 68612db..8262ed2 100644
+index 68612db..bfc495b 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7411,7 +7411,7 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -7392,7 +7392,9 @@ process_signature(proc_t p, struct image_params *imgp)
+ 		struct _posix_spawnattr *psa = (struct _posix_spawnattr *) imgp->ip_px_sa;
+ 		if (psa == NULL || psa->psa_platform == 0) {
+ 			boolean_t no_sandbox_entitled = FALSE;
+-#if DEBUG || DEVELOPMENT
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
++			no_sandbox_entitled = TRUE;
++#elif DEBUG || DEVELOPMENT
+ 			/*
+ 			 * Allow iOS binaries to spawn on internal systems
+ 			 * if no-sandbox entitlement is present of unentitled_ios_sim_launch
+@@ -7411,7 +7413,7 @@ process_signature(proc_t p, struct image_params *imgp)
  				error = EACCES;
  				goto done;
  			}
