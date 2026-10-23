@@ -1,0 +1,800 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -53,7 +53,7 @@ sweet_pthread_support.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+ sweet_pthread_synch.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+ endif
+ 
+-ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++ifneq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET VINCE),)
+ 
+ # Apple OSS HFS built in (bsd/sweet_hfs): compiled like the kext, see sweet_hfs_compat.h.
+ # The compat header must come after the kernel's -D options, hence _CFLAGS_ADD.
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/vince_mmc.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/vince_mmc.c
+@@ -0,0 +1,724 @@
++/*
++ * VINCE internal eMMC root device (read-only).
++ *
++ * SDCC1 on the MSM8953 is an SDHCI 3.0 host (0x07824900) behind Qualcomm's MCI core (0x07824000). LK leaves it
++ * unusable: the card asleep (CMD5), the core switched back to MCI mode, VENDOR_SPEC forcing HS400 with the DLL
++ * in reset, and the card clock (the GCC SDCC1 apps RCG; the MSM SDHCI ignores its own divider) at 384 MHz. So this
++ * driver re-initialises host and card from scratch, the sequence proven with the shim's monitor
++ * (vince-bringup/shim/mmc.c, 2026-10-24):
++ *   GCC RCG to 50 MHz, MCI core reset, HC_MODE, power-request acks, VENDOR_SPEC (no HS400 select, default MCLK,
++ *   1.8 V pads), 1.8 V signalling, 400 kHz with a delay after every SDHCI write (the host runs on the card clock),
++ *   CMD0 CMD1 CMD2 CMD3 CMD7, CMD6 to 8-bit and High Speed (volatile EXT_CSD bytes only), 50 MHz.
++ * Data moves by PIO through the buffer data port, polled, one command at a time; no DMA, no interrupts.
++ *
++ * It finds one GPT partition by name (boot-arg mmcroot=, default "userdata") and exposes it as the BSD disk
++ * mmcroot0 (rmmcroot0) with 512-byte sectors. Root on it with rd=mmcroot0. mmcprobe=1 (with any other root) only
++ * initialises it and logs the partition and the filesystem signature found on it. Writes are refused, and no
++ * command that writes the card's data (CMD24/25) exists here.
++ */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define SDCC1_PHYS      0x07824000ul    /* MCI core; the SDHCI registers start at +0x900 */
++#define GCC_SDCC1_PHYS  0x01842000ul    /* SDCC1 BCR, then the apps RCG at +4 */
++#define HC              0x900u
++
++/* MCI core */
++#define MCI_POWER       0x000           /* bit 7: software reset of the whole SDCC */
++#define MCI_STATUS2     0x06c           /* bit 0: MCI active */
++#define MCI_HC_MODE     0x078           /* bit 0: SDHCI mode, bit 13: FF_CLK_SW_RST_DIS */
++#define PWRCTL_STATUS   0x0dc           /* bus off/on, IO low/high requests */
++#define PWRCTL_CLEAR    0x0e4
++#define PWRCTL_CTL      0x0e8           /* bit 0: bus success, bit 2: IO success */
++
++/* SDHCI, relative to HC */
++#define BLKSZ           0x04            /* block size | block count << 16 */
++#define ARG             0x08
++#define XFER            0x0c            /* transfer mode | command << 16 */
++#define RESP0           0x10
++#define BUF             0x20
++#define PSTATE          0x24
++#define HOSTCTL         0x28            /* host control 1 | power << 8 */
++#define CLKCTL          0x2c            /* clock | timeout << 16 | software reset << 24 */
++#define INTSTS          0x30            /* normal | error << 16 */
++#define INTEN           0x34
++#define SIGEN           0x38
++#define HOSTCTL2        0x3c            /* auto CMD12 error | host control 2 << 16 */
++#define VENDOR_SPEC     0x10c           /* MSM vendor register, on the SDHCI base for the v4 core too */
++
++#define VS_MCLK_MASK    (3u << 8)
++#define VS_MCLK_DFLT    (2u << 8)
++#define VS_IO_PAD_EN    (1u << 15)
++#define VS_IO_PAD_18V   (1u << 16)
++#define VS_SELECT_IN    (0xfu << 18)    /* HC_SELECT_IN_EN (18) and HC_SELECT_IN (21:19) */
++
++#define PS_CMD_INHIBIT  (1u << 0)
++#define PS_DAT_INHIBIT  (1u << 1)
++#define INT_CMD         (1u << 0)
++#define INT_XFER        (1u << 1)
++#define INT_RDREADY     (1u << 5)
++#define INT_ERR         (1u << 15)
++#define CLK_INT_EN      (1u << 0)
++#define CLK_STABLE      (1u << 1)
++#define CLK_SD_EN       (1u << 2)
++#define TIMEOUT_MAX     (0xeu << 16)
++#define RST_CMD         (1u << 25)
++#define RST_DAT         (1u << 26)
++#define HC_HISPEED      (1u << 2)
++#define HC_8BIT         (1u << 5)
++#define PWR_18V_ON      (0x0bu << 8)
++#define HC2_18V         (1u << (16 + 3))
++
++#define XM_BLKCNT       (1u << 1)
++#define XM_ACMD12       (1u << 2)
++#define XM_READ         (1u << 4)
++#define XM_MULTI        (1u << 5)
++
++#define C_R136          0x01
++#define C_R48           0x02
++#define C_R48B          0x03
++#define C_CRC           0x08
++#define C_IDX           0x10
++#define C_DATA          0x20
++#define F_R1            (C_R48 | C_CRC | C_IDX)
++#define F_R1B           (C_R48B | C_CRC | C_IDX)
++#define F_R2            (C_R136 | C_CRC)
++#define F_R3            C_R48
++
++#define RCA             2u
++#define OCR_SECTOR_18V  0x40ff8080u     /* sector mode, 2.7-3.6 V and 1.70-1.95 V */
++#define R1_ERR          0xfd380080u     /* status errors that belong to the command itself */
++
++/* GCC RCG settings (gcc-msm8953 ftbl): cfg = mode << 12 | src << 8 | (2 * div - 1), then M/N */
++#define RCG_400K        0x2017u, 1u, 4u         /* XO 19.2 MHz / 12 * 1/4 */
++#define RCG_50M         0x011fu, 0u, 0u         /* GPLL0 800 MHz / 16 */
++
++#define SECTOR          512u
++#define MAX_SECTORS     64u             /* per CMD18, = the bounce buffer */
++#define MAX_IO          (1u << 20)      /* what the BSD layer may ask for at once */
++
++static struct {
++	vm_offset_t base;               /* SDCC1, core at +0, SDHCI at +HC */
++	vm_offset_t gcc;
++	uint32_t wdelay_us;             /* after each SDHCI write while the card clock is slow */
++	uint32_t resp;
++	uint32_t err;                   /* interrupt status (or the polled register) at the last failure */
++	uint64_t first, nsect;          /* partition, in 512-byte sectors */
++	uint32_t secsize;               /* logical sector size for the BSD layer */
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} vm;
++
++static uint32_t vince_mmc_bounce[MAX_SECTORS * SECTOR / 4];
++
++static LCK_GRP_DECLARE(vince_mmc_grp, "vince_mmc");
++static LCK_MTX_DECLARE(vince_mmc_lock, &vince_mmc_grp);
++
++static inline uint32_t
++hc_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(vm.base + HC + off);
++}
++
++static inline void
++hc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(vm.base + HC + off) = v;
++	if (vm.wdelay_us) {
++		delay(vm.wdelay_us);
++	}
++}
++
++static inline uint32_t
++core_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(vm.base + off);
++}
++
++static inline void
++core_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(vm.base + off) = v;
++}
++
++static inline void
++rcg_wr(uint32_t i, uint32_t v)
++{
++	((volatile uint32_t *)(vm.gcc + 4))[i] = v;    /* CMD_RCGR, CFG, M, N, D */
++}
++
++static uint64_t
++deadline_ms(uint32_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &t);
++	return mach_absolute_time() + t;
++}
++
++/* (*reg & mask) == want within ms; 0 or ETIMEDOUT (err = the last value) */
++static int
++mmc_poll(volatile uint32_t *reg, uint32_t mask, uint32_t want, uint32_t ms)
++{
++	uint64_t end = deadline_ms(ms);
++	for (;;) {
++		uint32_t v = *reg;
++		if ((v & mask) == want) {
++			return 0;
++		}
++		if (mach_absolute_time() > end) {
++			vm.err = v;
++			return ETIMEDOUT;
++		}
++	}
++}
++
++#define HCREG(o)        ((volatile uint32_t *)(vm.base + HC + (o)))
++#define COREREG(o)      ((volatile uint32_t *)(vm.base + (o)))
++
++static int
++wait_int(uint32_t mask, uint32_t ms)
++{
++	uint64_t end = deadline_ms(ms);
++	for (;;) {
++		uint32_t s = hc_rd(INTSTS);
++		if (s & INT_ERR) {
++			vm.err = s;
++			return EIO;
++		}
++		if (s & mask) {
++			hc_wr(INTSTS, s & mask);
++			return 0;
++		}
++		if (mach_absolute_time() > end) {
++			vm.err = s | 0x8000u;           /* bit 15 without error bits: our own timeout */
++			return ETIMEDOUT;
++		}
++	}
++}
++
++/* The MSM core asks for bus power / IO voltage changes to be confirmed (Linux does it from its pwr_irq). */
++static void
++pwrctl_ack(void)
++{
++	uint32_t s = core_rd(PWRCTL_STATUS);
++	if (s) {
++		core_wr(PWRCTL_CLEAR, s);
++		core_wr(PWRCTL_CTL, ((s & 3) ? 1u : 0) | ((s & 0xc) ? 4u : 0));
++	}
++}
++
++/* After any error SDHCI wants its CMD and DAT state machines reset. */
++static void
++recover(void)
++{
++	hc_wr(INTSTS, ~0u);
++	hc_wr(CLKCTL, hc_rd(CLKCTL) | RST_CMD | RST_DAT);
++	(void)mmc_poll(HCREG(CLKCTL), RST_CMD | RST_DAT, 0, 100);
++	hc_wr(INTSTS, ~0u);
++}
++
++static int
++mmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t xfer, uint32_t blocks)
++{
++	uint32_t busy = PS_CMD_INHIBIT | ((flags & C_DATA) || (flags & 3) == C_R48B ? PS_DAT_INHIBIT : 0);
++	int error = mmc_poll(HCREG(PSTATE), busy, 0, 100);
++	if (error) {
++		return error;
++	}
++	hc_wr(INTSTS, ~0u);
++	if (flags & C_DATA) {
++		hc_wr(BLKSZ, SECTOR | (blocks << 16));
++	}
++	hc_wr(ARG, arg);
++	hc_wr(XFER, xfer | ((idx << 8 | flags) << 16));
++	error = wait_int(INT_CMD, 100);
++	if (error) {
++		return error;
++	}
++	vm.resp = hc_rd(RESP0);
++	if ((flags & 3) == C_R48B) {
++		error = wait_int(INT_XFER, 1000);
++	}
++	return error;
++}
++
++static int
++mmc_state(void)
++{
++	if (mmc_cmd(13, RCA << 16, F_R1, 0, 0)) {
++		recover();
++		return -1;
++	}
++	return (int)((vm.resp >> 9) & 0xf);
++}
++
++static int
++rcg_set(uint32_t cfg, uint32_t m, uint32_t n)
++{
++	rcg_wr(1, cfg);
++	if (n) {
++		rcg_wr(2, m);
++		rcg_wr(3, ~(n - m) & 0xff);
++		rcg_wr(4, ~n & 0xff);
++	}
++	rcg_wr(0, 1);                                   /* UPDATE */
++	return mmc_poll((volatile uint32_t *)(vm.gcc + 4), 1, 0, 10);
++}
++
++static int
++set_clock(uint32_t cfg, uint32_t m, uint32_t n, uint32_t wdelay_us)
++{
++	hc_wr(CLKCTL, TIMEOUT_MAX | CLK_INT_EN);        /* card clock off while the RCG switches */
++	if (rcg_set(cfg, m, n)) {
++		return EIO;
++	}
++	vm.wdelay_us = wdelay_us;
++	if (mmc_poll(HCREG(CLKCTL), CLK_STABLE, CLK_STABLE, 20)) {
++		return EIO;
++	}
++	hc_wr(CLKCTL, TIMEOUT_MAX | CLK_INT_EN | CLK_SD_EN);
++	delay(100);
++	return 0;
++}
++
++/* CMD6 WRITE_BYTE of a volatile EXT_CSD byte, then CMD13 for SWITCH_ERROR */
++static int
++switch_byte(uint32_t index, uint32_t value)
++{
++	if (mmc_cmd(6, 3u << 24 | index << 16 | value << 8, F_R1B, 0, 0)) {
++		return EIO;
++	}
++	return (mmc_state() == 4 && !(vm.resp & 0x80)) ? 0 : EIO;
++}
++
++static int
++mmc_card_init(void)
++{
++	int step = 0;
++	uint64_t end;
++#define STEP(n, cond) do { step = (n); if (cond) goto fail; } while (0)
++
++	vm.wdelay_us = 0;
++	hc_wr(CLKCTL, TIMEOUT_MAX | CLK_INT_EN);
++	STEP(1, rcg_set(RCG_50M));                      /* a fast MCLK for the core reset */
++	delay(10);
++	core_wr(MCI_POWER, core_rd(MCI_POWER) | 0x80);
++	STEP(2, mmc_poll(COREREG(MCI_STATUS2), 1, 0, 10) || mmc_poll(COREREG(MCI_POWER), 0x80, 0, 10));
++	core_wr(MCI_HC_MODE, 1);
++	core_wr(MCI_HC_MODE, 1 | 1u << 13);
++	pwrctl_ack();
++	hc_wr(VENDOR_SPEC, (hc_rd(VENDOR_SPEC) & ~(VS_SELECT_IN | VS_MCLK_MASK)) |
++	    VS_MCLK_DFLT | VS_IO_PAD_EN | VS_IO_PAD_18V);
++	hc_wr(SIGEN, 0);                                /* polled */
++	hc_wr(INTEN, 0x03ff0033u);                      /* cmd, xfer, rd/wr ready, all errors */
++	hc_wr(HOSTCTL, PWR_18V_ON);
++	delay(1000);
++	pwrctl_ack();
++	hc_wr(HOSTCTL2, HC2_18V);
++	delay(1000);
++	pwrctl_ack();
++	STEP(3, set_clock(RCG_400K, 10));               /* 10 us = 4 card clocks after each write */
++	delay(1000);
++
++	STEP(4, mmc_cmd(0, 0, 0, 0, 0));
++	delay(1000);
++	end = deadline_ms(1000);
++	for (;;) {
++		STEP(5, mmc_cmd(1, OCR_SECTOR_18V, F_R3, 0, 0));
++		if (vm.resp & 0x80000000u) {
++			break;
++		}
++		STEP(6, mach_absolute_time() > end);
++		delay(1000);
++	}
++	STEP(7, mmc_cmd(2, 0, F_R2, 0, 0));
++	if (mmc_cmd(3, RCA << 16, F_R1, 0, 0)) {
++		/* the controller can miss CMD3's response (seen in the shim); the card state decides */
++		recover();
++		STEP(8, mmc_state() != 3);
++	}
++	STEP(9, mmc_cmd(7, RCA << 16, F_R1B, 0, 0));
++	STEP(10, switch_byte(183, 2));                  /* BUS_WIDTH: 8-bit SDR */
++	hc_wr(HOSTCTL, PWR_18V_ON | HC_8BIT);
++	STEP(11, switch_byte(185, 1));                  /* HS_TIMING: High Speed */
++	hc_wr(HOSTCTL, PWR_18V_ON | HC_8BIT | HC_HISPEED);
++	STEP(12, set_clock(RCG_50M, 0));
++	STEP(13, mmc_state() != 4);
++	return 0;
++fail:
++	printf("VINCE MMC: init failed at step %d (status 0x%08x)\n", step, vm.err);
++	recover();
++	return EIO;
++#undef STEP
++}
++
++/* n (1..MAX_SECTORS) sectors at lba into the bounce buffer */
++static int
++mmc_read_sectors(uint64_t lba, uint32_t n)
++{
++	if (lba > UINT32_MAX || n == 0 || n > MAX_SECTORS) {
++		return EINVAL;
++	}
++	uint32_t xm = XM_READ | XM_BLKCNT | (n > 1 ? XM_MULTI | XM_ACMD12 : 0);
++	int error = mmc_cmd(n > 1 ? 18 : 17, (uint32_t)lba, F_R1 | C_DATA, xm, n);
++	if (!error && (vm.resp & R1_ERR)) {
++		vm.err = vm.resp;
++		error = EIO;
++	}
++	uint32_t *w = vince_mmc_bounce;
++	for (uint32_t b = 0; !error && b < n; b++) {
++		error = wait_int(INT_RDREADY, 1000);
++		for (uint32_t i = 0; !error && i < SECTOR / 4; i++) {
++			*w++ = hc_rd(BUF);
++		}
++	}
++	if (!error) {
++		error = wait_int(INT_XFER, 1000);
++	}
++	if (error) {
++		printf("VINCE MMC: read of %u sectors at 0x%llx failed (status 0x%08x)\n", n, lba, vm.err);
++		recover();
++	}
++	return error;
++}
++
++static uint32_t
++crc32_le(const uint8_t *p, size_t n)
++{
++	uint32_t c = 0xffffffffu;
++	while (n--) {
++		c ^= *p++;
++		for (int k = 0; k < 8; k++) {
++			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1)));
++		}
++	}
++	return ~c;
++}
++
++static int
++mmc_find_partition(const char *want)
++{
++	static uint8_t hdr[SECTOR];
++	const uint8_t *b = (const uint8_t *)vince_mmc_bounce;
++	int error = mmc_read_sectors(1, 1);
++	if (error) {
++		return error;
++	}
++	memcpy(hdr, b, SECTOR);
++	if (memcmp(hdr, "EFI PART", 8) != 0) {
++		printf("VINCE MMC: no GPT\n");
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t hsz, hcrc, nent, esz, ecrc;
++	memcpy(&hsz, hdr + 12, 4);
++	memcpy(&hcrc, hdr + 16, 4);
++	memcpy(&entry_lba, hdr + 72, 8);
++	memcpy(&nent, hdr + 80, 4);
++	memcpy(&esz, hdr + 84, 4);
++	memcpy(&ecrc, hdr + 88, 4);
++	if (hsz < 92 || hsz > SECTOR || esz != 128 || nent == 0 || nent * esz > MAX_SECTORS * SECTOR) {
++		printf("VINCE MMC: unsupported GPT (header %u, entries %u x %u)\n", hsz, nent, esz);
++		return ENXIO;
++	}
++	memset(hdr + 16, 0, 4);
++	if (crc32_le(hdr, hsz) != hcrc) {
++		printf("VINCE MMC: GPT header CRC mismatch\n");
++		return EIO;
++	}
++	error = mmc_read_sectors(entry_lba, (nent * esz + SECTOR - 1) / SECTOR);
++	if (error) {
++		return error;
++	}
++	if (crc32_le(b, nent * esz) != ecrc) {
++		printf("VINCE MMC: GPT entry CRC mismatch\n");
++		return EIO;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		if (last < first) {
++			return ENXIO;
++		}
++		vm.first = first;
++		vm.nsect = last - first + 1;
++		return 0;
++	}
++	printf("VINCE MMC: no GPT partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
++/* What the partition holds, for the log: the superblock magics at offset 1024 (HFS+, ext4, F2FS). */
++static const char *
++mmc_fs_signature(void)
++{
++	if (mmc_read_sectors(vm.first, 4)) {
++		return "unreadable";
++	}
++	const uint8_t *p = (const uint8_t *)vince_mmc_bounce + 1024;
++	if ((p[0] == 'H' && p[1] == '+') || (p[0] == 'H' && p[1] == 'X')) {
++		return "HFS+";
++	}
++	if (p[0x38] == 0x53 && p[0x39] == 0xef) {
++		return "ext4";
++	}
++	if (p[0] == 0x10 && p[1] == 0x20 && p[2] == 0xf5 && p[3] == 0xf2) {
++		return "F2FS";
++	}
++	return "unknown";
++}
++
++static int
++vince_mmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!vm.ready) {
++		return ENXIO;
++	}
++	return (flags & FWRITE) ? EROFS : 0;
++}
++
++static int
++vince_mmc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++vince_mmc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * vm.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = vm.nsect * SECTOR;
++
++	buf_setresid(bp, count);
++	if (!(buf_flags(bp) & B_READ)) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&vince_mmc_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint32_t skip = (uint32_t)(pos % SECTOR);
++		uint32_t want = MIN(count - done, MAX_SECTORS * SECTOR - skip);
++		uint32_t n = (skip + want + SECTOR - 1) / SECTOR;
++		error = mmc_read_sectors(vm.first + pos / SECTOR, n);
++		if (error) {
++			break;
++		}
++		memcpy(vaddr + done, (const uint8_t *)vince_mmc_bounce + skip, want);
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&vince_mmc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++vince_mmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = vm.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > 4096 || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		vm.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = SECTOR;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = vm.nsect * SECTOR / vm.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = 0;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = MAX_IO / vm.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++vince_mmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return vince_mmc_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++vince_mmc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return vince_mmc_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++vince_mmc_psize(__unused dev_t dev)
++{
++	return vm.ready ? (int)MIN(vm.nsect * SECTOR / vm.secsize, INT_MAX) : -1;
++}
++
++static int
++vince_mmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(vince_mmc_strategy, NULL, dev, B_READ, minphys, uio, (int)vm.secsize);
++}
++
++static int
++vince_mmc_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++{
++	return EROFS;
++}
++
++static const struct bdevsw vince_mmc_bdevsw = {
++	.d_open     = vince_mmc_open,
++	.d_close    = vince_mmc_close,
++	.d_strategy = vince_mmc_strategy,
++	.d_ioctl    = vince_mmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = vince_mmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw vince_mmc_cdevsw = {
++	.d_open       = vince_mmc_open,
++	.d_close      = vince_mmc_close,
++	.d_read       = vince_mmc_read,
++	.d_write      = vince_mmc_write,
++	.d_ioctl      = vince_mmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++vince_mmc_init(void)
++{
++	char want[64] = "userdata";
++	int error;
++
++	PE_parse_boot_argn("mmcroot", want, sizeof(want));
++	vm.base = ml_io_map(SDCC1_PHYS, 0x1000);
++	vm.gcc = ml_io_map(GCC_SDCC1_PHYS, 0x1000);
++	vm.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&vince_mmc_lock);
++	uint32_t lk_cmd = (hc_rd(XFER) >> 24) & 0x3f;
++	error = mmc_card_init();
++	if (!error) {
++		error = mmc_find_partition(want);
++	}
++	const char *fs = error ? "" : mmc_fs_signature();
++	lck_mtx_unlock(&vince_mmc_lock);
++	if (error) {
++		printf("VINCE MMC: eMMC root unavailable: %d (LK's last command CMD%u)\n", error, lk_cmd);
++		return error;
++	}
++
++	vm.bmajor = bdevsw_add(-1, &vince_mmc_bdevsw);
++	if (vm.bmajor < 0) {
++		return ENXIO;
++	}
++	vm.cmajor = cdevsw_add_with_bdev(-1, &vince_mmc_cdevsw, vm.bmajor);
++	if (vm.cmajor < 0) {
++		return ENXIO;
++	}
++	vm.bdev = makedev(vm.bmajor, 0);
++	devfs_make_node(vm.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "mmcroot0");
++	devfs_make_node(makedev(vm.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rmmcroot0");
++	vm.ready = true;
++	printf("VINCE MMC: \"%s\" at sector 0x%llx, %llu MiB, %s, read-only (8-bit HS 50 MHz, PIO)\n",
++	    want, vm.first, vm.nsect * SECTOR >> 20, fs);
++	return 0;
++}
++
++/* Root device for rd=mmcroot0, and the mmcprobe=1 check (IOFindBSDRoot). */
++int vince_mmc_rootdev(dev_t *dev);
++
++int
++vince_mmc_rootdev(dev_t *dev)
++{
++	if (!vm.ready) {
++		int error = vince_mmc_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = vm.bdev;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
+diff --git a/config/MASTER.arm64.vince b/config/MASTER.arm64.vince
+--- a/config/MASTER.arm64.vince
++++ b/config/MASTER.arm64.vince
+@@ -27,7 +27,7 @@
+ #  BSD_RELEASE =    [ BSD_BASE ]
+ #  BSD_DEV =        [ BSD_BASE config_vnguard ]
+ #  BSD_DEBUG =      [ BSD_BASE config_vnguard ]
+-#  FILESYS_BASE =   [ devfs fdesc fifo mockfs fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_ext_resolver config_searchfs config_volfs config_appledouble nullfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
++#  FILESYS_BASE =   [ devfs fdesc fifo mockfs sweet_hfs fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_ext_resolver config_searchfs config_volfs config_appledouble nullfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
+ #  FILESYS_RELEASE= [ FILESYS_BASE ]
+ #  FILESYS_DEV =    [ FILESYS_BASE config_iocount_trace ]
+ #  FILESYS_DEBUG =  [ FILESYS_BASE config_iocount_trace ]
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -784,6 +784,32 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++//
++//	VINCE: root on a GPT partition of the internal eMMC (bsd/dev/vince_mmc.c).
++//	mmcprobe=1 with another root only brings the eMMC up and logs what the partition holds.
++//
++	{
++		extern int vince_mmc_rootdev(dev_t *dev);
++		int mmc_probe = 0;
++		if (strcmp(rdBootVar, "mmcroot0") == 0) {
++			OSSafeReleaseNULL(matching);
++			int mmc_error = vince_mmc_rootdev(root);
++			if (mmc_error) {
++				panic("IOFindBSDRoot: VINCE eMMC root %s unavailable: %d", rdBootVar, mmc_error);
++			}
++			strlcpy(rootName, rdBootVar, rootNameSize);
++			IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++			*oflags = 0;
++			goto iofrootx;
++		}
++		if (PE_parse_boot_argn("mmcprobe", &mmc_probe, sizeof(mmc_probe)) && mmc_probe) {
++			dev_t mmc_dev;
++			(void)vince_mmc_rootdev(&mmc_dev);
++		}
++	}
++#endif
++
+ //
+ //	Now check if we are trying to root on a memory device
+ //
