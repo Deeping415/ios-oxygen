@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
+index e4d18e7..3bc55b0 100644
+--- a/bsd/dev/vince_mmc.c
++++ b/bsd/dev/vince_mmc.c
+@@ -37,6 +37,8 @@
+ 
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* bsd/dev/sweet_sample.c: SMP backtraces of the processes in boot-arg sweetsample (sweet starts it from its UFS root) */
++extern void sweet_sample_start(void);
+ 
+ #define SDCC1_PHYS      0x07824000ul    /* MCI core; the SDHCI registers start at +0x900 */
+ #define GCC_SDCC1_PHYS  0x01842000ul    /* SDCC1 BCR, then the apps RCG at +4 */
+@@ -827,6 +829,7 @@ vince_mmc_init(void)
+ 	vm.ready = true;
+ 	printf("VINCE MMC: \"%s\" at sector 0x%llx, %llu MiB, %s, %s (8-bit HS 50 MHz, PIO)\n",
+ 	    want, vm.first, vm.nsect * SECTOR >> 20, fs, vm.rw ? "read-write" : "read-only");
++	sweet_sample_start();
+ 	return 0;
+ }
+ 
