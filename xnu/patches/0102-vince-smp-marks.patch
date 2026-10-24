@@ -1,0 +1,210 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 42506a1..b113ae6 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -27,6 +27,9 @@ extern vm_offset_t vince_gicc_base;
+ extern uint32_t vince_vtimer_intid;
+ extern unsigned int LowResetVectorBase;
+ vm_offset_t ml_static_vtop(vm_offset_t);
++vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern volatile uint64_t *vince_smp_mark_va;
++void vince_smp_mark(uint64_t code);
+ }
+ 
+ #define PSCI_CPU_ON_64  0xc4000003ULL
+@@ -143,6 +146,13 @@ SweetCPU::start(IOService *provider)
+ 
+ #if defined(VINCE)
+ 	if (boot) {
++		vm_offset_t marks = ml_io_map(0x913F0000, 0x1000);
++		if (marks) {
++			for (int i = 0; i < 8; i++) {
++				((volatile uint64_t *)marks)[0x100 + i] = 0;
++			}
++			vince_smp_mark_va = (volatile uint64_t *)marks;
++		}
+ 		os_atomic_store(&gVinceBootRegistered, 1, release);
+ 	}
+ #endif
+@@ -218,6 +228,7 @@ SweetCPU::initCPU(bool boot)
+ 	}
+ 	assert(cpu_number() == (int)getCPUNumber());
+ #if defined(VINCE)
++	vince_smp_mark(0x31);
+ 	if (!fBoot) {
+ 		/* banked per CPU: SGI/PPI group 1, priority 0xA0, the timer PPI and SGI enables; then the CPU interface */
+ 		*(volatile uint32_t *)(vince_gicd_base + 0x080) = 0xFFFFFFFF;
+@@ -232,6 +243,7 @@ SweetCPU::initCPU(bool boot)
+ 	}
+ 	/* GICD_ITARGETSR0 reads back this CPU's own interface bit (banked) */
+ 	fGicMask = *(volatile uint32_t *)(vince_gicd_base + 0x800) & 0xff;
++	vince_smp_mark(0x32);
+ 	if (fGicMask == 0) {
+ 		panic("SWEET CPU: cpu %u has no GIC CPU interface bit", getCPUNumber());
+ 	}
+@@ -250,6 +262,9 @@ SweetCPU::initCPU(bool boot)
+ 		}
+ 		__asm__ volatile("yield");
+ 	}
++#if defined(VINCE)
++	vince_smp_mark(0x33);
++#endif
+ 	setCPUState(kIOCPUStateRunning);
+ }
+ 
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index aafc0ff..03397d4 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -690,6 +690,10 @@ arm_init_cpu(
+ 
+ 	cpu_data_ptr->cpu_flags &= ~SleepState;
+ 
++#if defined(VINCE)
++	extern void vince_smp_mark(uint64_t code);
++	vince_smp_mark(0x21);
++#endif
+ 
+ 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
+ 
+@@ -728,8 +732,14 @@ arm_init_cpu(
+ #endif
+ 
+ 	cpu_machine_idle_init(FALSE);
++#if defined(VINCE)
++	vince_smp_mark(0x22);
++#endif
+ 
+ 	cpu_init();
++#if defined(VINCE)
++	vince_smp_mark(0x23);
++#endif
+ 
+ #ifdef  APPLETYPHOON
+ 	if ((cpus_defeatures & (0xF << 4 * cpu_data_ptr->cpu_number)) != 0) {
+@@ -759,6 +769,9 @@ arm_init_cpu(
+ 		commpage_update_timebase();
+ 	}
+ 	PE_init_cpu();
++#if defined(VINCE)
++	vince_smp_mark(0x24);
++#endif
+ 
+ 	fiq_context_init(TRUE);
+ 	cpu_data_ptr->rtcPop = EndOfAllTime;
+@@ -799,6 +812,9 @@ arm_init_cpu(
+ 	}
+ #endif
+ 
++#if defined(VINCE)
++	vince_smp_mark(0x25);
++#endif
+ 
+ 	slave_main(NULL);
+ }
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 118e8c6..0828d5c 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -85,6 +85,20 @@ extern void sweet_early_putc(char c);
+ #if defined(VINCE)
+ #include <pexpert/arm64/boot.h>
+ extern boot_args const_boot_args;
++
++/* SMP progress marks after the MMU is on (start.s writes the early ones by PA); SweetCPU maps the page */
++volatile uint64_t *vince_smp_mark_va;
++void vince_smp_mark(uint64_t code);
++void
++vince_smp_mark(uint64_t code)
++{
++	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++	unsigned core = (unsigned)((mpidr & 0xff) + ((mpidr >> 8) & 0xff) * 4);
++	if (vince_smp_mark_va != NULL && core < 8) {
++		vince_smp_mark_va[0x100 + core] = code;
++		__builtin_arm_dsb(DSB_SY);
++	}
++}
+ #endif
+ 
+ extern boolean_t        idle_enable;
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 7efb216..5c0bb9d 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -100,6 +100,26 @@
+  */
+ 	.text
+ 	.align 12
++#if defined(VINCE)
++/*
++ * SMP progress mark, MMU off only: stage code to PA 0x913F0800 + 8 * core (core = Aff1 * 4 + Aff0), a free word
++ * in the framebuffer carve-out next to the VSCN descriptor; the shim reads it from CPU1 (`r 913f0800 10`).
++ * Clobbers x9-x11.
++ */
++.macro VINCE_SMP_MARK code
++	mrs		x9, MPIDR_EL1
++	and		x10, x9, #0xff
++	ubfx	x9, x9, #8, #8
++	add		x10, x10, x9, lsl #2
++	movz	x9, #0x0800
++	movk	x9, #0x913f, lsl #16
++	add		x9, x9, x10, lsl #3
++	mov		x11, #\code
++	str		x11, [x9]
++	dsb		sy
++.endmacro
++#endif
++
+ 	.globl EXT(LowResetVectorBase)
+ LEXT(LowResetVectorBase)
+ 	/*
+@@ -129,6 +149,9 @@ LEXT(reset_vector)
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
++#if defined(VINCE)
++	VINCE_SMP_MARK 0x11
++#endif
+ 
+ #if !(defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR))
+ 	// Set low reset vector before attempting any loads
+@@ -163,6 +186,9 @@ Lnext_cpu_data_entry:
+ 	b.eq	Lskip_cpu_reset_handler				// Not found
+ 	b		Lcheck_cpu_data_entry	// loop
+ Lfound_cpu_data_entry:
++#if defined(VINCE)
++	VINCE_SMP_MARK 0x12
++#endif
+ 	adrp	x20, EXT(const_boot_args)@page
+ 	add		x20, x20, EXT(const_boot_args)@pageoff
+ 	ldr		x0, [x21, CPU_RESET_HANDLER]		// Call CPU reset handler
+@@ -194,6 +220,9 @@ Lfound_cpu_data_entry:
+ 
+ 	blr		x0
+ Lskip_cpu_reset_handler:
++#if defined(VINCE)
++	VINCE_SMP_MARK 0x1f
++#endif
+ 	b		.									// Hang if the handler is NULL or returns
+ 
+ 	.align 3
+@@ -355,6 +384,9 @@ start_cpu:
+ 
+ 	// x20 set to BootArgs phys address
+ 	// x21 set to cpu data phys address
++#if defined(VINCE)
++	VINCE_SMP_MARK 0x13
++#endif
+ 
+ 	// Get the kernel memory parameters from the boot args
+ 	ldr		x22, [x20, BA_VIRT_BASE]			// Get the kernel virt base
+@@ -897,6 +929,9 @@ common_start:
+ #endif /* HAS_APPLE_PAC */
+ 
+ #if defined(VINCE)
++	cbz		x21, 8f
++	VINCE_SMP_MARK 0x14
++8:
+ 	/* Stage 0D: magenta 48x32 band - about to write SCTLR_EL1 (enable MMU) */
+ 	VINCE_STAGE_MARK 0xff, 0x00, 0xff, 192
+ #endif
