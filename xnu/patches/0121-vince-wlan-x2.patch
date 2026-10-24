@@ -1,0 +1,1279 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e8c52e7..c2f0acb 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/vince_input.c			standard
+ bsd/dev/vince_ctl.c			standard
+ bsd/dev/vince_smd.c			standard
+ bsd/dev/vince_wlan.c			standard
++bsd/dev/vince_wlan_dxe.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 2ade42c..4c34b7e 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -119,9 +119,16 @@ kick(void)
+ 	wr32(apcs + APCS_IPC, APCS_IPC_WCNSS);
+ }
+ 
++void
++vince_smd_kick(uint32_t bit)
++{
++	__asm__ volatile("dsb osh" ::: "memory");
++	wr32(apcs + APCS_IPC, bit);
++}
++
+ /* the private partition between the apps (host 0) and host: off/size, 0 if none */
+ static bool
+-smem_partition(uint32_t host, uint32_t *off, uint32_t *size, uint32_t *cacheline)
++smem_partition(uint32_t host, uint32_t *off, uint32_t *size, uint32_t *cacheline, bool global)
+ {
+ 	if (srd32(PTABLE_OFF) != 0x434f5424u || srd32(PTABLE_OFF + 4) != 1) {   /* "$TOC", version 1 */
+ 		return false;
+@@ -134,7 +141,7 @@ smem_partition(uint32_t host, uint32_t *off, uint32_t *size, uint32_t *cacheline
+ 		uint32_t e = PTABLE_OFF + 32 + i * PTABLE_ENTRY;
+ 		uint32_t o = srd32(e), s = srd32(e + 4), h = srd32(e + 12);
+ 		uint32_t h0 = h & 0xffff, h1 = h >> 16;
+-		if (!o || !s || !((h0 == 0 && h1 == host) || (h1 == 0 && h0 == host))) {
++		if (!o || !s || !(global ? (h0 == 0xfffe && h1 == 0xfffe) : ((h0 == 0 && h1 == host) || (h1 == 0 && h0 == host)))) {
+ 			continue;
+ 		}
+ 		if (o > SMEM_SIZE || s > SMEM_SIZE - o || srd32(o) != 0x54525024u ||          /* "$PRT" */
+@@ -194,7 +201,7 @@ vince_smd_find(const char *name, struct vsmd_ch *c)
+ 	uint32_t po, ps, cl;
+ 
+ 	c->open = false;
+-	if (!smem_partition(PRONTO_HOST, &po, &ps, &cl)) {
++	if (!smem_partition(PRONTO_HOST, &po, &ps, &cl, false)) {
+ 		return false;
+ 	}
+ 	for (int t = 0; t < 2; t++) {
+@@ -232,6 +239,41 @@ vince_smd_find(const char *name, struct vsmd_ch *c)
+ 	return false;
+ }
+ 
++/*
++ * Mapped address of a global SMEM item: the global partition first (both hosts 0xfffe), then the legacy item table
++ * in the SMEM header (shim smem.c smem_get). 0 if absent. The RPM message RAM aux region is not handled.
++ */
++vm_offset_t
++vince_smd_item(uint32_t item, uint32_t *size)
++{
++	uint32_t po, ps, cl, sz = 0, o;
++
++	*size = 0;
++	if (!smem) {
++		return 0;
++	}
++	if (smem_partition(0, &po, &ps, &cl, true)) {
++		o = part_get(po, ps, cl, item, &sz);
++		if (o) {
++			*size = sz;
++			return smem + o;
++		}
++	}
++	if (item < 512) {
++		uint32_t tb = 0xD0u + item * 16;
++
++		if (srd32(tb) == 1) {
++			uint32_t off = srd32(tb + 4), isz = srd32(tb + 8), aux = srd32(tb + 12) & ~3u;
++
++			if ((aux == 0 || aux == SMEM_PA) && off <= SMEM_SIZE && isz <= SMEM_SIZE - off) {
++				*size = isz;
++				return smem + off;
++			}
++		}
++	}
++	return 0;
++}
++
+ /* ---- the channel ---- */
+ 
+ static void
+diff --git a/bsd/dev/vince_smd.h b/bsd/dev/vince_smd.h
+index 6b6d957..7cbf441 100755
+--- a/bsd/dev/vince_smd.h
++++ b/bsd/dev/vince_smd.h
+@@ -16,6 +16,8 @@ struct vsmd_ch {
+ 
+ bool vince_smd_map(void);                                       /* SMEM and APCS mapped (once); false on failure */
+ void vince_smd_sleep(unsigned ms);
++void vince_smd_kick(uint32_t bit);                              /* APCS IPC doorbell bit (17 = WCNSS SMD, 19 = WCNSS SMSM) */
++vm_offset_t vince_smd_item(uint32_t item, uint32_t *size);      /* mapped address of a global SMEM item, 0 if absent */
+ bool vince_smd_find(const char *name, struct vsmd_ch *c);       /* false if Pronto has not created it (yet) */
+ int vince_smd_open(struct vsmd_ch *c);                          /* 0 ok, <0 step that timed out */
+ int vince_smd_send(struct vsmd_ch *c, const void *data, uint32_t len);
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index 7efd090..b5c57a4 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -1,15 +1,16 @@
+ /*
+- * VINCE (Redmi 5 Plus, MSM8953) Wi-Fi HAL client, X1 of reports/WIFI_HANDOFF.md. A port of
+- * vince-bringup/shim/wlan.c (start and feature exchange), which was proven on the phone first: HAL_START answered
+- * with status 0, 29 stations, 2 BSS, API 2.1.5.1, "WCN v2.0 RadioPhy vIris_TSMC_4.0 with 48MHz XO".
++ * VINCE (Redmi 5 Plus, MSM8953) Wi-Fi driver, X1 and X2 of reports/WIFI_HANDOFF.md. A port of
++ * vince-bringup/shim/{wlan,dxe}.c, which were proven on the phone first: HAL start, DXE, scan, association, WPA2.
++ * This file is the HAL client (WLAN_CTRL SMD channel) and the test thread; vince_wlan_dxe.c is the DXE.
+  *
+- * Transport is vince_smd.c (the WLAN_CTRL SMD channel). Pronto itself is started by the shim before the handover
+- * (WCNSS_CTRL handshake and NV included), so the channel exists when this thread looks for it.
++ * Pronto itself is started by the shim before the handover (WCNSS_CTRL handshake and NV included), so the channel
++ * exists when the thread looks for it.
+  *
+  * Message layout from mainline drivers/net/wireless/ath/wcn36xx (hal.h, smd.c; GPL-2.0): every HAL message starts
+  * with { u16 type, u16 version, u32 total length }, little endian, and the firmware answers type + 1.
+  *
+- * Boot-arg: vincewlan=1 turns it on (default off). Log lines start with "VINCE WLAN:" (tools/xnulog.py --con).
++ * Boot-arg vincewlan=N (default 0 = off): 1 = HAL start and feature exchange (X1), 2 = also DXE and a scan of
++ * channels 1..13 with a BSS list (X2). Log lines start with "VINCE WLAN:" (tools/xnulog.py --con).
+  */
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ #include <sys/param.h>
+@@ -18,12 +19,18 @@
+ #include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
+ #include "vince_smd.h"
++#include "vince_wlan.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ void vince_wlan_start(void);
+ 
+ #define HAL_START_REQ           0
+ #define HAL_START_RSP           1
++#define HAL_INIT_SCAN_REQ       4
++#define HAL_START_SCAN_REQ      6
++#define HAL_END_SCAN_REQ        8
++#define HAL_FINISH_SCAN_REQ     10
++#define HAL_ADD_STA_SELF_REQ    125
+ #define HAL_FEATURE_CAPS_REQ    175
+ #define HAL_FEATURE_CAPS_RSP    176
+ #define FEAT_STA_POWERSAVE      13
+@@ -36,6 +43,7 @@ void vince_wlan_start(void);
+ static struct vsmd_ch vw_ch;
+ static uint8_t vw_req[HAL_BUF], vw_rsp[HAL_BUF];
+ static bool vw_started;
++static uint8_t vw_mac[6] = { 0x02, 0x00, 0x00, 0x00, 0x76, 0x01 };
+ 
+ static void
+ vw_put16(uint8_t *p, uint32_t v)
+@@ -86,7 +94,9 @@ vw_open(void)
+ 
+ /*
+  * Send vw_req[0..len) and wait for the answer of type want in vw_rsp: its length, or <0. The firmware also sends
+- * indications on this channel (the first packet after a start is type 233): skip those.
++ * indications on this channel (the first packet after a start is type 233): skip those. The wait goes in 5 ms
++ * slices and the DXE rings are serviced meanwhile (Linux does that from the interrupts; the frames the AP sends
++ * right after an association arrive while the HAL requests of the association are still being answered).
+  */
+ static int
+ vw_xfer(uint32_t len, uint32_t want)
+@@ -100,7 +110,13 @@ vw_xfer(uint32_t len, uint32_t want)
+ 		return -2;
+ 	}
+ 	for (int tries = 0; tries < 8; tries++) {
+-		n = vince_smd_recv(&vw_ch, vw_rsp, sizeof(vw_rsp), RSP_TIMEOUT_MS);
++		n = 0;
++		for (uint32_t waited = 0; waited < RSP_TIMEOUT_MS && n == 0; waited += 5) {
++			n = vince_smd_recv(&vw_ch, vw_rsp, sizeof(vw_rsp), 5);
++			if (n == 0 && vd_ready()) {
++				vd_poll(0);
++			}
++		}
+ 		if (n <= 0) {
+ 			return n ? -3 : -4;
+ 		}
+@@ -112,6 +128,43 @@ vw_xfer(uint32_t len, uint32_t want)
+ 	return -5;
+ }
+ 
++/* request with a body; the answer is copied to rsp (up to max); its length or <0 */
++int
++vw_raw(uint16_t type, const void *body, uint32_t blen, void *rsp, uint32_t max)
++{
++	const uint8_t *b = body;
++	uint8_t *o = rsp;
++	int n;
++
++	if (blen > HAL_BUF - 8) {
++		return -9;
++	}
++	vw_hdr(vw_req, type, 8 + blen);
++	for (uint32_t i = 0; i < blen; i++) {
++		vw_req[8 + i] = b[i];
++	}
++	n = vw_xfer(8 + blen, (uint32_t)(type + 1));
++	if (n > 0) {
++		for (uint32_t i = 0; i < (uint32_t)n && i < max; i++) {
++			o[i] = vw_rsp[i];
++		}
++	}
++	return n;
++}
++
++/* request whose answer starts with a u32 status after the header; 0 when the firmware says success */
++static int
++vw_cmd(uint16_t type, const void *body, uint32_t blen)
++{
++	uint8_t rsp[64];
++	int n = vw_raw(type, body, blen, rsp, sizeof(rsp));
++
++	if (n < 12) {
++		return n < 0 ? n : -6;
++	}
++	return vw_get32(rsp + 8) ? -7 : 0;
++}
++
+ static void
+ vw_log_name(const char *what, const uint8_t *s)
+ {
+@@ -181,12 +234,187 @@ vw_caps(void)
+ 	return 0;
+ }
+ 
++/* ---- the self station and scanning ---- */
++
++/* ADD_STA_SELF for mac; out = sta index, DPU descriptor index, DPU signature */
++static int
++vw_add_sta_self(const uint8_t mac[6], uint8_t out[3])
++{
++	uint8_t rsp[64], body[10];
++	int n;
++
++	for (int i = 0; i < 10; i++) {
++		body[i] = i < 6 ? mac[i] : 0;
++	}
++	n = vw_raw(HAL_ADD_STA_SELF_REQ, body, sizeof(body), rsp, sizeof(rsp));
++	if (n < 12) {
++		return n < 0 ? n : -6;
++	}
++	if (vw_get32(rsp + 8)) {
++		return -7;
++	}
++	if (n < 15) {
++		return -8;
++	}
++	out[0] = rsp[12];
++	out[1] = rsp[13];
++	out[2] = rsp[14];
++	return 0;
++}
++
++static int
++vw_scan_init(void)
++{
++	uint8_t b[40];
++
++	bzero(b, sizeof(b));
++	vw_put32(b, 2);                 /* HAL_SYS_MODE_SCAN */
++	return vw_cmd(HAL_INIT_SCAN_REQ, b, sizeof(b));
++}
++
++static int
++vw_scan_start(uint8_t ch)
++{
++	return vw_cmd(HAL_START_SCAN_REQ, &ch, 1);
++}
++
++static int
++vw_scan_end(uint8_t ch)
++{
++	return vw_cmd(HAL_END_SCAN_REQ, &ch, 1);
++}
++
++static int
++vw_scan_finish(uint8_t oper_ch)
++{
++	uint8_t b[45];
++
++	bzero(b, sizeof(b));
++	vw_put32(b, 2);                 /* mode: SCAN */
++	b[4] = oper_ch;                 /* the struct is packed: cb_state (u32) follows at 5, all zero */
++	return vw_cmd(HAL_FINISH_SCAN_REQ, b, sizeof(b));
++}
++
++/* broadcast probe request, wildcard SSID, 2.4 GHz rates; returns the length */
++static uint32_t
++vw_probe_req(uint8_t *f, const uint8_t *mac)
++{
++	static const uint8_t ies[] = {
++		0x00, 0x00,                                                     /* SSID: wildcard */
++		0x01, 0x04, 0x82, 0x84, 0x8b, 0x96,                             /* 1, 2, 5.5, 11 Mbit/s (basic) */
++		0x32, 0x08, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c,     /* 6..54 Mbit/s */
++	};
++	uint32_t n = 0;
++
++	f[n++] = 0x40;                  /* frame control: management, probe request */
++	f[n++] = 0x00;
++	f[n++] = 0;                     /* duration */
++	f[n++] = 0;
++	for (int i = 0; i < 6; i++) {
++		f[n++] = 0xff;          /* DA */
++	}
++	for (int i = 0; i < 6; i++) {
++		f[n++] = mac[i];        /* SA */
++	}
++	for (int i = 0; i < 6; i++) {
++		f[n++] = 0xff;          /* BSSID */
++	}
++	f[n++] = 0;                     /* sequence control, filled by the DPU */
++	f[n++] = 0;
++	for (uint32_t i = 0; i < sizeof(ies); i++) {
++		f[n++] = ies[i];
++	}
++	return n;
++}
++
++static void
++vw_log_bss(void)
++{
++	uint32_t n;
++	const struct vd_bss *b = vd_bss_list(&n);
++	struct vd_stats st;
++
++	printf("VINCE WLAN: scan found %u networks\n", n);
++	for (uint32_t i = 0; i < n; i++) {
++		printf("VINCE WLAN: bss %02x:%02x:%02x:%02x:%02x:%02x ch %u rssi %d x%u rsn %u \"%s\"\n",
++		    b[i].bssid[0], b[i].bssid[1], b[i].bssid[2], b[i].bssid[3], b[i].bssid[4], b[i].bssid[5],
++		    b[i].ch, b[i].rssi, b[i].count, b[i].rsn_len, b[i].ssid);
++	}
++	vd_get_stats(&st);
++	printf("VINCE WLAN: dxe rx_l %u rx_h %u bad_bd %u errors %u\n", st.frames_l, st.frames_h, st.bad_bd, st.errors);
++}
++
++/* X2: DXE up, self station, active scan of channels 1..13 (120 ms each, two probe requests at the start) */
++static int
++vw_scan_all(void)
++{
++	struct vd_tx_ctx ctx;
++	uint8_t self[3], pr[64];
++	uint32_t prlen;
++	uint64_t c;
++	int r, probes = 2;
++
++	__asm__ volatile ("mrs %0, cntvct_el0" : "=r"(c));
++	vw_mac[5] = (uint8_t)(c ^ c >> 8 ^ c >> 16);    /* a new station address per Pronto start (shim wlan.c) */
++
++	r = vd_init();
++	printf("VINCE WLAN: dxe init %d\n", r);
++	if (r) {
++		return r;
++	}
++	r = vw_add_sta_self(vw_mac, self);
++	if (r) {
++		printf("VINCE WLAN: ADD_STA_SELF failed %d\n", r);
++		return r;
++	}
++	printf("VINCE WLAN: self %02x:%02x:%02x:%02x:%02x:%02x sta %u dpu %u/%u\n", vw_mac[0], vw_mac[1], vw_mac[2],
++	    vw_mac[3], vw_mac[4], vw_mac[5], self[0], self[1], self[2]);
++	ctx.sta_index = self[0];
++	ctx.dpu_desc_idx = self[1];
++	ctx.dpu_sign = self[2];
++	ctx.band_5ghz = 0;
++	ctx.no_encrypt = 1;
++	prlen = vw_probe_req(pr, vw_mac);
++	vd_bss_clear();
++	r = vw_scan_init();
++	if (r) {
++		printf("VINCE WLAN: INIT_SCAN failed %d\n", r);
++		return r;
++	}
++	for (uint8_t ch = 1; ch <= 13; ch++) {
++		if (vw_scan_start(ch)) {
++			printf("VINCE WLAN: START_SCAN failed on channel %u\n", ch);
++			break;
++		}
++		for (int k = 0; k < probes; k++) {
++			r = vd_tx_mgmt(&ctx, pr, prlen, 1);
++			if (r) {
++				printf("VINCE WLAN: probe request tx failed %d on channel %u\n", r, ch);
++				probes = 0;     /* stop sending after the first failure */
++				break;
++			}
++			vd_poll(10);
++		}
++		vd_poll(120);
++		if (vw_scan_end(ch)) {
++			printf("VINCE WLAN: END_SCAN failed on channel %u\n", ch);
++			break;
++		}
++	}
++	r = vw_scan_finish(1);
++	printf("VINCE WLAN: FINISH_SCAN %d\n", r);
++	vd_poll(50);
++	vw_log_bss();
++	return 0;
++}
++
+ static void
+ vw_thread(void *arg, wait_result_t w)
+ {
+ #pragma unused(arg, w)
+-	int r = -1;
++	int r = -1, stage = 0;
+ 
++	(void)PE_parse_boot_argn("vincewlan", &stage, sizeof(stage));
+ 	/* the channel list is complete once the shim has done the WCNSS_CTRL handshake; give it a minute anyway */
+ 	for (int i = 0; i < 240 && !vince_smd_find("WLAN_CTRL", &vw_ch); i++) {
+ 		vince_smd_sleep(250);
+@@ -203,8 +431,20 @@ vw_thread(void *arg, wait_result_t w)
+ 		goto out;
+ 	}
+ 	printf("VINCE WLAN: WLAN_CTRL open\n");
+-	if (vw_start() == 0 && vw_caps() == 0) {
+-		printf("VINCE WLAN: X1 done, HAL is up\n");
++	if (stage >= 2) {
++		if (!vd_map()) {
++			printf("VINCE WLAN: DXE mapping failed\n");
++			goto out;
++		}
++		/* mainline sets the tx-rings-empty SMSM bit before it starts the chip */
++		printf("VINCE WLAN: SMSM tx-rings-empty %d\n", vd_smsm_rings_empty());
++	}
++	if (vw_start() || vw_caps()) {
++		goto out;
++	}
++	printf("VINCE WLAN: X1 done, HAL is up\n");
++	if (stage >= 2 && vw_scan_all() == 0) {
++		printf("VINCE WLAN: X2 done\n");
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
+diff --git a/bsd/dev/vince_wlan.h b/bsd/dev/vince_wlan.h
+new file mode 100755
+index 0000000..091d191
+--- /dev/null
++++ b/bsd/dev/vince_wlan.h
+@@ -0,0 +1,71 @@
++/*
++ * VINCE Wi-Fi driver internals (vince_wlan.c: HAL client, vince_wlan_dxe.c: DXE). Ports of the shim files
++ * vince-bringup/shim/{wlan,dxe}.c, proven on the phone first.
++ */
++#ifndef _VINCE_WLAN_H_
++#define _VINCE_WLAN_H_
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <stdint.h>
++#include <stdbool.h>
++
++#define VD_MAX_BSS              96
++#define VD_Q_FRAMES             16
++#define VD_Q_FRAME_MAX          512
++
++struct vd_bss {
++	uint8_t bssid[6];
++	uint8_t ch;                     /* channel the firmware reports, 0 if unknown */
++	int8_t rssi;                    /* dBm, from the RX BD */
++	uint16_t count;                 /* beacons / probe responses seen */
++	char ssid[33];
++	uint16_t beacon_int, capab;
++	uint8_t dtim_period;            /* from the TIM element, 0 if not seen */
++	uint8_t nrates;
++	uint8_t rates[16];              /* supported + extended rates, 500 kbit/s units, basic bit kept */
++	uint8_t rsn_len;                /* RSN element body (id 48), 0 if the beacon has none */
++	uint8_t rsn[48];
++};
++
++struct vd_frame {
++	uint16_t len;                   /* 802.11 frame, header first, no FCS */
++	uint8_t ch;
++	int8_t rssi;
++	uint8_t data[VD_Q_FRAME_MAX];
++};
++
++struct vd_stats {
++	uint32_t frames_l, frames_h;    /* RX frames handled on the low / high channel */
++	uint32_t bad_bd;                /* frames whose BD did not parse */
++	uint32_t errors;                /* DXE error status seen */
++	uint32_t last_int_src;
++	uint32_t status_rx_l, status_rx_h;
++	uint64_t first_data_us;         /* time of the first data frame for us (0 = none) */
++	uint32_t data_frames, data_for_us, data_bcast, mgmt_for_us;
++};
++
++/* what a frame needs from the firmware's station (ADD_STA_SELF / CONFIG_STA answers) */
++struct vd_tx_ctx {
++	uint8_t sta_index, dpu_desc_idx, dpu_sign;
++	int band_5ghz;                  /* management rate class: 5 GHz uses the control rate */
++	int no_encrypt;                 /* DPU: do not encrypt (open network, or management frames) */
++};
++
++bool vd_map(void);                                      /* DXE, CCU and the descriptor window mapped; false on failure */
++int vd_smsm_rings_empty(void);                          /* apps SMSM bit 9 = 1, bit 10 = 0; 0 ok */
++int vd_init(void);                                      /* reset, CCU select, four channels, interrupt mask; once per Pronto start */
++bool vd_ready(void);
++void vd_poll(uint32_t ms);                              /* handle RX frames for ms milliseconds (sleeps 1 ms between passes) */
++int vd_tx_mgmt(const struct vd_tx_ctx *ctx, const uint8_t *frame, uint32_t len, int bcast);
++int vd_tx_data(const struct vd_tx_ctx *ctx, const uint8_t *frame, uint32_t len);
++void vd_set_filter_mac(const uint8_t mac[6]);           /* queue unicast frames to this MAC (0 turns the queue off) */
++int vd_pop_frame(struct vd_frame *out);
++void vd_flush_frames(void);
++const struct vd_bss *vd_bss_list(uint32_t *n);
++void vd_bss_clear(void);
++void vd_get_stats(struct vd_stats *s);
++uint64_t vd_now_us(void);
++
++/* HAL client (vince_wlan.c) */
++int vw_raw(uint16_t type, const void *body, uint32_t blen, void *rsp, uint32_t max);
++#endif
++#endif /* _VINCE_WLAN_H_ */
+diff --git a/bsd/dev/vince_wlan_dxe.c b/bsd/dev/vince_wlan_dxe.c
+new file mode 100755
+index 0000000..2a81dab
+--- /dev/null
++++ b/bsd/dev/vince_wlan_dxe.c
+@@ -0,0 +1,753 @@
++/*
++ * VINCE Pronto DXE client, X2 of reports/WIFI_HANDOFF.md. A port of vince-bringup/shim/dxe.c, which was proven on the
++ * phone first (scan, probe requests, association, WPA2 data). Register layout, descriptor format and channel set-up
++ * follow mainline drivers/net/wireless/ath/wcn36xx/dxe.c (ISC licence). Polled: the DXE interrupts are not used.
++ *
++ * Memory: descriptors and frame buffers live in the 256 KiB window at physical 0x47400000, outside the DRAM that XNU
++ * manages (0xa0000000 and up), mapped with ml_io_map (device memory: every access is aligned). Descriptors carry
++ * physical addresses, the CPU uses the mapping (vd_pa / vd_va translate). Registers: DXE 0x0A202000, CCU 0x0A204000.
++ * Pronto must be running (guide H6) and the apps SMSM "tx rings empty" bit set before the HAL start.
++ */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "vince_smd.h"
++#include "vince_wlan.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define DXE_PA                  0x0A202000u
++#define CCU_PA                  0x0A204000u
++#define MEM_PA                  0x47400000u
++#define MEM_END                 0x40000u
++
++#define SMEM_SMSM_SHARED_STATE  85u
++#define SMSM_TX_ENABLE          (1u << 10)
++#define SMSM_TX_RINGS_EMPTY     (1u << 9)
++#define APCS_IPC_WCNSS_SMSM     (1u << 19)      /* msm8953.dtsi smsm mboxes: host 3 (WCNSS) = apcs 19 */
++
++/* DXE registers */
++#define REG_CSR_RESET           0x00u
++#define REG_ENCH_ADDR           0x04u
++#define REG_INT_MASK            0x18u
++#define REG_INT_SRC_RAW         0x20u
++#define REG_INT_CLR             0x30u
++#define REG_INT_ED_CLR          0x34u
++#define REG_INT_DONE_CLR        0x38u
++#define REG_INT_ERR_CLR         0x3Cu
++#define CSR_RESET_VALUE         0x5c89u
++#define CCU_DXE_INT_SELECT_PRONTO 0x10dcu
++
++#define TX_L_OFF                0x400u
++#define TX_H_OFF                0x500u
++#define RX_L_OFF                0x440u
++#define RX_H_OFF                0x4C0u
++#define CH_STATUS               0x04u
++#define CH_SRC_ADDR             0x0Cu
++#define CH_DEST_ADDR            0x14u
++#define CH_NEXT_DESC            0x1Cu
++
++#define INT_TX_L                0x00000001u
++#define INT_RX_L                0x00000002u
++#define INT_RX_H                0x00000008u
++#define INT_TX_H                0x00000010u
++#define CH1_MASK                0x00000002u
++#define CH3_MASK                0x00000008u
++#define STAT_DONE               0x00008000u
++#define STAT_ERR                0x00004000u
++#define STAT_ED                 0x00002000u
++
++/* descriptor control word */
++#define C_VLD                   (1u << 0)
++#define C_XTYPE(x)              ((uint32_t)(x) << 1)
++#define C_EOP                   (1u << 3)
++#define C_SIQ                   (1u << 5)
++#define C_DIQ                   (1u << 6)
++#define C_PDU_REL               (1u << 8)
++#define C_BTHLD(x)              ((uint32_t)(x) << 9)
++#define C_PRIO(x)               ((uint32_t)(x) << 13)
++#define C_INT                   (1u << 17)
++#define C_SWAP                  (1u << 20)
++#define C_ENDIAN                (1u << 21)
++#define XT_H2B                  2
++#define XT_B2H                  3
++
++#define CTRL_TX_L               (C_XTYPE(XT_H2B) | C_DIQ | C_BTHLD(5) | C_PRIO(4) | C_INT | C_SWAP | C_ENDIAN)
++#define CTRL_TX_H               (C_XTYPE(XT_H2B) | C_DIQ | C_BTHLD(7) | C_PRIO(6) | C_INT | C_SWAP | C_ENDIAN)
++#define CTRL_RX_L               (C_VLD | C_XTYPE(XT_B2H) | C_EOP | C_SIQ | C_PDU_REL | C_BTHLD(6) | C_PRIO(5) | C_INT | C_SWAP)
++#define CTRL_RX_H               (C_VLD | C_XTYPE(XT_B2H) | C_EOP | C_SIQ | C_PDU_REL | C_BTHLD(8) | C_PRIO(6) | C_INT | C_SWAP)
++
++/* channel control register defaults */
++#define CH_EN                   (1u << 0)
++#define CH_EOP                  (1u << 3)
++#define CH_SIQ                  (1u << 5)
++#define CH_DIQ                  (1u << 6)
++#define CH_PDU_REL              (1u << 8)
++#define CH_INE_ED               (1u << 17)
++#define CH_INE_ERR              (1u << 18)
++#define CH_INE_DONE             (1u << 19)
++#define CH_EDEN                 (1u << 20)
++#define CH_EDVEN                (1u << 21)
++#define CH_ENDIAN               (1u << 26)
++#define CH_SWAP                 (1u << 31)
++#define CH_SEL(x)               ((uint32_t)(x) << 22)
++#define DEF_CTL_RX_L            (CH_EN | C_XTYPE(XT_B2H) | CH_EOP | CH_SIQ | CH_PDU_REL | C_BTHLD(6) | C_PRIO(5) | \
++	                         CH_INE_ED | CH_INE_ERR | CH_INE_DONE | CH_EDEN | CH_EDVEN | CH_SEL(1) | CH_ENDIAN | CH_SWAP)
++#define DEF_CTL_RX_H            (CH_EN | C_XTYPE(XT_B2H) | CH_EOP | CH_SIQ | CH_PDU_REL | C_BTHLD(8) | C_PRIO(6) | \
++	                         CH_INE_ED | CH_INE_ERR | CH_INE_DONE | CH_EDEN | CH_EDVEN | CH_SEL(3) | CH_ENDIAN | CH_SWAP)
++
++/* BMU work queues (pronto v3: TX 6) */
++#define WQ_TX_L                 0x6u
++#define WQ_TX_H                 0x6u
++#define WQ_RX_L                 0xBu
++#define WQ_RX_H                 0x4u
++
++#define N_TX_L                  8u
++#define N_TX_H                  8u
++#define N_RX_L                  32u
++#define N_RX_H                  16u
++#define PKT_SIZE                0xF20u
++#define BUF_STRIDE              0x1000u
++
++struct vdesc {
++	uint32_t ctrl, fr_len, src_l, dst_l, next_l, src_h, dst_h, next_h;
++};
++
++/* layout inside the window */
++#define OFF_RX_L_DESC           0x0000u
++#define OFF_RX_H_DESC           0x0400u
++#define OFF_TX_L_DESC           0x0600u
++#define OFF_TX_H_DESC           0x0700u
++#define OFF_RX_L_BUF            0x10000u
++#define OFF_RX_H_BUF            0x30000u
++
++/* TX: BD + frame buffers */
++#define OFF_TX_H_BD             0x4000u
++#define OFF_TX_H_BUF            0x5000u
++#define OFF_TX_L_BD             0x4800u
++#define OFF_TX_L_BUF            0x8000u
++#define TX_SLOT_BUF             0x800u
++#define TX_BD_SIZE              40u
++#define TX_BD_CHUNK             144u            /* WCN36XX_BD_CHUNK_SIZE + 16 - (128 % 8) */
++#define BD_RATE_MGMT            2u
++#define BD_RATE_CTRL            3u
++#define TX_B_WQ_ID              0xAu
++#define TX_U_WQ_ID              0x9u
++#define BMU_WQ_TX               25u
++#define VD_TID                     7u
++
++#define CTRL_TX_H_BD            (C_VLD | C_XTYPE(XT_H2B) | C_DIQ | C_BTHLD(7) | C_PRIO(6) | C_SWAP | C_ENDIAN)
++#define CTRL_TX_H_SKB           (C_VLD | C_XTYPE(XT_H2B) | C_EOP | C_DIQ | C_BTHLD(7) | C_PRIO(6) | C_INT | C_SWAP | C_ENDIAN)
++#define DEF_CTL_TX_H            (CH_EN | C_XTYPE(XT_H2B) | CH_EOP | CH_DIQ | CH_PDU_REL | C_BTHLD(7) | C_PRIO(6) | \
++	                         CH_INE_ED | CH_INE_ERR | CH_INE_DONE | CH_EDEN | CH_EDVEN | CH_SEL(4) | CH_ENDIAN | CH_SWAP)
++#define CTRL_TX_L_BD            (C_VLD | C_XTYPE(XT_H2B) | C_DIQ | C_BTHLD(5) | C_PRIO(4) | C_SWAP | C_ENDIAN)
++#define CTRL_TX_L_SKB           (C_VLD | C_XTYPE(XT_H2B) | C_EOP | C_DIQ | C_BTHLD(5) | C_PRIO(4) | C_INT | C_SWAP | C_ENDIAN)
++#define DEF_CTL_TX_L            (CH_EN | C_XTYPE(XT_H2B) | CH_EOP | CH_DIQ | CH_PDU_REL | C_BTHLD(5) | C_PRIO(4) | \
++	                         CH_INE_ED | CH_INE_ERR | CH_INE_DONE | CH_EDEN | CH_EDVEN | CH_SEL(0) | CH_ENDIAN | CH_SWAP)
++
++struct vch {
++	volatile struct vdesc *d;
++	uint32_t n, head;
++	uint32_t dma;                   /* physical address of d[0] */
++};
++
++struct vtxq {
++	struct vch *c;
++	uint32_t reg, ctrl_bd, ctrl_skb, def_ctl, wq, bd_off, buf_off;
++};
++
++static vm_offset_t dxe_v, ccu_v, mem_v;
++static struct vch rx_l, rx_h, tx_l, tx_h;
++static bool s_ready;
++static struct vd_stats s_stats;
++static struct vd_bss s_bss[VD_MAX_BSS];
++static uint32_t s_nbss;
++static uint8_t s_filter[6];
++static bool s_filter_on;
++static struct vd_frame s_q[VD_Q_FRAMES];
++static uint32_t s_q_head, s_q_tail;     /* tail = next to pop */
++
++uint64_t
++vd_now_us(void)
++{
++	uint64_t t, ns;
++
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns / 1000;
++}
++
++static uint32_t
++drd(uint32_t off)
++{
++	return *(volatile uint32_t *)(dxe_v + off);
++}
++
++static void
++dwr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(dxe_v + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++cwr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ccu_v + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint32_t
++vd_pa(const volatile void *p)
++{
++	return (uint32_t)(MEM_PA + ((vm_offset_t)p - mem_v));
++}
++
++static volatile uint8_t *
++vd_va(uint32_t pa)
++{
++	return (volatile uint8_t *)(mem_v + (pa - MEM_PA));
++}
++
++bool
++vd_ready(void)
++{
++	return s_ready;
++}
++
++bool
++vd_map(void)
++{
++	if (!dxe_v) {
++		dxe_v = ml_io_map(DXE_PA, 0x1000);
++	}
++	if (!ccu_v) {
++		ccu_v = ml_io_map(CCU_PA, 0x2000);
++	}
++	if (!mem_v) {
++		mem_v = ml_io_map(MEM_PA, MEM_END);
++	}
++	return dxe_v && ccu_v && mem_v;
++}
++
++/* ---- SMSM: the apps state word the firmware watches before it accepts frames ---- */
++
++int
++vd_smsm_rings_empty(void)
++{
++	uint32_t size = 0;
++	vm_offset_t a = vince_smd_item(SMEM_SMSM_SHARED_STATE, &size);
++	volatile uint32_t *w;
++	uint32_t v;
++
++	if (!a || size < 4 || (a & 3)) {
++		return -1;
++	}
++	w = (volatile uint32_t *)a;     /* entry 0 = apps */
++	v = *w;
++	v &= ~SMSM_TX_ENABLE;
++	v |= SMSM_TX_RINGS_EMPTY;
++	*w = v;
++	vince_smd_kick(APCS_IPC_WCNSS_SMSM);
++	return 0;
++}
++
++/* ---- channels ---- */
++
++static void
++ring_init(struct vch *c, uint32_t off, uint32_t n, uint32_t ctrl, uint32_t src, uint32_t dst, uint32_t buf_off)
++{
++	c->d = (volatile struct vdesc *)(mem_v + off);
++	c->dma = MEM_PA + off;
++	c->n = n;
++	c->head = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		volatile struct vdesc *d = &c->d[i];
++
++		d->ctrl = ctrl;
++		d->fr_len = 0;
++		d->src_l = src;
++		d->dst_l = dst;
++		d->next_l = c->dma + ((i + 1) % n) * (uint32_t)sizeof(struct vdesc);
++		d->src_h = d->dst_h = d->next_h = 0;
++		if (buf_off) {
++			d->dst_l = MEM_PA + buf_off + i * BUF_STRIDE;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++zero_mem(void)
++{
++	volatile uint64_t *p = (volatile uint64_t *)mem_v;
++
++	for (uint32_t i = 0; i < MEM_END / 8; i++) {
++		p[i] = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++int
++vd_init(void)
++{
++	if (s_ready) {
++		return -1;      /* once per Pronto start */
++	}
++	if (!vd_map()) {
++		return -2;
++	}
++	zero_mem();
++	bzero(&s_stats, sizeof(s_stats));
++	s_nbss = 0;
++
++	dwr(REG_CSR_RESET, CSR_RESET_VALUE);
++	cwr(CCU_DXE_INT_SELECT_PRONTO, (CH3_MASK | CH1_MASK) << 16 | INT_TX_L | INT_TX_H);
++
++	ring_init(&tx_l, OFF_TX_L_DESC, N_TX_L, CTRL_TX_L, 0, WQ_TX_L, 0);
++	dwr(TX_L_OFF + CH_NEXT_DESC, tx_l.dma);
++	dwr(TX_L_OFF + CH_DEST_ADDR, WQ_TX_L);
++
++	ring_init(&tx_h, OFF_TX_H_DESC, N_TX_H, CTRL_TX_H, 0, WQ_TX_H, 0);
++	dwr(TX_H_OFF + CH_NEXT_DESC, tx_h.dma);
++	dwr(TX_H_OFF + CH_DEST_ADDR, WQ_TX_H);
++
++	ring_init(&rx_l, OFF_RX_L_DESC, N_RX_L, CTRL_RX_L, WQ_RX_L, 0, OFF_RX_L_BUF);
++	dwr(RX_L_OFF + CH_NEXT_DESC, rx_l.dma);
++	dwr(RX_L_OFF + CH_SRC_ADDR, WQ_RX_L);
++	dwr(RX_L_OFF + CH_DEST_ADDR, rx_l.d[0].next_l);         /* mainline programs the next descriptor's address here */
++	dwr(RX_L_OFF, DEF_CTL_RX_L);
++
++	ring_init(&rx_h, OFF_RX_H_DESC, N_RX_H, CTRL_RX_H, WQ_RX_H, 0, OFF_RX_H_BUF);
++	dwr(RX_H_OFF + CH_NEXT_DESC, rx_h.dma);
++	dwr(RX_H_OFF + CH_SRC_ADDR, WQ_RX_H);
++	dwr(RX_H_OFF + CH_DEST_ADDR, rx_h.d[0].next_l);
++	dwr(RX_H_OFF, DEF_CTL_RX_H);
++
++	dwr(REG_INT_MASK, drd(REG_INT_MASK) | INT_TX_L | INT_TX_H | INT_RX_L | INT_RX_H);
++	s_ready = true;
++	return 0;
++}
++
++/* ---- TX ---- */
++
++static void
++put_be32(volatile uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v >> 24);
++	p[1] = (uint8_t)(v >> 16);
++	p[2] = (uint8_t)(v >> 8);
++	p[3] = (uint8_t)v;
++}
++
++/*
++ * One frame = two descriptors (BD, frame). data: a data frame to the AP (BD rate class DATA, queue 0, no ACK
++ * override, header 24 bytes); otherwise a management frame (class MGMT or CTRL on 5 GHz, queue 0xA broadcast or 0x9
++ * unicast).
++ */
++static int
++tx_common(const struct vtxq *q, const struct vd_tx_ctx *ctx, const uint8_t *frame, uint32_t len, int bcast, int data)
++{
++	struct vch *c = q->c;
++	uint32_t i, slot, w0, w3, w4, w5, rate, queue;
++	volatile struct vdesc *dbd, *dfr;
++	volatile uint8_t *bd, *buf;
++	uint64_t t0;
++
++	if (!s_ready) {
++		return -1;
++	}
++	if (len < 24 || len > TX_SLOT_BUF) {
++		return -2;
++	}
++	/* a slot is free when both descriptors have been given back */
++	i = c->head;
++	dbd = &c->d[i];
++	dfr = &c->d[(i + 1) % c->n];
++	if ((dbd->ctrl | dfr->ctrl) & C_VLD) {
++		return -3;
++	}
++
++	slot = i / 2;
++	bd = (volatile uint8_t *)(mem_v + q->bd_off + slot * TX_BD_CHUNK);
++	buf = (volatile uint8_t *)(mem_v + q->buf_off + slot * TX_SLOT_BUF);
++
++	for (uint32_t k = 0; k < len; k++) {
++		buf[k] = frame[k];
++	}
++	for (uint32_t k = 0; k < TX_BD_SIZE; k++) {
++		bd[k] = 0;
++	}
++
++	/* BD, little-endian bitfields as the compiler lays out wcn36xx_tx_bd, then every word swapped to big-endian */
++	w0 = (ctx->no_encrypt ? 1u << 3 : 0) | (bcast ? 1u << 7 : 0) | BMU_WQ_TX << 24;
++	w0 |= (uint32_t)(ctx->dpu_sign & 7) << 21;
++	w3 = 24u << 24 | 40u << 16 | 64u << 7;                  /* mpdu_header_len 24, header_off 40, data_off 64 */
++	w4 = (data ? 0u : VD_TID << 8) | 1u << 12 | len << 16;     /* tid, bd_ssn = FILL_DPU_NON_QOS, mpdu_len */
++	rate = data ? 0u : (ctx->band_5ghz ? BD_RATE_CTRL : BD_RATE_MGMT);
++	queue = data ? 0u : (bcast ? TX_B_WQ_ID : TX_U_WQ_ID);
++	w5 = queue << 7 | rate << 12 | (bcast ? 1u << 14 : 0) | (uint32_t)ctx->sta_index << 16 |
++	    (uint32_t)ctx->dpu_desc_idx << 24;
++	put_be32(bd + 0x00, w0);
++	put_be32(bd + 0x0c, w3);
++	put_be32(bd + 0x10, w4);
++	put_be32(bd + 0x14, w5);
++	put_be32(bd + 0x18, 0xbdbdbdbd);                        /* tx_bd_sign */
++
++	dbd->src_l = vd_pa(bd);
++	dbd->dst_l = q->wq;
++	dbd->fr_len = TX_BD_SIZE;
++	dfr->src_l = vd_pa(buf);
++	dfr->dst_l = q->wq;
++	dfr->fr_len = len;
++	c->head = (i + 2) % c->n;
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	dfr->ctrl = q->ctrl_skb;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	dbd->ctrl = q->ctrl_bd;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	dwr(q->reg, q->def_ctl);                                /* kick the channel */
++
++	t0 = vd_now_us();
++	while (((dbd->ctrl | dfr->ctrl) & C_VLD) && vd_now_us() - t0 < 100000ULL) {
++		vince_smd_sleep(1);
++	}
++	return ((dbd->ctrl | dfr->ctrl) & C_VLD) ? -4 : 0;
++}
++
++int
++vd_tx_mgmt(const struct vd_tx_ctx *ctx, const uint8_t *frame, uint32_t len, int bcast)
++{
++	const struct vtxq q = { &tx_h, TX_H_OFF, CTRL_TX_H_BD, CTRL_TX_H_SKB, DEF_CTL_TX_H, WQ_TX_H, OFF_TX_H_BD,
++		                OFF_TX_H_BUF };
++	struct vd_tx_ctx m = *ctx;
++
++	m.no_encrypt = 1;       /* management frames before the keys exist are never encrypted */
++	return tx_common(&q, &m, frame, len, bcast, 0);
++}
++
++int
++vd_tx_data(const struct vd_tx_ctx *ctx, const uint8_t *frame, uint32_t len)
++{
++	const struct vtxq q = { &tx_l, TX_L_OFF, CTRL_TX_L_BD, CTRL_TX_L_SKB, DEF_CTL_TX_L, WQ_TX_L, OFF_TX_L_BD,
++		                OFF_TX_L_BUF };
++
++	return tx_common(&q, ctx, frame, len, 0, 1);
++}
++
++/* ---- RX ---- */
++
++static uint32_t
++bswap32(uint32_t v)
++{
++	return v >> 24 | (v >> 8 & 0xff00) | (v << 8 & 0xff0000) | v << 24;
++}
++
++/* RX BD words are big-endian in memory (mainline buff_to_be) */
++static uint32_t
++bd_word(const volatile uint8_t *buf, uint32_t off)
++{
++	return bswap32(*(const volatile uint32_t *)(const volatile void *)(buf + off));
++}
++
++void
++vd_set_filter_mac(const uint8_t mac[6])
++{
++	s_filter_on = false;
++	if (!mac) {
++		return;
++	}
++	for (int i = 0; i < 6; i++) {
++		s_filter[i] = mac[i];
++	}
++	s_filter_on = true;
++}
++
++void
++vd_flush_frames(void)
++{
++	s_q_head = s_q_tail = 0;
++}
++
++int
++vd_pop_frame(struct vd_frame *out)
++{
++	const struct vd_frame *f;
++
++	if (s_q_head == s_q_tail) {
++		return 0;
++	}
++	f = &s_q[s_q_tail % VD_Q_FRAMES];
++	out->len = f->len;
++	out->ch = f->ch;
++	out->rssi = f->rssi;
++	for (uint32_t i = 0; i < f->len; i++) {
++		out->data[i] = f->data[i];
++	}
++	s_q_tail++;
++	return 1;
++}
++
++static void
++push_frame(const uint8_t *f, uint32_t n, uint32_t hwch, int rssi)
++{
++	struct vd_frame *q;
++
++	if (s_q_head - s_q_tail >= VD_Q_FRAMES) {
++		s_q_tail++;     /* drop the oldest */
++	}
++	q = &s_q[s_q_head % VD_Q_FRAMES];
++	q->len = (uint16_t)n;
++	q->ch = (uint8_t)hwch;
++	q->rssi = (int8_t)rssi;
++	for (uint32_t i = 0; i < n; i++) {
++		q->data[i] = f[i];
++	}
++	s_q_head++;
++}
++
++static void
++note_frame(const volatile uint8_t *buf, uint32_t hdr_off, uint32_t len, uint32_t hwch, int rssi)
++{
++	uint8_t f[VD_Q_FRAME_MAX];
++	uint32_t n = len < sizeof(f) ? len : (uint32_t)sizeof(f);
++	uint32_t fc, type, sub;
++	bool is_beacon;
++	const uint8_t *bssid;
++	char ssid[33];
++	uint32_t ch = 0, dtim = 0, nrates = 0, rsn_len = 0, bint, capab;
++	uint8_t rates[16], rsn[48];
++	struct vd_bss *b;
++
++	for (uint32_t i = 0; i < n; i++) {
++		f[i] = buf[hdr_off + i];
++	}
++	if (n < 24) {
++		return;
++	}
++	fc = f[0] | (uint32_t)f[1] << 8;
++	type = fc >> 2 & 3;
++	sub = fc >> 4 & 15;
++	is_beacon = type == 0 && (sub == 8 || sub == 5);
++
++	if (!is_beacon) {
++		if (type == 2) {
++			int us = 1, bc = 1;
++
++			for (int k = 0; k < 6; k++) {
++				us &= f[4 + k] == s_filter[k];
++				bc &= f[4 + k] == 0xff;
++			}
++			s_stats.data_frames++;
++			if (s_filter_on && us) {
++				s_stats.data_for_us++;
++				if (!s_stats.first_data_us) {
++					s_stats.first_data_us = vd_now_us();
++				}
++			}
++			if (bc) {
++				s_stats.data_bcast++;
++			}
++		} else if (type == 0 && s_filter_on) {
++			int us = 1;
++
++			for (int k = 0; k < 6; k++) {
++				us &= f[4 + k] == s_filter[k];
++			}
++			if (us) {
++				s_stats.mgmt_for_us++;
++			}
++		}
++		/* frames for us (unicast to the filter MAC) go to the queue */
++		if (s_filter_on) {
++			int mine = 1, bcast = 1;
++
++			for (int k = 0; k < 6; k++) {
++				mine &= f[4 + k] == s_filter[k];
++				bcast &= f[4 + k] == 0xff;
++			}
++			if (mine || (bcast && type == 2)) {
++				push_frame(f, n, hwch, rssi);
++			}
++		}
++		return;
++	}
++	if (n < 24 + 12) {
++		return;
++	}
++	bssid = f + 16;
++	bzero(ssid, sizeof(ssid));
++	bint = f[32] | (uint32_t)f[33] << 8;
++	capab = f[34] | (uint32_t)f[35] << 8;
++
++	for (uint32_t p = 24 + 12; p + 2 <= n;) {               /* IEs after the 12 fixed bytes */
++		uint32_t id = f[p], l = f[p + 1];
++
++		if (p + 2 + l > n) {
++			break;
++		}
++		if (id == 0 && l <= 32) {
++			for (uint32_t i = 0; i < l; i++) {
++				ssid[i] = (f[p + 2 + i] >= 0x20 && f[p + 2 + i] < 0x7f) ? (char)f[p + 2 + i] : '.';
++			}
++		} else if (id == 3 && l == 1) {
++			ch = f[p + 2];                          /* DS parameter set: the AP's channel */
++		} else if (id == 5 && l >= 2) {
++			dtim = f[p + 3];                        /* TIM: DTIM count, DTIM period, ... */
++		} else if (id == 48 && l <= sizeof(rsn)) {
++			rsn_len = l;
++			for (uint32_t i = 0; i < l; i++) {
++				rsn[i] = f[p + 2 + i];
++			}
++		} else if ((id == 1 || id == 50) && nrates < sizeof(rates)) {
++			for (uint32_t i = 0; i < l && nrates < sizeof(rates); i++) {
++				rates[nrates++] = f[p + 2 + i];
++			}
++		}
++		p += 2 + l;
++	}
++	for (uint32_t i = 0; i < s_nbss; i++) {
++		uint32_t same = 1;
++
++		for (int k = 0; k < 6; k++) {
++			same &= s_bss[i].bssid[k] == bssid[k];
++		}
++		if (same) {
++			if (s_bss[i].count < 0xffff) {
++				s_bss[i].count++;
++			}
++			s_bss[i].rssi = (int8_t)rssi;
++			if (!s_bss[i].dtim_period && dtim) {
++				s_bss[i].dtim_period = (uint8_t)dtim;
++			}
++			return;
++		}
++	}
++	if (s_nbss == VD_MAX_BSS) {
++		return;
++	}
++	b = &s_bss[s_nbss++];
++	for (int k = 0; k < 6; k++) {
++		b->bssid[k] = bssid[k];
++	}
++	for (int k = 0; k < 33; k++) {
++		b->ssid[k] = ssid[k];
++	}
++	b->ch = (uint8_t)(ch ? ch : hwch);
++	b->rssi = (int8_t)rssi;
++	b->count = 1;
++	b->beacon_int = (uint16_t)bint;
++	b->capab = (uint16_t)capab;
++	b->dtim_period = (uint8_t)dtim;
++	b->nrates = (uint8_t)nrates;
++	for (uint32_t k = 0; k < nrates; k++) {
++		b->rates[k] = rates[k];
++	}
++	b->rsn_len = (uint8_t)rsn_len;
++	for (uint32_t k = 0; k < rsn_len; k++) {
++		b->rsn[k] = rsn[k];
++	}
++}
++
++static void
++rx_channel(struct vch *c, uint32_t ctrl, uint32_t en_mask, uint32_t int_mask, uint32_t status_reg, uint32_t *frames)
++{
++	uint32_t reason = drd(status_reg);
++
++	dwr(REG_INT_CLR, int_mask);
++	if (reason & STAT_ERR) {
++		dwr(REG_INT_ERR_CLR, int_mask);
++		s_stats.errors++;
++	}
++	if (reason & STAT_DONE) {
++		dwr(REG_INT_DONE_CLR, int_mask);
++	}
++	if (reason & STAT_ED) {
++		dwr(REG_INT_ED_CLR, int_mask);
++	}
++	if (!(reason & (STAT_DONE | STAT_ED))) {
++		return;
++	}
++
++	for (uint32_t guard = 0; guard < c->n; guard++) {
++		volatile struct vdesc *d = &c->d[c->head];
++		volatile uint8_t *buf;
++		uint32_t w0, w2, w3, wphy0, hdr_off, data_off, hdr_len, mlen;
++
++		if (d->ctrl & C_VLD) {
++			break;
++		}
++		__asm__ volatile ("dmb sy" ::: "memory");
++		buf = vd_va(d->dst_l);
++		w0 = bd_word(buf, 0x00);
++		w2 = bd_word(buf, 0x0c);        /* pdu_count:7 mpdu_data_off:9 mpdu_header_off:8 mpdu_header_len:8 */
++		w3 = bd_word(buf, 0x10);        /* ... mpdu_len:16 in the high half */
++		wphy0 = bd_word(buf, 0x1c);     /* phy_stat0 */
++		hdr_off = w2 >> 16 & 0xff;
++		data_off = w2 >> 7 & 0x1ff;
++		hdr_len = w2 >> 24 & 0xff;
++		mlen = w3 >> 16;
++		if (data_off <= hdr_off || mlen < hdr_len || hdr_off < 0x20 || hdr_off + mlen > PKT_SIZE) {
++			s_stats.bad_bd++;
++		} else {
++			uint32_t hwch = (w0 >> 11 & 1) << 4 | (w0 >> 13 & 0xf);
++			int rssi = -(100 - (int)(wphy0 >> 24 & 0xff));
++
++			note_frame(buf, hdr_off, mlen, hwch, rssi);
++		}
++		(*frames)++;
++		d->ctrl = ctrl;                 /* give it back to the hardware */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		c->head = (c->head + 1) % c->n;
++	}
++	dwr(REG_ENCH_ADDR, en_mask);
++}
++
++void
++vd_poll(uint32_t ms)
++{
++	uint64_t t0 = vd_now_us();
++
++	if (!s_ready) {
++		return;
++	}
++	do {
++		uint32_t src = drd(REG_INT_SRC_RAW);
++
++		s_stats.last_int_src = src;
++		if (src & CH1_MASK) {
++			rx_channel(&rx_l, CTRL_RX_L, CH1_MASK, INT_RX_L, RX_L_OFF + CH_STATUS, &s_stats.frames_l);
++		}
++		if (src & CH3_MASK) {
++			rx_channel(&rx_h, CTRL_RX_H, CH3_MASK, INT_RX_H, RX_H_OFF + CH_STATUS, &s_stats.frames_h);
++		}
++		if (ms) {
++			vince_smd_sleep(1);
++		}
++	} while (vd_now_us() - t0 < (uint64_t)ms * 1000ULL);
++	s_stats.status_rx_l = drd(RX_L_OFF + CH_STATUS);
++	s_stats.status_rx_h = drd(RX_H_OFF + CH_STATUS);
++}
++
++const struct vd_bss *
++vd_bss_list(uint32_t *n)
++{
++	*n = s_nbss;
++	return s_bss;
++}
++
++void
++vd_bss_clear(void)
++{
++	s_nbss = 0;
++}
++
++void
++vd_get_stats(struct vd_stats *s)
++{
++	*s = s_stats;
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
