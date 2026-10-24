@@ -1,0 +1,532 @@
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index fc1bd04..3513764 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -22,6 +22,7 @@
+ #include "vince_wlan.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
++extern int vince_wlan_iokit_publish(const uint8_t mac[6], const char *bsd_name);
+ void vince_wlan_start(void);
+ 
+ #define HAL_START_REQ           0
+@@ -857,6 +858,21 @@ vw_station(int stage)
+ 	printf("VINCE WLAN: station done after %d reconnect cycles, %d Pronto restarts\n", cycles, restarts);
+ }
+ 
++/* boot-arg vinceui=1: show the radio to iOS userland (en0 as a down interface, the IORegistry objects wifid waits for) */
++static void
++vw_publish_ui(void)
++{
++	int ui = 0;
++
++	(void)PE_parse_boot_argn("vinceui", &ui, sizeof(ui));
++	if (!ui) {
++		return;
++	}
++	if (vif_attach(vw_mac) == 0) {
++		printf("VINCE WLAN: IORegistry publish: %d\n", vince_wlan_iokit_publish(vw_mac, "en0"));
++	}
++}
++
+ static void
+ vw_thread(void *arg, wait_result_t w)
+ {
+@@ -866,6 +882,7 @@ vw_thread(void *arg, wait_result_t w)
+ 	(void)PE_parse_boot_argn("vincewlan", &stage, sizeof(stage));
+ 	if (vw_bringup(stage) == 0 && stage >= 2 && vw_scan_all() == 0) {
+ 		printf("VINCE WLAN: X2 done\n");
++		vw_publish_ui();
+ 		if (stage >= 5) {
+ 			vw_station(stage);
+ 		} else if (stage >= 3) {
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index b0c97c4..4455ff0 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -37,6 +37,8 @@
+ #include <netinet/ip.h>
+ #include <netinet/ip_icmp.h>
+ #include <kern/locks.h>
++#include <sys/proc.h>
++#include <sys/systm.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include "vince_smd.h"
+@@ -64,6 +66,179 @@ static uint64_t vif_last_rx_us;
+ 
+ /* ---- ifnet callbacks ---- */
+ 
++/* ---- Apple80211: wifid and configd talk to the radio with socket ioctls on the interface ---- */
++
++#define SIOCSA80211_A   0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
++#define SIOCGA80211_A   0xc02869c9u     /* _IOWR('i', 201, ...) */
++#define SIOCSA80211_B   0x803069c8u     /* the same with the 0x30 byte request of newer systems */
++#define SIOCGA80211_B   0xc03069c9u
++
++struct a80211_req {
++	char ifname[16];
++	uint32_t type;
++	uint32_t val;
++	uint32_t len;
++	uint32_t pad;
++	uint64_t data;
++};
++
++#define A80211_SSID             1
++#define A80211_CHANNEL          4
++#define A80211_TXPOWER          7
++#define A80211_RATE             8
++#define A80211_BSSID            9
++#define A80211_SCAN_REQ         10
++#define A80211_SCAN_RESULT      11
++#define A80211_CARD_CAPS        12
++#define A80211_STATE            13
++#define A80211_PHY_MODE         14
++#define A80211_OP_MODE          15
++#define A80211_RSSI             16
++#define A80211_NOISE            17
++#define A80211_POWER            19
++#define A80211_ASSOCIATE        20
++#define A80211_DISASSOCIATE     22
++#define A80211_LOCALE           28
++#define A80211_DRIVER_VERSION   43
++#define A80211_HARDWARE_VERSION 44
++#define A80211_COUNTRY_CODE     51
++
++static uint32_t a80211_power = 1;               /* APPLE80211_POWER_ON */
++static uint8_t a80211_seen[2][512 / 8];
++
++static void
++a80211_put32(uint8_t *b, unsigned off, uint32_t v)
++{
++	b[off] = (uint8_t)v;
++	b[off + 1] = (uint8_t)(v >> 8);
++	b[off + 2] = (uint8_t)(v >> 16);
++	b[off + 3] = (uint8_t)(v >> 24);
++}
++
++/*
++ * One request. kb holds the data (for a SET what userland sent, for a GET zeroes to fill); returns an errno. Structure
++ * layouts are the macOS ones (OpenIntelWireless/itlwm apple80211_var.h); iOS 16 may differ, hence the logging.
++ */
++static int
++a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len)
++{
++	switch (type) {
++	case A80211_POWER:
++		if (get) {
++			if (len >= 12) {
++				a80211_put32(kb, 0, 1);                 /* version */
++				a80211_put32(kb, 4, 1);                 /* radios */
++				a80211_put32(kb, 8, a80211_power);      /* power_state[0] */
++			}
++		} else if (len >= 12) {
++			a80211_power = kb[8] | (uint32_t)kb[9] << 8;
++		}
++		return 0;
++	case A80211_STATE:
++		if (get && len >= 8) {
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, 0);                         /* APPLE80211_S_INIT */
++		}
++		return 0;
++	case A80211_OP_MODE:
++		if (get && len >= 8) {
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, 1);                         /* APPLE80211_M_STA */
++		}
++		return 0;
++	case A80211_PHY_MODE:
++		if (get && len >= 12) {
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, 0x4 | 0x8 | 0x10);          /* 11b, 11g, 11n */
++			a80211_put32(kb, 8, 0);
++		}
++		return 0;
++	case A80211_CARD_CAPS:
++		if (get && len >= 16) {
++			a80211_put32(kb, 0, 1);
++			kb[4] = 0x0f;                                   /* wep, tkip, aes, aes-ccm */
++			kb[5] = 0xe0;                                   /* ibss.. (bits 5..7) */
++			kb[6] = 0x7f;
++		}
++		return 0;
++	case A80211_LOCALE:
++		if (get && len >= 8) {
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, 2);                         /* ETSI */
++		}
++		return 0;
++	case A80211_COUNTRY_CODE:
++		if (get && len >= 8) {
++			a80211_put32(kb, 0, 1);
++			kb[4] = 'T';
++			kb[5] = 'R';
++		}
++		return 0;
++	case A80211_DRIVER_VERSION:
++	case A80211_HARDWARE_VERSION:
++		if (get && len >= 8) {
++			a80211_put32(kb, 0, 1);
++			strlcpy((char *)kb + 4, "vince-wcn36xx 1.0", len - 4);
++		}
++		return 0;
++	case A80211_SCAN_REQ:
++	case A80211_DISASSOCIATE:
++		return 0;
++	case A80211_SSID:
++	case A80211_BSSID:
++	case A80211_CHANNEL:
++	case A80211_RSSI:
++	case A80211_NOISE:
++	case A80211_RATE:
++	case A80211_TXPOWER:
++		return get ? ENXIO : 0;                                 /* not associated */
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static errno_t
++a80211_ioctl(ifnet_t ifp, u_long cmd, void *data)
++{
++	struct a80211_req *rq = data;
++	bool get = cmd == SIOCGA80211_A || cmd == SIOCGA80211_B;
++	uint8_t kb[1536];
++	uint32_t len = rq->len;
++	user_addr_t ua = (user_addr_t)rq->data;
++	int err = 0;
++
++#pragma unused(ifp)
++	if (len > sizeof(kb)) {
++		len = sizeof(kb);
++	}
++	bzero(kb, sizeof(kb));
++	if (len && ua && !get) {
++		err = copyin(ua, kb, len);
++	} else if (len && ua && get) {
++		(void)copyin(ua, kb, len);      /* some requests carry parameters in a GET */
++	}
++	if (!err) {
++		err = a80211_handle(rq->type, get, kb, len);
++	}
++	if (rq->type < 512) {
++		uint8_t *seen = &a80211_seen[get ? 1 : 0][rq->type / 8];
++		uint8_t bit = (uint8_t)(1u << (rq->type % 8));
++
++		if (!(*seen & bit)) {
++			char nm[32];
++
++			*seen |= bit;
++			proc_selfname(nm, sizeof(nm));
++			printf("VINCE A80211: %s type %u val %u len %u by %s -> %d (cmd %#lx)\n", get ? "get" : "set", rq->type,
++			    rq->val, rq->len, nm, err, cmd);
++		}
++	}
++	if (get && !err && len && ua) {
++		err = copyout(kb, ua, len);
++	}
++	return err;
++}
++
+ static void
+ vif_start(ifnet_t ifp)
+ {
+@@ -107,7 +282,20 @@ vif_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 	case SIOCADDMULTI:
+ 	case SIOCDELMULTI:
+ 		return 0;
++	case SIOCSA80211_A:
++	case SIOCGA80211_A:
++	case SIOCSA80211_B:
++	case SIOCGA80211_B:
++		return a80211_ioctl(ifp, cmd, data);
+ 	default:
++		if (cmd != SIOCGIFMEDIA) {
++			static unsigned unk;
++
++			if (unk < 60) {
++				unk++;
++				printf("VINCE A80211: unknown ioctl %#lx\n", cmd);
++			}
++		}
+ 		return EOPNOTSUPP;
+ 	}
+ }
+@@ -124,6 +312,10 @@ vif_attach(const uint8_t mac[6])
+ 	struct ifnet_init_eparams e;
+ 	errno_t err;
+ 
++	if (vif_ifp) {
++		return 0;
++	}
++
+ 	vif_grp = lck_grp_alloc_init("vince_wlan", LCK_GRP_ATTR_NULL);
+ 	vif_lock = lck_mtx_alloc_init(vif_grp, LCK_ATTR_NULL);
+ 	bzero(&e, sizeof(e));
+diff --git a/iokit/Kernel/arm/VinceWiFi.cpp b/iokit/Kernel/arm/VinceWiFi.cpp
+new file mode 100644
+index 0000000..a773325
+--- /dev/null
++++ b/iokit/Kernel/arm/VinceWiFi.cpp
+@@ -0,0 +1,247 @@
++/*
++ * VINCE Wi-Fi in the IORegistry, X7 of reports/OVERNIGHT_PLAN.md.
++ *
++ * iOS userland finds a Wi-Fi radio through IOKit, not through the BSD interface list: wifid waits for a service of
++ * class IO80211SkywalkInterface whose IO80211InterfaceRole is "Infrastructure" and reads its IOInterfaceName
++ * ("en0"); configd's interface list comes from IONetworkInterface objects whose controller is an IO80211Controller.
++ * The kernel has no IONetworkingFamily / IO80211Family (those are kexts), so the few classes that userland looks at
++ * are defined here. They carry no data path: the packets go through the BSD ifnet (bsd/dev/vince_wlan_if.c), the
++ * Apple80211 requests arrive as socket ioctls on that ifnet.
++ *
++ * Property reads on these objects are logged ("VINCE IO: ...") so that what userland asks for can be seen.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <device/device_types.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <sys/proc.h>
++
++static unsigned vince_io_logged;
++
++static void
++vince_io_log_key(const char *cls, const char *op, const char *key)
++{
++	char name[32];
++
++	if (vince_io_logged >= 400) {
++		return;
++	}
++	vince_io_logged++;
++	proc_selfname(name, sizeof(name));
++	IOLog("VINCE IO: %s %s \"%s\" by %s\n", cls, op, key ? key : "?", name);
++}
++
++/* ---- the controller side: IONetworkController -> IOEthernetController -> IO80211Controller -> VinceWLANController ---- */
++
++class IONetworkController : public IOService {
++	OSDeclareDefaultStructors(IONetworkController);
++};
++OSDefineMetaClassAndStructors(IONetworkController, IOService);
++
++class IOEthernetController : public IONetworkController {
++	OSDeclareDefaultStructors(IOEthernetController);
++};
++OSDefineMetaClassAndStructors(IOEthernetController, IONetworkController);
++
++class IO80211Controller : public IOEthernetController {
++	OSDeclareDefaultStructors(IO80211Controller);
++public:
++	using IOEthernetController::copyProperty;
++	OSPtr<OSObject> copyProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IO80211Controller, IOEthernetController);
++
++OSPtr<OSObject>
++IO80211Controller::copyProperty(const OSSymbol *aKey) const
++{
++	OSPtr<OSObject> o = IOEthernetController::copyProperty(aKey);
++
++	vince_io_log_key("controller", o ? "get" : "get (absent)", aKey ? aKey->getCStringNoCopy() : NULL);
++	return o;
++}
++
++class VinceWLANController : public IO80211Controller {
++	OSDeclareDefaultStructors(VinceWLANController);
++};
++OSDefineMetaClassAndStructors(VinceWLANController, IO80211Controller);
++
++/* ---- the interface side: IONetworkInterface -> IOEthernetInterface -> IO80211Interface -> IO80211SkywalkInterface ---- */
++
++class IONetworkInterface : public IOService {
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class IOEthernetInterface : public IONetworkInterface {
++	OSDeclareDefaultStructors(IOEthernetInterface);
++};
++OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface);
++
++class IO80211Interface : public IOEthernetInterface {
++	OSDeclareDefaultStructors(IO80211Interface);
++};
++OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface);
++
++class IO80211SkywalkInterface : public IO80211Interface {
++	OSDeclareDefaultStructors(IO80211SkywalkInterface);
++public:
++	using IO80211Interface::copyProperty;
++	OSPtr<OSObject> copyProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
++	OSPtr<OSObject> copyProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IO80211SkywalkInterface, IO80211Interface);
++
++OSPtr<OSObject>
++IO80211SkywalkInterface::copyProperty(const OSSymbol *aKey) const
++{
++	OSPtr<OSObject> o = IO80211Interface::copyProperty(aKey);
++
++	vince_io_log_key("interface", o ? "get" : "get (absent)", aKey ? aKey->getCStringNoCopy() : NULL);
++	return o;
++}
++
++OSPtr<OSObject>
++IO80211SkywalkInterface::copyProperty(const char *aKey) const
++{
++	OSPtr<OSObject> o = IO80211Interface::copyProperty(aKey);
++
++	vince_io_log_key("interface", o ? "get" : "get (absent)", aKey);
++	return o;
++}
++
++IOReturn
++IO80211SkywalkInterface::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++
++	if (d) {
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++		OSObject *k;
++
++		while (it && (k = it->getNextObject())) {
++			OSSymbol *s = OSDynamicCast(OSSymbol, k);
++			OSString *str = OSDynamicCast(OSString, k);
++
++			vince_io_log_key("interface", "set", s ? s->getCStringNoCopy() : (str ? str->getCStringNoCopy() : NULL));
++		}
++		OSSafeReleaseNULL(it);
++	}
++	return kIOReturnSuccess;
++}
++
++/* ---- the user client wifid has an entitlement for ---- */
++
++class IO80211APIUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IO80211APIUserClient);
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IO80211APIUserClient, IOUserClient);
++
++IOReturn
++IO80211APIUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IO80211APIUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	char name[32];
++	static unsigned n;
++
++	if (n < 100) {
++		n++;
++		proc_selfname(name, sizeof(name));
++		IOLog("VINCE IO: IO80211APIUserClient selector %u by %s, in %u/%u out %u/%u\n", selector, name,
++		    args->scalarInputCount, args->structureInputSize, args->scalarOutputCount, args->structureOutputSize);
++	}
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++
++/* ---- publishing, called from the Wi-Fi driver thread once en0 exists ---- */
++
++static VinceWLANController *vince_ctl;
++static IO80211SkywalkInterface *vince_ifc;
++
++static void
++vince_wlan_props(const uint8_t mac[6])
++{
++	if (!vince_ifc) {
++		return;
++	}
++	vince_ifc->setProperty("IOMACAddress", (void *)mac, 6);
++	vince_ctl->setProperty("IOMACAddress", (void *)mac, 6);
++}
++
++extern "C" int
++vince_wlan_iokit_publish(const uint8_t mac[6], const char *bsd_name)
++{
++	if (vince_ifc) {
++		vince_wlan_props(mac);          /* the firmware restarted: new station address */
++		return 0;
++	}
++	vince_ctl = new VinceWLANController;
++	if (!vince_ctl || !vince_ctl->init()) {
++		OSSafeReleaseNULL(vince_ctl);
++		return -1;
++	}
++	vince_ifc = new IO80211SkywalkInterface;
++	if (!vince_ifc || !vince_ifc->init()) {
++		OSSafeReleaseNULL(vince_ifc);
++		OSSafeReleaseNULL(vince_ctl);
++		return -2;
++	}
++	/* controller */
++	vince_ctl->setProperty("IOClass", "VinceWLANController");
++	vince_ctl->setProperty(kIOUserClientClassKey, "IO80211APIUserClient");
++	vince_ctl->setProperty("IOModel", "Pronto WCN3660B");
++	vince_ctl->setProperty("IOVendor", "Qualcomm");
++	vince_ctl->setProperty("IOBuiltin", true);
++	vince_ctl->setProperty("IOMACAddress", (void *)mac, 6);
++	if (!vince_ctl->attach(IOService::getPlatform())) {
++		return -3;
++	}
++	vince_ctl->registerService();
++	/* interface */
++	vince_ifc->setProperty("IOInterfaceName", bsd_name);
++	vince_ifc->setProperty("BSD Name", bsd_name);
++	vince_ifc->setProperty("IOInterfaceNamePrefix", "en");
++	vince_ifc->setProperty("IOInterfaceUnit", 0ULL, 32);
++	vince_ifc->setProperty("IOInterfaceType", 6ULL, 8);             /* IFT_ETHER */
++	vince_ifc->setProperty("IOMediaAddressLength", 6ULL, 8);
++	vince_ifc->setProperty("IOMediaHeaderLength", 14ULL, 8);
++	vince_ifc->setProperty("IOMaxTransferUnit", 1500ULL, 32);
++	vince_ifc->setProperty("IOMinPacketSize", 60ULL, 32);
++	vince_ifc->setProperty("IOMaxPacketSize", 1518ULL, 32);
++	vince_ifc->setProperty("IOPrimaryInterface", true);
++	vince_ifc->setProperty("IOBuiltin", true);
++	vince_ifc->setProperty("IOLocation", "");
++	vince_ifc->setProperty("IO80211InterfaceRole", "Infrastructure");
++	vince_ifc->setProperty(kIOUserClientClassKey, "IO80211APIUserClient");
++	vince_ifc->setProperty("IOMACAddress", (void *)mac, 6);
++	if (!vince_ifc->attach(vince_ctl)) {
++		return -4;
++	}
++	vince_ifc->registerService();
++	IOLog("VINCE IO: IO80211SkywalkInterface %s registered\n", bsd_name);
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..974cf31 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/VinceWiFi.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
