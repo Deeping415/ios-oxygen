@@ -1,0 +1,618 @@
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index b2a91f6..1e4b8b1 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -530,10 +530,135 @@ vw_connect_test(int stage)
+ 	}
+ leave:
+ 	vwpa_stop();
+-	printf("VINCE WLAN: leave %d\n", va_leave(&ap));
++	printf("VINCE WLAN: leave %d\n", va_leave(&ap, 1));
+ 	printf("VINCE WLAN: X3 done\n");
+ }
+ 
++/* ---- X5: a station that stays connected (boot-args vincessid, vincepass, vincerun, vincecycle, vincelease) ---- */
++
++/* HAL requests that get no answer: the firmware stopped reading WLAN_CTRL. Only the HAL steps count (not the over-the-air ones). */
++static bool
++vw_hal_dead(int step, int err)
++{
++	bool hal_step = step == 2 || step == 3 || step == 4 || step == 9 || step == 10 || step == 11;
++
++	return hal_step && err >= -5 && err <= -2;
++}
++
++static void
++vw_station(void)
++{
++	static char ssid[40], pass[72];
++	static struct va_result ar;
++	static struct vwpa_result wr;
++	static const char *const why_names[] = { "?", "time over", "AP dropped us", "keep-alive / lease failed", "forced cycle", "lease changed" };
++	uint32_t n, pl = 0;
++	const struct vd_bss *b = vd_bss_list(&n), *hit = NULL;
++	struct vd_bss ap;
++	int run_s = 600, cycle_s = 0, lease_s = 0, attempt = 0, cycles = 0;
++	uint64_t end;
++
++	if (!PE_parse_boot_argn("vincessid", ssid, sizeof(ssid)) || !PE_parse_boot_argn("vincepass", pass, sizeof(pass))) {
++		printf("VINCE WLAN: vincessid / vincepass boot-args missing, stopping after the scan\n");
++		return;
++	}
++	(void)PE_parse_boot_argn("vincerun", &run_s, sizeof(run_s));
++	(void)PE_parse_boot_argn("vincecycle", &cycle_s, sizeof(cycle_s));
++	(void)PE_parse_boot_argn("vincelease", &lease_s, sizeof(lease_s));
++	vw_unscore(ssid);
++	while (pass[pl]) {
++		pl++;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		if (strncmp(b[i].ssid, ssid, 33) == 0 && (!hit || b[i].rssi > hit->rssi)) {
++			hit = &b[i];
++		}
++	}
++	if (!hit) {
++		printf("VINCE WLAN: \"%s\" is not in the scan table\n", ssid);
++		return;
++	}
++	ap = *hit;
++	end = vd_now_us() + (uint64_t)run_s * 1000000ULL;
++	printf("VINCE WLAN: station \"%s\" ch %u, run %d s, forced cycle %d s, lease override %d s\n", ap.ssid, ap.ch, run_s,
++	    cycle_s, lease_s);
++	vif_start_ping((uint32_t)run_s / 5, 5000);
++	while (vd_now_us() < end) {
++		const struct vn_cfg *c;
++		int r, why;
++
++		va_use_rsn(1);
++		r = va_connect(&ap, &ar);
++		va_use_rsn(0);
++		vw_log_assoc(&ar);
++		if (r) {
++			if (vw_hal_dead(ar.step, ar.err)) {
++				printf("VINCE WLAN: the firmware stopped answering HAL requests (step %d): Wi-Fi needs a Pronto restart\n", ar.step);
++				break;
++			}
++		} else {
++			r = vwpa_handshake(&ap, pass, pl, &wr);
++			printf("VINCE WLAN: handshake %s at step %d (%s) err %d, gtk id %u\n", r ? "FAILED" : "done", wr.step,
++			    vwpa_step_name(wr.step), wr.err, wr.gtk_id);
++			if (r && vw_hal_dead(wr.step, wr.err)) {
++				printf("VINCE WLAN: the firmware stopped answering HAL requests: Wi-Fi needs a Pronto restart\n");
++				break;
++			}
++			if (!r) {
++				r = vn_dhcp();
++				if (r) {
++					printf("VINCE WLAN: DHCP failed, step %d\n", r);
++				}
++			}
++		}
++		if (r) {
++			uint32_t backoff = 2u << (attempt < 4 ? attempt : 4);
++
++			vwpa_stop();
++			(void)va_leave(&ap, 1);
++			vn_link_reset();
++			printf("VINCE WLAN: reconnect attempt %d failed, waiting %u s\n", attempt + 1, backoff);
++			attempt++;
++			vince_smd_sleep(backoff * 1000);
++			continue;
++		}
++		attempt = 0;
++		c = vn_get_cfg();
++		printf("VINCE WLAN: DHCP lease ip %u.%u.%u.%u gw %u.%u.%u.%u lease %u s\n", c->ip[0], c->ip[1], c->ip[2], c->ip[3],
++		    c->gw[0], c->gw[1], c->gw[2], c->gw[3], c->lease);
++		if (vif_up(c)) {
++			break;
++		}
++		for (;;) {
++			uint64_t now = vd_now_us();
++
++			if (now >= end) {
++				why = VIF_END_TIME;
++				break;
++			}
++			why = vif_serve(end - now, (uint32_t)cycle_s, (uint32_t)lease_s);
++			if (why != VIF_END_RECFG) {
++				break;
++			}
++			(void)vif_up(vif_current_cfg());
++		}
++		printf("VINCE WLAN: serve ended: %s\n", why >= 1 && why <= 5 ? why_names[why] : why_names[0]);
++		vif_down();
++		vwpa_stop();
++		printf("VINCE WLAN: leave %d\n", va_leave(&ap, 1));
++		vn_link_reset();
++		if (why == VIF_END_TIME) {
++			break;
++		}
++		cycles++;
++		vince_smd_sleep(2000);          /* let the AP forget us */
++	}
++	bzero(pass, sizeof(pass));
++	vif_stop_ping();
++	vince_smd_sleep(6000);
++	printf("VINCE WLAN: station done after %d reconnect cycles\n", cycles);
++}
++
+ static void
+ vw_thread(void *arg, wait_result_t w)
+ {
+@@ -571,7 +696,9 @@ vw_thread(void *arg, wait_result_t w)
+ 	printf("VINCE WLAN: X1 done, HAL is up\n");
+ 	if (stage >= 2 && vw_scan_all() == 0) {
+ 		printf("VINCE WLAN: X2 done\n");
+-		if (stage >= 3) {
++		if (stage >= 5) {
++			vw_station();
++		} else if (stage >= 3) {
+ 			vw_connect_test(stage);
+ 		}
+ 	}
+diff --git a/bsd/dev/vince_wlan.h b/bsd/dev/vince_wlan.h
+index c2652fc..02f9bf0 100755
+--- a/bsd/dev/vince_wlan.h
++++ b/bsd/dev/vince_wlan.h
+@@ -96,7 +96,15 @@ uint32_t va_own_rsn(uint8_t *out);
+ int va_reconfigure_ccmp(const struct vd_bss *ap);       /* after the 4-way handshake, as wcn36xx_set_key() */
+ int va_install_ptk(const uint8_t tk[16]);
+ int va_install_gtk(uint8_t keyid, const uint8_t gtk[16]);
+-int va_leave(const struct vd_bss *ap);                  /* deauthentication, then link idle */
++/*
++ * Leave: deauthentication (va_leave only), then the firmware side in mainline order: remove keys, delete station,
++ * delete BSS, link idle. full = 0 only sets the link idle (old behaviour, leaves the firmware in a state that wedges
++ * the next association). va_drop: the link is gone without a goodbye.
++ */
++int va_leave(const struct vd_bss *ap, int full);
++int va_drop(const struct vd_bss *ap, int full);
++int va_teardown_code(int i);                            /* 0 remove ptk, 1 remove gtk, 2 delete sta, 3 delete bss, 4 link idle */
++uint32_t va_teardown_status(int i);
+ 
+ /* IPv4 over the association (vince_wlan_net.c) */
+ struct vn_cfg {
+@@ -127,12 +135,25 @@ int vn_dhcp(void);                                      /* 0 ok, otherwise the s
+ void vn_dhcp_unicast(int on);
+ int vn_arp(const uint8_t ip[4], uint8_t mac[6]);
+ int vn_ping(const uint8_t ip[4], uint32_t *rtt_us);
++void vn_set_cfg(const struct vn_cfg *c);                /* put a saved lease back (a failed renewal clears it) */
+ void vn_set_stack_mode(int on);                         /* 1: the kernel IP stack owns ARP / ICMP, the responder is off */
+ const uint8_t *vn_last_dst(void);                       /* addr1 (DA) of the frame vn_recv_eth() returned last */
+ 
+ /* en0 (vince_wlan_if.c) */
+ int vif_attach(const uint8_t mac[6]);
+-void vif_stack_test(const struct vn_cfg *c);            /* attach en0, address + route from the lease, 75 s of traffic with a kernel ICMP test */
++void vif_stack_test(const struct vn_cfg *c);
++/* X5: en0 as a long-running interface */
++#define VIF_END_TIME    1               /* the requested time is over */
++#define VIF_END_LOST    2               /* the AP deauthenticated / disassociated us */
++#define VIF_END_DEAD    3               /* keep-alive or lease renewal failed for good */
++#define VIF_END_CYCLE   4               /* the test asked for a forced reconnect */
++#define VIF_END_RECFG   5               /* the lease changed: configure the interface again */
++int vif_up(const struct vn_cfg *c);     /* attach (once), stack mode, address + default route from the lease */
++void vif_down(void);                    /* not running, address removed */
++int vif_serve(uint64_t us_total, uint32_t cycle_s, uint32_t t1_override_s);
++void vif_start_ping(uint32_t count, uint32_t period_ms);
++void vif_stop_ping(void);
++const struct vn_cfg *vif_current_cfg(void);            /* attach en0, address + route from the lease, 75 s of traffic with a kernel ICMP test */
+ 
+ /* WPA2-PSK supplicant (vince_wlan_wpa.c) */
+ struct vwpa_result {
+diff --git a/bsd/dev/vince_wlan_assoc.c b/bsd/dev/vince_wlan_assoc.c
+index 8592d30..a53a9ef 100644
+--- a/bsd/dev/vince_wlan_assoc.c
++++ b/bsd/dev/vince_wlan_assoc.c
+@@ -477,7 +477,72 @@ static int va_connect_inner(const struct vd_bss *ap, struct va_result *r)
+ 	return 0;
+ }
+ 
+-int va_leave(const struct vd_bss *ap)
++/*
++ * What mac80211 + wcn36xx do when the link goes away: link state idle, delete the AP station (CONFIG_STA's index),
++ * delete the BSS. Without the last two the firmware keeps the old BSS entry, and a following association (with a new
++ * self address) wedged it at SET_LINK_STATE(POSTASSOC) (seen 2026-10-25). Returns the first HAL error, 0 if all ok.
++ */
++static int s_td[5];			/* results of the teardown requests: remove ptk, remove gtk, delete sta, delete bss, link idle */
++static uint32_t s_td_status[5];
++static int s_have_gtk, s_gtk_id;	/* keys installed in this association (for the teardown) */
++
++int va_teardown_code(int i)
++{
++	return s_td[i];
++}
++
++uint32_t va_teardown_status(int i)
++{
++	return s_td_status[i];
++}
++
++/*
++ * Mainline order when a link goes away (mac80211 removes the keys, then the station, then clears the BSSID):
++ * RMV_STAKEY, RMV_BSSKEY, DELETE_STA (CONFIG_STA's index), DELETE_BSS, SET_LINK_STATE(IDLE). DELETE_BSS fails with
++ * status 7 when the link state is already idle (seen 2026-10-25), and leaving the BSS/station/keys behind wedged
++ * the next association. full = 0 only sets the link idle (the old, incomplete behaviour). Returns the first error.
++ */
++static int teardown_fw(const uint8_t *bssid, int full)
++{
++	int e = 0;
++
++	for (int i = 0; i < 5; i++) {
++		s_td[i] = 0;
++		s_td_status[i] = 0;
++	}
++	if (full && s_last.sta_index != 0xff && s_last.bss_index != 0xff) {
++		if (s_encrypted) {
++			struct wcn36xx_hal_remove_sta_key_req_msg k;
++			struct wcn36xx_hal_remove_bss_key_req_msg g;
++
++			memset(&k, 0, sizeof(k));
++			k.sta_idx = s_last.bss_sta_index;
++			k.enc_type = WCN36XX_HAL_ED_CCMP;
++			k.key_id = 0;
++			k.unicast = 1;
++			s_td[0] = vw_cmd(WCN36XX_HAL_RMV_STAKEY_REQ, (uint8_t *)&k + 8, sizeof(k) - 8, &s_td_status[0]);
++			if (s_have_gtk) {
++				memset(&g, 0, sizeof(g));
++				g.bss_idx = s_last.bss_index;
++				g.enc_type = WCN36XX_HAL_ED_CCMP;
++				g.key_id = (u8)s_gtk_id;
++				s_td[1] = vw_cmd(WCN36XX_HAL_RMV_BSSKEY_REQ, (uint8_t *)&g + 8, sizeof(g) - 8, &s_td_status[1]);
++			}
++		}
++		s_td[2] = vw_cmd(WCN36XX_HAL_DELETE_STA_REQ, &s_last.sta_index, 1, &s_td_status[2]);
++		s_td[3] = vw_cmd(WCN36XX_HAL_DELETE_BSS_REQ, &s_last.bss_index, 1, &s_td_status[3]);
++	}
++	s_td[4] = set_link(bssid, WCN36XX_HAL_LINK_IDLE_STATE);
++	for (int i = 0; i < 5; i++)
++		if (!e && s_td[i])
++			e = s_td[i];
++	s_last.sta_index = s_last.bss_index = 0xff;
++	s_encrypted = 0;
++	s_have_gtk = 0;
++	return e;
++}
++
++int va_leave(const struct vd_bss *ap, int full)
+ {
+ 	uint8_t f[40];
+ 	const uint8_t *self = vw_self_info();
+@@ -494,7 +559,14 @@ int va_leave(const struct vd_bss *ap)
+ 	vd_tx_mgmt(&ctx, f, n, 0);
+ 	vd_poll(50);
+ 	s_connected = 0;
+-	return set_link(ap->bssid, WCN36XX_HAL_LINK_IDLE_STATE);
++	return teardown_fw(ap->bssid, full);
++}
++
++/* the link is gone without a goodbye (the AP vanished): only the firmware side is cleaned up */
++int va_drop(const struct vd_bss *ap, int full)
++{
++	s_connected = 0;
++	return teardown_fw(ap->bssid, full);
+ }
+ 
+ /* ---- keys (wcn36xx_set_key, pairwise first) ---- */
+@@ -564,6 +636,12 @@ int va_install_gtk(uint8_t keyid, const uint8_t gtk[16])
+ 	m.keys[0].length = 16;
+ 	for (int i = 0; i < 16; i++)
+ 		m.keys[0].key[i] = gtk[i];
+-	return vw_cmd(WCN36XX_HAL_SET_BSSKEY_REQ, (uint8_t *)&m + 8, sizeof(m) - 8, &status);
++	int e = vw_cmd(WCN36XX_HAL_SET_BSSKEY_REQ, (uint8_t *)&m + 8, sizeof(m) - 8, &status);
++
++	if (!e) {
++		s_have_gtk = 1;
++		s_gtk_id = keyid;
++	}
++	return e;
+ }
+ #endif /* ARM64_BOARD_CONFIG_VINCE */
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index 8fe5c22..5b45916 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -55,6 +55,11 @@ static mbuf_t vif_txq[VIF_TXQ];
+ static uint32_t vif_txh, vif_txn;
+ static volatile bool vif_stalled;       /* start() left packets in the stack's queue because ours was full */
+ static struct vn_cfg vif_cfg;
++static bool vif_have_addr;
++static uint8_t vif_addr[4];
++static volatile bool vif_ping_quit;
++static uint32_t vif_ping_n, vif_ping_period_ms;
++static uint64_t vif_last_rx_us;
+ 
+ /* ---- ifnet callbacks ---- */
+ 
+@@ -206,6 +211,26 @@ vif_route_default(const uint8_t gw[4])
+ 	return err;
+ }
+ 
++static void
++vif_unconfig(void)
++{
++	struct ifreq ifr;
++	struct sockaddr_in *sin;
++
++	if (!vif_have_addr || !vif_ifp) {
++		return;
++	}
++	bzero(&ifr, sizeof(ifr));
++	strlcpy(ifr.ifr_name, if_name(vif_ifp), sizeof(ifr.ifr_name));
++	sin = (struct sockaddr_in *)(void *)&ifr.ifr_addr;
++	sin->sin_len = sizeof(struct sockaddr_in);
++	sin->sin_family = AF_INET;
++	bcopy(vif_addr, &sin->sin_addr, 4);
++	printf("VINCE WLAN: remove address %u.%u.%u.%u: %d\n", vif_addr[0], vif_addr[1], vif_addr[2], vif_addr[3],
++	    in_control(NULL, SIOCDIFADDR, (caddr_t)&ifr, vif_ifp, kernproc));
++	vif_have_addr = false;
++}
++
+ static int
+ vif_config(const struct vn_cfg *c)
+ {
+@@ -232,6 +257,8 @@ vif_config(const struct vn_cfg *c)
+ 	if (err) {
+ 		return err;
+ 	}
++	vif_have_addr = true;
++	bcopy(c->ip, vif_addr, 4);
+ 	ifnet_set_flags(vif_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	err = vif_route_default(c->gw);
+ 	printf("VINCE WLAN: default route via %u.%u.%u.%u: %d\n", c->gw[0], c->gw[1], c->gw[2], c->gw[3], err);
+@@ -315,24 +342,96 @@ vif_input(const uint8_t dst[6], const uint8_t src[6], uint16_t etype, const uint
+ 	ifnet_input(vif_ifp, m, &stats);
+ }
+ 
+-/* run the interface for us_total microseconds, or until the AP drops us */
+-static void
+-vif_run(uint64_t us_total)
++/*
++ * Run the interface: transmit what the stack queued, deliver what the AP sends, and keep the link up. Returns why it
++ * stopped (VIF_END_*). cycle_s != 0 forces a reconnect after that many seconds (test); t1_override_s != 0 replaces the
++ * DHCP renewal time (half the lease). Lease renewal and keep-alive probes run here, in the one thread that owns DXE.
++ */
++int
++vif_serve(uint64_t us_total, uint32_t cycle_s, uint32_t t1_override_s)
+ {
+ 	static uint8_t buf[1600];
+-	uint8_t src[6];
++	uint8_t src[6], gwmac[6];
+ 	uint16_t et;
+-	uint64_t until = vd_now_us() + us_total;
+-
+-	while (vd_now_us() < until && !vn_link_lost()) {
++	uint64_t t0 = vd_now_us(), until = t0 + us_total, last_ka = t0, next_stat = t0 + 60000000ULL, t1;
++	uint32_t lease = vif_cfg.lease ? vif_cfg.lease : 3600;
++	int ka_fail = 0, renew_fail = 0;
++
++	t1 = t0 + (uint64_t)(t1_override_s ? t1_override_s : lease / 2) * 1000000ULL;
++	vif_last_rx_us = t0;
++	while (vd_now_us() < until) {
++		uint64_t now;
+ 		int n;
+ 
+ 		vif_tx_drain();
+ 		n = vn_recv_eth(src, &et, buf, sizeof(buf), 2);
+ 		if (n > 0) {
+ 			vif_input(vn_last_dst(), src, et, buf, (uint32_t)n);
++			vif_last_rx_us = vd_now_us();
++		}
++		now = vd_now_us();
++		if (vn_link_lost()) {
++			return VIF_END_LOST;
++		}
++		if (cycle_s && now - t0 >= (uint64_t)cycle_s * 1000000ULL) {
++			return VIF_END_CYCLE;
++		}
++		if (now >= t1) {
++			struct vn_cfg old = vif_cfg;
++			int r = vn_dhcp();
++
++			if (r == 0) {
++				const struct vn_cfg *nc = vn_get_cfg();
++				bool same = bcmp(nc->ip, old.ip, 4) == 0 && bcmp(nc->gw, old.gw, 4) == 0 &&
++				    bcmp(nc->mask, old.mask, 4) == 0;
++
++				printf("VINCE WLAN: lease renewed (%u s)%s\n", nc->lease, same ? "" : ", address changed");
++				vif_cfg = *nc;
++				lease = nc->lease ? nc->lease : 3600;
++				renew_fail = 0;
++				t1 = vd_now_us() + (uint64_t)(t1_override_s ? t1_override_s : lease / 2) * 1000000ULL;
++				if (!same) {
++					return VIF_END_RECFG;
++				}
++			} else {
++				vn_set_cfg(&old);
++				renew_fail++;
++				printf("VINCE WLAN: lease renewal failed (step %d), try %d\n", r, renew_fail);
++				t1 = vd_now_us() + 15000000ULL;
++				if (renew_fail >= 8) {
++					return VIF_END_DEAD;
++				}
++			}
++		}
++		if (now - vif_last_rx_us > 20000000ULL && now - last_ka > 20000000ULL) {
++			last_ka = now;
++			if (vn_arp(vif_cfg.gw, gwmac) == 0) {
++				ka_fail = 0;
++				vif_last_rx_us = vd_now_us();
++			} else if (++ka_fail >= 3) {
++				printf("VINCE WLAN: keep-alive: gateway silent three times\n");
++				return VIF_END_DEAD;
++			}
++		}
++		if (now >= next_stat) {
++			struct ifnet_stats_param st;
++
++			next_stat += 60000000ULL;
++			if (ifnet_stat(vif_ifp, &st) == 0) {
++				printf("VINCE WLAN: %llu s: in %llu out %llu errors %llu/%llu\n", (unsigned long long)((now - t0) / 1000000),
++				    (unsigned long long)st.packets_in, (unsigned long long)st.packets_out,
++				    (unsigned long long)st.errors_in, (unsigned long long)st.errors_out);
++			}
+ 		}
+ 	}
++	return VIF_END_TIME;
++}
++
++/* the 75 s run of stage 4 */
++static void
++vif_run(uint64_t us_total)
++{
++	(void)vif_serve(us_total, 0, 0);
+ }
+ 
+ /* ---- the test: ICMP echo to the gateway through a kernel socket ---- */
+@@ -364,7 +463,7 @@ vif_ping_thread(void *arg, wait_result_t w)
+ 	struct msghdr msg;
+ 	uint8_t echo[8 + 32], rx[128];
+ 	socket_t so = NULL;
+-	int ok = 0, fail = 0;
++	int ok = 0, fail = 0, sent_n = 0;
+ 	errno_t err;
+ 
+ 	vince_smd_sleep(1500);          /* let the driver loop start */
+@@ -379,14 +478,19 @@ vif_ping_thread(void *arg, wait_result_t w)
+ 	tv.tv_sec = 1;
+ 	tv.tv_usec = 0;
+ 	sock_setsockopt(so, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+-	bzero(&sin, sizeof(sin));
+-	sin.sin_len = sizeof(sin);
+-	sin.sin_family = AF_INET;
+-	bcopy(vif_cfg.gw, &sin.sin_addr, 4);
+-	for (int i = 0; i < 12; i++) {
++	for (uint32_t i = 0; i < vif_ping_n && !vif_ping_quit; i++) {
+ 		uint64_t t0;
+ 		size_t sent = 0, got = 0;
+ 
++		if (!vif_have_addr) {
++			vince_smd_sleep(1000);  /* between two associations */
++			i--;
++			continue;
++		}
++		bzero(&sin, sizeof(sin));
++		sin.sin_len = sizeof(sin);
++		sin.sin_family = AF_INET;
++		bcopy(vif_cfg.gw, &sin.sin_addr, 4);
+ 		bzero(echo, sizeof(echo));
+ 		echo[0] = 8;
+ 		echo[4] = 0x76;
+@@ -409,9 +513,10 @@ vif_ping_thread(void *arg, wait_result_t w)
+ 		msg.msg_iov = &iov;
+ 		msg.msg_iovlen = 1;
+ 		t0 = vd_now_us();
++		sent_n++;
+ 		err = sock_send(so, &msg, 0, &sent);
+ 		if (err) {
+-			printf("VINCE WLAN: kernel ping %d: send failed %d\n", i, err);
++			printf("VINCE WLAN: kernel ping %u: send failed %d\n", i, err);
+ 			fail++;
+ 		} else {
+ 			int good = 0;
+@@ -442,27 +547,75 @@ vif_ping_thread(void *arg, wait_result_t w)
+ 			}
+ 			if (good) {
+ 				ok++;
+-				printf("VINCE WLAN: kernel ping %d: reply in %u us\n", i, (uint32_t)(vd_now_us() - t0));
++				printf("VINCE WLAN: kernel ping %u: reply in %u us\n", i, (uint32_t)(vd_now_us() - t0));
+ 			} else {
+ 				fail++;
+-				printf("VINCE WLAN: kernel ping %d: no reply (%d)\n", i, err);
++				printf("VINCE WLAN: kernel ping %u: no reply (%d)\n", i, err);
+ 			}
+ 		}
+-		vince_smd_sleep(4000);
++		vince_smd_sleep(vif_ping_period_ms);
+ 	}
+-	printf("VINCE WLAN: kernel ping done, %d ok, %d failed\n", ok, fail);
++	printf("VINCE WLAN: kernel ping done, %d ok, %d failed of %d\n", ok, fail, sent_n);
+ 	sock_close(so);
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++void
++vif_start_ping(uint32_t count, uint32_t period_ms)
++{
++	thread_t th;
++
++	vif_ping_n = count;
++	vif_ping_period_ms = period_ms;
++	vif_ping_quit = false;
++	if (kernel_thread_start(vif_ping_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
++
++void
++vif_stop_ping(void)
++{
++	vif_ping_quit = true;
++}
++
++const struct vn_cfg *
++vif_current_cfg(void)
++{
++	return &vif_cfg;
++}
++
++/* en0 up: attach on first use, address and default route from the lease */
++int
++vif_up(const struct vn_cfg *c)
++{
++	vif_cfg = *c;
++	vn_set_stack_mode(1);
++	if (!vif_ifp && vif_attach(vw_mac)) {
++		vn_set_stack_mode(0);
++		return -1;
++	}
++	vif_unconfig();
++	return vif_config(c);
++}
++
++void
++vif_down(void)
++{
++	if (vif_ifp) {
++		ifnet_set_flags(vif_ifp, 0, IFF_RUNNING);
++	}
++	vif_unconfig();
++	vn_set_stack_mode(0);
++}
++
+ /* attach en0, configure it from the lease, run the driver loop with a ping test beside it */
+ void
+ vif_stack_test(const struct vn_cfg *c)
+ {
+ 	struct ifnet_stats_param st;
+-	thread_t th;
+ 
+ 	vif_cfg = *c;
+ 	vn_set_stack_mode(1);
+@@ -470,9 +623,7 @@ vif_stack_test(const struct vn_cfg *c)
+ 		vn_set_stack_mode(0);
+ 		return;
+ 	}
+-	if (kernel_thread_start(vif_ping_thread, NULL, &th) == KERN_SUCCESS) {
+-		thread_deallocate(th);
+-	}
++	vif_start_ping(12, 4000);
+ 	vif_run(75ULL * 1000000ULL);
+ 	if (ifnet_stat(vif_ifp, &st) == 0) {
+ 		printf("VINCE WLAN: %s packets in %llu out %llu, errors in %llu out %llu\n", if_name(vif_ifp),
+diff --git a/bsd/dev/vince_wlan_net.c b/bsd/dev/vince_wlan_net.c
+index 9e5e58b..e5fca2f 100644
+--- a/bsd/dev/vince_wlan_net.c
++++ b/bsd/dev/vince_wlan_net.c
+@@ -41,6 +41,11 @@ const struct vn_cfg *vn_get_cfg(void)
+ 	return &s_cfg;
+ }
+ 
++void vn_set_cfg(const struct vn_cfg *c)
++{
++	s_cfg = *c;
++}
++
+ static void p16(uint8_t *p, uint32_t v)
+ {
+ 	p[0] = (uint8_t)(v >> 8);
