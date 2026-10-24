@@ -1,0 +1,80 @@
+diff --git a/bsd/vfs/kpi_vfs.c b/bsd/vfs/kpi_vfs.c
+index 90cd9fc..c84b096 100644
+--- a/bsd/vfs/kpi_vfs.c
++++ b/bsd/vfs/kpi_vfs.c
+@@ -4459,7 +4459,7 @@ vn_rename(struct vnode *fdvp, struct vnode **fvpp, struct componentname *fcnp, s
+ 					_err = VNOP_RENAME(fdvp, *fvpp, fcnp, tdvp, *tvpp, tcnp, ctx);
+ 				}
+ 			}
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ 			/*
+ 			 * SWEET: HFS has no RENAME_SWAP, which Foundation's atomic
+ 			 * writes use (usermanagerd: "Failed to atomically swap writing
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 163fce1..806bbfa 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2600,7 +2600,7 @@ is_io_service_match_property_table_bin(
+ }
+ 
+ static 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ /*
+  * SWEET IOKit trace: registry and matching calls made by the processes
+  * named in boot-arg sweetiolog (comma separated, default "backboardd,SpringBoard";
+@@ -2675,7 +2675,7 @@ internal_io_service_get_matching_services(
+ 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+ 		OSIterator *found = IOService::getMatchingServices( dict );
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ 		char sname[32];
+ 		if (sweet_iolog(sname, sizeof(sname))) {
+ 			unsigned int count = 0;
+@@ -2775,7 +2775,7 @@ internal_io_service_get_matching_service(
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+ 		*service = IOService::copyMatchingService( dict );
+ 		kr = *service ? kIOReturnSuccess : kIOReturnNotFound;
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ 		char sname[32];
+ 		if (sweet_iolog(sname, sizeof(sname))) {
+ 			sweet_iolog_dict(sname, "matching1", dict,
+@@ -2885,7 +2885,7 @@ internal_io_service_add_notification(
+ 			continue;
+ 		}
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ 		{
+ 			char sname[32];
+ 			if (sweet_iolog(sname, sizeof(sname))) {
+@@ -3360,7 +3360,7 @@ is_io_registry_entry_from_path(
+ 	}
+ 
+ 	entry = IORegistryEntry::fromPath( path );
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ 	{
+ 		char sname[32];
+ 		if (sweet_iolog(sname, sizeof(sname))) {
+@@ -4178,7 +4178,7 @@ is_io_registry_entry_get_child_iterator(
+ 
+ 	*iterator = IOUserIterator::withIterator(entry->getChildIterator(
+ 		    IORegistryEntry::getPlane( plane )));
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ 	{
+ 		char sname[32];
+ 		if (sweet_iolog(sname, sizeof(sname))) {
+@@ -4401,7 +4401,7 @@ is_io_service_open_extended(
+ #endif
+ 		res = service->newUserClient( owningTask, (void *) owningTask,
+ 		    connect_type, propertiesDict, &client );
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ 		{
+ 			char sname[32];
+ 			if (sweet_iolog(sname, sizeof(sname))) {
