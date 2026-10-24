@@ -218,10 +218,10 @@ index 0000000..6b6d957
 +#endif /* _VINCE_SMD_H_ */
 diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
 new file mode 100755
-index 0000000..197b561
+index 0000000..7efd090
 --- /dev/null
 +++ b/bsd/dev/vince_wlan.c
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,238 @@
 +/*
 + * VINCE (Redmi 5 Plus, MSM8953) Wi-Fi HAL client, X1 of reports/WIFI_HANDOFF.md. A port of
 + * vince-bringup/shim/wlan.c (start and feature exchange), which was proven on the phone first: HAL_START answered
@@ -239,6 +239,7 @@ index 0000000..197b561
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/thread.h>
++#include <kern/sched_prim.h>
 +#include <pexpert/pexpert.h>
 +#include "vince_smd.h"
 +
