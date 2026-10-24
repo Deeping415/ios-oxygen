@@ -206,14 +206,15 @@ def build_vince_adt(seed=None):
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    # CPUs: 8 Cortex-A53 cores (all 8 cores defined, cpu0 running, cpu1-7 stopped)
+    # CPUs: Cortex-A53 x8 in two clusters (MPIDR 0x0-0x3, 0x100-0x103). CPU1 is left out: the shim's USB monitor
+    # runs there for the whole session. cpu0 running, the rest started by SweetCPU through PSCI CPU_ON.
     cpu_nodes = []
-    for core in range(8):
+    for core in (0, 2, 3, 4, 5, 6, 7):
         c = node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,cortex-a53') + cstr('ARM,v8') + b'\0'),
-            ('reg', u32(core)),
+            ('reg', u32(core if core < 4 else 0x100 + core - 4)),
             ('cpu-id', u32(core)),
             ('cluster-id', u32(0 if core < 4 else 1)),
             ('cluster-type', u32(0)),
