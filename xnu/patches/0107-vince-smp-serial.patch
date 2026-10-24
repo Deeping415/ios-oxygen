@@ -1,0 +1,60 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index a5af49d..fe548a5 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -50,8 +50,9 @@ vince_psci(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
+ 	return (int64_t)x0;
+ }
+ 
+-static uint32_t gVinceBootRegistered;
++static uint32_t gVinceBootRegistered;   /* the boot CPU finished processor_start */
+ static uint32_t gVinceStarted;
++static uint32_t gVinceStartBusy;        /* one secondary at a time through register + start + wait */
+ #endif
+ 
+ class SweetCPU : public IOCPU {
+@@ -111,8 +112,20 @@ SweetCPU::start(IOService *provider)
+ 	}
+ 	fPhysId = cpu->phys_id;
+ 	fBoot = boot;
++	/*
++	 * The CPU nubs match in parallel threads; measured with all six at once: two CPUs never got past the reset
++	 * vector's marks and the system stopped early in boot. Serialize the secondaries.
++	 */
++	while (!boot && !os_atomic_cmpxchg(&gVinceStartBusy, 0, 1, acquire)) {
++		IOSleep(5);
++	}
+ #endif
+ 	if (!IOCPU::start(provider)) {
++#if defined(VINCE)
++		if (!boot) {
++			os_atomic_store(&gVinceStartBusy, 0, release);
++		}
++#endif
+ 		return false;
+ 	}
+ #if defined(VINCE)
+@@ -153,7 +166,6 @@ SweetCPU::start(IOService *provider)
+ 			}
+ 			vince_smp_mark_va = (volatile uint64_t *)marks;
+ 		}
+-		os_atomic_store(&gVinceBootRegistered, 1, release);
+ 	}
+ #endif
+ 	/*
+@@ -171,6 +183,7 @@ SweetCPU::start(IOService *provider)
+ 		IOLog("SWEET CPU: cpu %u (MPIDR %#x) %s\n", cpu->cpu_id, fPhysId,
+ 		    result != KERN_SUCCESS ? "not started" :
+ 		    getCPUState() == kIOCPUStateRunning ? "running" : "did not come up within 1 s");
++		os_atomic_store(&gVinceStartBusy, 0, release);
+ 		registerService();
+ 		finishStart(topology);
+ 		return true;
+@@ -180,6 +193,7 @@ SweetCPU::start(IOService *provider)
+ 		panic("SWEET CPU: processor_start failed: %d", result);
+ 	}
+ #if defined(VINCE)
++	os_atomic_store(&gVinceBootRegistered, 1, release);
+ 	registerService();
+ 	IOLog("SWEET CPU: boot CPU %u (MPIDR %#x) registered, SGI1 verified\n", getCPUNumber(), fPhysId);
+ 	finishStart(topology);
