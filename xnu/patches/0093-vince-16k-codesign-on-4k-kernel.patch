@@ -1,0 +1,50 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index 9b553be..7da8ef3 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -124,6 +124,9 @@ ZONE_DEFINE_ID(ZONE_ID_CS_BLOB, "cs_blob zone", struct cs_blob,
+ extern int cs_debug;
+ 
+ #define PAGE_SHIFT_4K           (12)
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#define VINCE_CS_PAGE_SHIFT_16K (14)
++#endif
+ 
+ static boolean_t
+ cs_valid_range(
+@@ -371,6 +374,16 @@ cs_validate_codedirectory(const CS_CodeDirectory *cd, size_t length)
+ 	if (ntohl(cd->magic) != CSMAGIC_CODEDIRECTORY) {
+ 		return EBADEXEC;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	/*
++	 * VINCE runs 4K pages (the Cortex-A53 has no 16K granule) under an iOS userland whose binaries and shared
++	 * cache are all signed with 16K hash pages. Accept those signatures: cdhashes, entitlements and the code
++	 * directory checks below still work; only per-page validation is skipped (cs_validate_hash).
++	 */
++	if (cd->pageSize == VINCE_CS_PAGE_SHIFT_16K) {
++		/* accepted */
++	} else
++#endif
+ 	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT)) {
+ 		printf("disallowing unsupported code signature page shift: %u\n", cd->pageSize);
+ 		return EBADEXEC;
+@@ -5716,6 +5729,18 @@ cs_validate_hash(
+ 		upper_bound = lower_bound + blob->csb_mem_size;
+ 
+ 		cd = blob->csb_cd;
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++		if (cd != NULL && blob->csb_hash_pageshift > PAGE_SHIFT) {
++			/*
++			 * A 16K hash covers four of VINCE's 4K pages, and the other three need not be resident, so this
++			 * page cannot be checked on its own. Accept it unchecked (see cs_validate_codedirectory): the
++			 * signature itself was validated when it was added, and nothing on this port is enforced anyway.
++			 */
++			*bytes_processed = PAGE_SIZE - (vm_size_t)(page_offset & PAGE_MASK);
++			*tainted = 0;
++			return TRUE;
++		}
++#endif
+ 		if (cd != NULL) {
+ 			/* all CD's that have been injected is already validated */
+ 
