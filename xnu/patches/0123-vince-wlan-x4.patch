@@ -70,10 +70,10 @@ index 6971183..c2652fc 100755
  struct vwpa_result {
 diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
 new file mode 100755
-index 0000000..7707522
+index 0000000..8fe5c22
 --- /dev/null
 +++ b/bsd/dev/vince_wlan_if.c
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,485 @@
 +/*
 + * VINCE Wi-Fi network interface en0, X4 of reports/WIFI_HANDOFF.md.
 + *
@@ -106,6 +106,7 @@ index 0000000..7707522
 +#include <net/route.h>
 +#include <net/dlil.h>
 +#include <net/kpi_interface.h>
++#include <net/if_ether.h>
 +#include <net/ether_if_module.h>
 +#include <netinet/in.h>
 +#include <netinet/in_var.h>
