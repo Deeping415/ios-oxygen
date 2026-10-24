@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 7e8cd48..bbaec29 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,6 +73,38 @@ vince_cpu_mhz(void)
+ }
+ 
+ static uint32_t gVinceMHz[8];
++
++/*
++ * Cluster clock muxes (Android DT qcom,cpu-clock-8953: c0-mux 0x0b111050, c1-mux 0x0b011050; CMD +0, CFG +4,
++ * CFG src_sel bits 8-10: 0 XO, 4 GPLL0, 5 the A53 PLL; div bits 0-4). Measured: LK leaves cluster 0 (MPIDR 0x0xx)
++ * on GPLL0/1 = 800 MHz (CFG 0x401) and cluster 1 (MPIDR 0x1xx) on XO = 19.2 MHz (CFG 0), so threads the scheduler
++ * put on CPUs 4-7 ran 40 times slower. Both clusters share VDD_APC, which already carries cluster 0 at 800 MHz:
++ * give cluster 1 the same source. The A53 PLL (for more than 800 MHz) stays off; that needs CPR voltage control.
++ */
++static void
++vince_cluster1_clock(void)
++{
++	vm_offset_t c0 = ml_io_map(0x0b111000, 0x1000), c1 = ml_io_map(0x0b011000, 0x1000);
++	if (!c0 || !c1) {
++		IOLog("VINCE CLK: mux mapping failed\n");
++		return;
++	}
++	volatile uint32_t *cmd1 = (volatile uint32_t *)(c1 + 0x50), *cfg1 = (volatile uint32_t *)(c1 + 0x54);
++	uint32_t cfg0 = *(volatile uint32_t *)(c0 + 0x54), old = *cfg1;
++	if (((old >> 8) & 7) != 0 || ((cfg0 >> 8) & 7) != 4) {
++		IOLog("VINCE CLK: cluster muxes c0 %#x c1 %#x, left alone\n", cfg0, old);
++		return;
++	}
++	*cfg1 = cfg0;
++	__builtin_arm_dsb(DSB_SY);
++	*cmd1 = *cmd1 | 1;          /* UPDATE */
++	__builtin_arm_dsb(DSB_SY);
++	int i = 0;
++	while ((*cmd1 & 1) && i++ < 1000) {
++		IODelay(1);
++	}
++	IOLog("VINCE CLK: cluster 1 mux %#x -> %#x (as cluster 0)%s\n", old, *cfg1, (*cmd1 & 1) ? ", update stuck" : "");
++}
+ static uint32_t gVinceBootRegistered;   /* the boot CPU finished processor_start */
+ static uint32_t gVinceStarted;
+ static uint32_t gVinceStartBusy;        /* one secondary at a time through register + start + wait */
+@@ -182,6 +214,7 @@ SweetCPU::start(IOService *provider)
+ 
+ #if defined(VINCE)
+ 	if (boot) {
++		vince_cluster1_clock();
+ 		vm_offset_t marks = ml_io_map(0x913F0000, 0x1000);
+ 		if (marks) {
+ 			for (int i = 0; i < 8; i++) {
