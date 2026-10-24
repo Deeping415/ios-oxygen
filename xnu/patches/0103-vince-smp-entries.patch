@@ -1,0 +1,63 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index b113ae6..f33d089 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -248,15 +248,40 @@ SweetCPU::initCPU(bool boot)
+ 		panic("SWEET CPU: cpu %u has no GIC CPU interface bit", getCPUNumber());
+ 	}
+ 	__builtin_arm_dmb(DMB_ISH);
++#endif
++#if defined(VINCE)
++	/* per core at mark page word 0x110 + 4 * core: DAIF, GICD_ISPENDR0 / ISACTIVER0, GICC_HPPIR, ticks */
++	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++	unsigned core = (unsigned)((mpidr & 0xff) + ((mpidr >> 8) & 0xff) * 4);
++	volatile uint64_t *diag = vince_smp_mark_va && core < 8 ? vince_smp_mark_va + 0x110 + 4 * core : NULL;
++	if (diag) {
++		diag[0] = __builtin_arm_rsr64("DAIF") | ((uint64_t)ml_get_interrupts_enabled() << 32);
++	}
+ #endif
+ 	assert(ml_get_interrupts_enabled());
+ 	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
++#if defined(VINCE)
++	vince_smp_mark(0x34);
++#endif
+ 
+ 	/* A real GIC interrupt clears SIGPdisabled in cpu_signal_handler. */
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(NSEC_PER_SEC, &deadline);
+ 	signalCPU(this);
++#if defined(VINCE)
++	vince_smp_mark(0x35);
++	uint64_t spins = 0;
++#endif
+ 	while (!ml_cpu_signal_is_enabled()) {
++#if defined(VINCE)
++		if (diag && (++spins & 0xfff) == 0) {
++			diag[1] = *(volatile uint32_t *)(vince_gicd_base + 0x200) |
++			    ((uint64_t)*(volatile uint32_t *)(vince_gicd_base + 0x300) << 32);
++			diag[2] = *(volatile uint32_t *)(vince_gicc_base + 0x018) |
++			    ((uint64_t)*(volatile uint32_t *)(vince_gicc_base + 0x000) << 32);
++			diag[3] = spins;
++		}
++#endif
+ 		if (mach_absolute_time() > deadline) {
+ 			panic("SWEET CPU: SGI1 self-test timed out on cpu %u", getCPUNumber());
+ 		}
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 0828d5c..1a3d142 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -956,7 +956,12 @@ cpu_start(int cpu)
+ 		flush_dcache((vm_offset_t)&CpuDataEntries[cpu], sizeof(cpu_data_entry_t), FALSE);
+ 		flush_dcache((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t), FALSE);
+ #if defined(VINCE)
+-		/* PSCI starts the CPU with its MMU and caches off: what reset_vector/start_cpu read before the MMU is on */
++		/*
++		 * PSCI starts the CPU with its MMU and caches off: what reset_vector/start_cpu read before the MMU is on.
++		 * All of CpuDataEntries: entries are filled in registration order (cpu_number), not by this logical cpu
++		 * id, and the CPUs register in parallel; the reset vector scans the whole array.
++		 */
++		flush_dcache((vm_offset_t)&CpuDataEntries[0], sizeof(CpuDataEntries), FALSE);
+ 		flush_dcache((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData), FALSE);
+ 		flush_dcache((vm_offset_t)&const_boot_args, sizeof(const_boot_args), FALSE);
+ 		flush_dcache((vm_offset_t)&sysreg_restore, sizeof(sysreg_restore), FALSE);
