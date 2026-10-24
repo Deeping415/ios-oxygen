@@ -5348,7 +5348,7 @@ index 091d191..6971183 100755
  #endif /* _VINCE_WLAN_H_ */
 diff --git a/bsd/dev/vince_wlan_assoc.c b/bsd/dev/vince_wlan_assoc.c
 new file mode 100644
-index 0000000..dda8856
+index 0000000..8592d30
 --- /dev/null
 +++ b/bsd/dev/vince_wlan_assoc.c
 @@ -0,0 +1,569 @@
@@ -5793,9 +5793,9 @@ index 0000000..dda8856
 +			return r->err;
 +		}
 +		if (wait_frame(ap->bssid, 0x10, &fr, STEP_TIMEOUT_MS, &r->waited_ms) >= 24 + 6) {
-+			r->va_status = (uint16_t)(fr.data[26] | fr.data[27] << 8);
++			r->assoc_status = (uint16_t)(fr.data[26] | fr.data[27] << 8);
 +			r->aid = (uint16_t)((fr.data[28] | fr.data[29] << 8) & 0x3fff);
-+			ok = r->va_status == 0;
++			ok = r->assoc_status == 0;
 +			if (!ok)
 +				break;
 +		}
