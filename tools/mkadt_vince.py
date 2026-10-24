@@ -156,6 +156,23 @@ def build_vince_adt(seed=None):
         ('interrupts', u32(0, 65, 2)),  # GPIO 65
     ])
 
+    # No Wi-Fi or Bluetooth driver: MobileGestalt's WifiAddress/BluetoothAddress (for the A11-style UniqueDeviceID)
+    # look up IONameMatch wlan / bluetooth and read local-mac-address; with no such service it waits for an
+    # IONetworkController, times out and retries forever (lsd's database seed hangs in GenerateBuiltInAppInstallSessionID,
+    # SpringBoard and backboardd wait on lsd). Stub nubs with synthetic locally administered addresses, not the phone's.
+    wlan = node('wlan', [
+        ph(),
+        ('device_type', cstr('wlan')),
+        ('compatible', cstr('vince,wlan-stub')),
+        ('local-mac-address', bytes([0x02, 0x56, 0x49, 0x4e, 0x43, 0x01])),
+    ])
+    bluetooth = node('bluetooth', [
+        ph(),
+        ('device_type', cstr('bluetooth')),
+        ('compatible', cstr('vince,bluetooth-stub')),
+        ('local-mac-address', bytes([0x02, 0x56, 0x49, 0x4e, 0x43, 0x02])),
+    ])
+
     # arm-io with device_type and ranges so pe_arm_get_soc_base_phys() succeeds
     arm_io = node('arm-io', [
         ph(),
@@ -164,7 +181,7 @@ def build_vince_adt(seed=None):
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
         ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
-    ], [gic, gic_alias, wdt, disp0, sdhci_node, touch_node])
+    ], [gic, gic_alias, wdt, disp0, sdhci_node, touch_node, wlan, bluetooth])
 
     # Vince Framebuffer console node for early kprintf
     fbcon = node('vince-fbcon', [
