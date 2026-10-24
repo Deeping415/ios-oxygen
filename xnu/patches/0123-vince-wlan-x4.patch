@@ -1,0 +1,610 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4c5d334..b8c0135 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/vince_ctl.c			standard
+ bsd/dev/vince_smd.c			standard
+ bsd/dev/vince_wlan.c			standard
+ bsd/dev/vince_wlan_dxe.c		standard
++bsd/dev/vince_wlan_if.c		standard
+ bsd/dev/vince_wlan_wpa.c		standard
+ bsd/dev/vince_wlan_net.c		standard
+ bsd/dev/vince_wlan_assoc.c		standard
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index 2c41274..b2a91f6 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -449,7 +449,7 @@ vw_log_assoc(const struct va_result *r)
+ }
+ 
+ static void
+-vw_connect_test(void)
++vw_connect_test(int stage)
+ {
+ 	static char ssid[40], pass[72];
+ 	static struct va_result ar;
+@@ -503,6 +503,10 @@ vw_connect_test(void)
+ 	} else {
+ 		printf("VINCE WLAN: DHCP lease ip %u.%u.%u.%u gw %u.%u.%u.%u lease %u s\n", c->ip[0], c->ip[1], c->ip[2],
+ 		    c->ip[3], c->gw[0], c->gw[1], c->gw[2], c->gw[3], c->lease);
++		if (stage >= 4) {
++			vif_stack_test(c);
++			goto leave;
++		}
+ 		/* link upkeep: a ping to the gateway every 5 s for a minute; ARP / echo / group rekeys are answered inside */
+ 		for (int i = 0; i < 12; i++) {
+ 			uint8_t src[6], buf[100];
+@@ -524,6 +528,7 @@ vw_connect_test(void)
+ 			}
+ 		}
+ 	}
++leave:
+ 	vwpa_stop();
+ 	printf("VINCE WLAN: leave %d\n", va_leave(&ap));
+ 	printf("VINCE WLAN: X3 done\n");
+@@ -567,7 +572,7 @@ vw_thread(void *arg, wait_result_t w)
+ 	if (stage >= 2 && vw_scan_all() == 0) {
+ 		printf("VINCE WLAN: X2 done\n");
+ 		if (stage >= 3) {
+-			vw_connect_test();
++			vw_connect_test(stage);
+ 		}
+ 	}
+ out:
+diff --git a/bsd/dev/vince_wlan.h b/bsd/dev/vince_wlan.h
+index 6971183..c2652fc 100755
+--- a/bsd/dev/vince_wlan.h
++++ b/bsd/dev/vince_wlan.h
+@@ -127,6 +127,12 @@ int vn_dhcp(void);                                      /* 0 ok, otherwise the s
+ void vn_dhcp_unicast(int on);
+ int vn_arp(const uint8_t ip[4], uint8_t mac[6]);
+ int vn_ping(const uint8_t ip[4], uint32_t *rtt_us);
++void vn_set_stack_mode(int on);                         /* 1: the kernel IP stack owns ARP / ICMP, the responder is off */
++const uint8_t *vn_last_dst(void);                       /* addr1 (DA) of the frame vn_recv_eth() returned last */
++
++/* en0 (vince_wlan_if.c) */
++int vif_attach(const uint8_t mac[6]);
++void vif_stack_test(const struct vn_cfg *c);            /* attach en0, address + route from the lease, 75 s of traffic with a kernel ICMP test */
+ 
+ /* WPA2-PSK supplicant (vince_wlan_wpa.c) */
+ struct vwpa_result {
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+new file mode 100755
+index 0000000..7707522
+--- /dev/null
++++ b/bsd/dev/vince_wlan_if.c
+@@ -0,0 +1,484 @@
++/*
++ * VINCE Wi-Fi network interface en0, X4 of reports/WIFI_HANDOFF.md.
++ *
++ * A plain BSD ifnet (Ethernet family, like if_fake.c) on top of the proven shim-port data path:
++ *  - TX: the stack's start callback moves packets (full Ethernet frames) into a small queue; the driver thread
++ *    (vif_run) converts them to 802.11 data frames (vn_send_eth) and sends them through DXE. All DXE and HAL access
++ *    stays in that one thread.
++ *  - RX: the driver thread pops the data frames the AP sends (vn_recv_eth, which already answers EAPOL group rekeys),
++ *    rebuilds the Ethernet header (DA = addr1, SA = addr3) and hands the packet to ifnet_input().
++ *  - ARP and ICMP are the kernel's job now: vn_set_stack_mode() turns the shim-port responder off.
++ * IP address and default route are set from the DHCP lease with in_control(SIOCAIFADDR) and a routing-socket
++ * RTM_ADD. A second thread pings the gateway through a kernel ICMP socket, so the whole path (route, ARP, ifnet
++ * output, DXE, AP, DXE, ifnet input, ICMP) is exercised by the stack, not by the driver's private helpers.
++ *
++ * Not an IO80211 / IONetworkInterface: configd and Settings will not know it yet (X7).
++ */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/mbuf.h>
++#include <sys/socket.h>
++#include <sys/sockio.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/if_dl.h>
++#include <net/ethernet.h>
++#include <net/route.h>
++#include <net/dlil.h>
++#include <net/kpi_interface.h>
++#include <net/ether_if_module.h>
++#include <netinet/in.h>
++#include <netinet/in_var.h>
++#include <netinet/ip.h>
++#include <netinet/ip_icmp.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include "vince_smd.h"
++#include "vince_wlan.h"
++
++extern kern_return_t thread_terminate(thread_t);
++extern struct proc *kernproc;
++
++#define VIF_TXQ         64
++#define VIF_MTU         1500
++
++static ifnet_t vif_ifp;
++static lck_grp_t *vif_grp;
++static lck_mtx_t *vif_lock;
++static mbuf_t vif_txq[VIF_TXQ];
++static uint32_t vif_txh, vif_txn;
++static volatile bool vif_stalled;       /* start() left packets in the stack's queue because ours was full */
++static struct vn_cfg vif_cfg;
++
++/* ---- ifnet callbacks ---- */
++
++static void
++vif_start(ifnet_t ifp)
++{
++	mbuf_t m;
++
++	lck_mtx_lock(vif_lock);
++	while (vif_txn < VIF_TXQ) {
++		if (ifnet_dequeue(ifp, &m) != 0) {
++			break;
++		}
++		vif_txq[(vif_txh + vif_txn) % VIF_TXQ] = m;
++		vif_txn++;
++	}
++	if (vif_txn == VIF_TXQ) {
++		vif_stalled = true;
++	}
++	lck_mtx_unlock(vif_lock);
++}
++
++static errno_t
++vif_ioctl(ifnet_t ifp, u_long cmd, void *data)
++{
++	struct ifreq *ifr = data;
++
++	switch (cmd) {
++	case SIOCSIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++		if (ifnet_flags(ifp) & IFF_UP) {
++			ifnet_set_flags(ifp, IFF_RUNNING, IFF_RUNNING);
++		} else {
++			ifnet_set_flags(ifp, 0, IFF_RUNNING);
++		}
++		return 0;
++	case SIOCSIFMTU:
++		if (ifr->ifr_mtu > VIF_MTU || ifr->ifr_mtu < IF_MINMTU) {
++			return EINVAL;
++		}
++		return ifnet_set_mtu(ifp, (u_int32_t)ifr->ifr_mtu);
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++vif_free(ifnet_t ifp)
++{
++	ifnet_release(ifp);
++}
++
++int
++vif_attach(const uint8_t mac[6])
++{
++	struct ifnet_init_eparams e;
++	errno_t err;
++
++	vif_grp = lck_grp_alloc_init("vince_wlan", LCK_GRP_ATTR_NULL);
++	vif_lock = lck_mtx_alloc_init(vif_grp, LCK_ATTR_NULL);
++	bzero(&e, sizeof(e));
++	e.ver = IFNET_INIT_CURRENT_VERSION;
++	e.len = sizeof(e);
++#ifdef IFNET_INIT_NX_NOAUTO
++	e.flags = IFNET_INIT_NX_NOAUTO;
++#endif
++	e.uniqueid = "vince-wlan0";
++	e.uniqueid_len = 11;
++	e.name = "en";
++	e.unit = 0;
++	e.family = IFNET_FAMILY_ETHERNET;
++	e.type = IFT_ETHER;
++	e.start = vif_start;
++	e.demux = ether_demux;
++	e.add_proto = ether_add_proto;
++	e.del_proto = ether_del_proto;
++	e.check_multi = ether_check_multi;
++	e.framer_extended = ether_frameout_extended;
++	e.ioctl = vif_ioctl;
++	e.detach = vif_free;
++	e.broadcast_addr = etherbroadcastaddr;
++	e.broadcast_len = ETHER_ADDR_LEN;
++	err = ifnet_allocate_extended(&e, &vif_ifp);
++	if (err) {
++		printf("VINCE WLAN: ifnet_allocate failed %d\n", err);
++		return err;
++	}
++	ifnet_set_capabilities_enabled(vif_ifp, 0, -1);
++	ifnet_set_addrlen(vif_ifp, ETHER_ADDR_LEN);
++	ifnet_set_baudrate(vif_ifp, 54000000);
++	ifnet_set_mtu(vif_ifp, VIF_MTU);
++	ifnet_set_flags(vif_ifp, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
++	ifnet_set_hdrlen(vif_ifp, sizeof(struct ether_header));
++	ifnet_set_offload(vif_ifp, 0);
++	err = ifnet_attach(vif_ifp, NULL);
++	if (err) {
++		printf("VINCE WLAN: ifnet_attach failed %d\n", err);
++		ifnet_release(vif_ifp);
++		vif_ifp = NULL;
++		return err;
++	}
++	ifnet_set_lladdr(vif_ifp, mac, ETHER_ADDR_LEN);
++	printf("VINCE WLAN: %s attached, %02x:%02x:%02x:%02x:%02x:%02x\n", if_name(vif_ifp), mac[0], mac[1], mac[2],
++	    mac[3], mac[4], mac[5]);
++	return 0;
++}
++
++/* ---- IP address and default route ---- */
++
++static int
++vif_route_default(const uint8_t gw[4])
++{
++	struct {
++		struct rt_msghdr h;
++		struct sockaddr_in dst, gw, mask;
++	} rm;
++	struct iovec iov;
++	struct msghdr msg;
++	socket_t so;
++	size_t sent = 0;
++	errno_t err;
++
++	err = sock_socket(PF_ROUTE, SOCK_RAW, AF_INET, NULL, NULL, &so);
++	if (err) {
++		return err;
++	}
++	bzero(&rm, sizeof(rm));
++	rm.h.rtm_msglen = sizeof(rm);
++	rm.h.rtm_version = RTM_VERSION;
++	rm.h.rtm_type = RTM_ADD;
++	rm.h.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
++	rm.h.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
++	rm.h.rtm_seq = 1;
++	rm.dst.sin_len = rm.gw.sin_len = rm.mask.sin_len = sizeof(struct sockaddr_in);
++	rm.dst.sin_family = rm.gw.sin_family = rm.mask.sin_family = AF_INET;
++	bcopy(gw, &rm.gw.sin_addr, 4);
++	iov.iov_base = &rm;
++	iov.iov_len = sizeof(rm);
++	bzero(&msg, sizeof(msg));
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	err = sock_send(so, &msg, 0, &sent);
++	sock_close(so);
++	return err;
++}
++
++static int
++vif_config(const struct vn_cfg *c)
++{
++	struct in_aliasreq ifra;
++	uint32_t ip, mask;
++	int err;
++
++	bzero(&ifra, sizeof(ifra));
++	strlcpy(ifra.ifra_name, if_name(vif_ifp), sizeof(ifra.ifra_name));
++	ifra.ifra_addr.sin_len = sizeof(struct sockaddr_in);
++	ifra.ifra_addr.sin_family = AF_INET;
++	bcopy(c->ip, &ifra.ifra_addr.sin_addr, 4);
++	ifra.ifra_mask.sin_len = sizeof(struct sockaddr_in);
++	ifra.ifra_mask.sin_family = AF_INET;
++	bcopy(c->mask, &ifra.ifra_mask.sin_addr, 4);
++	bcopy(c->ip, &ip, 4);
++	bcopy(c->mask, &mask, 4);
++	ifra.ifra_broadaddr.sin_len = sizeof(struct sockaddr_in);
++	ifra.ifra_broadaddr.sin_family = AF_INET;
++	ifra.ifra_broadaddr.sin_addr.s_addr = ip | ~mask;
++	err = in_control(NULL, SIOCAIFADDR, (caddr_t)&ifra, vif_ifp, kernproc);
++	printf("VINCE WLAN: address %u.%u.%u.%u/%u.%u.%u.%u on %s: %d\n", c->ip[0], c->ip[1], c->ip[2], c->ip[3],
++	    c->mask[0], c->mask[1], c->mask[2], c->mask[3], if_name(vif_ifp), err);
++	if (err) {
++		return err;
++	}
++	ifnet_set_flags(vif_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	err = vif_route_default(c->gw);
++	printf("VINCE WLAN: default route via %u.%u.%u.%u: %d\n", c->gw[0], c->gw[1], c->gw[2], c->gw[3], err);
++	return 0;
++}
++
++/* ---- the driver loop ---- */
++
++static void
++vif_tx_drain(void)
++{
++	static uint8_t pkt[2048];
++
++	for (;;) {
++		mbuf_t m = NULL;
++		size_t len;
++
++		lck_mtx_lock(vif_lock);
++		if (vif_txn) {
++			m = vif_txq[vif_txh];
++			vif_txh = (vif_txh + 1) % VIF_TXQ;
++			vif_txn--;
++		}
++		lck_mtx_unlock(vif_lock);
++		if (!m) {
++			break;
++		}
++		len = mbuf_pkthdr_len(m);
++		if (len >= sizeof(struct ether_header) && len <= sizeof(pkt)) {
++			int r = -3;
++
++			mbuf_copydata(m, 0, len, pkt);
++			for (int tries = 0; tries < 50 && r == -3; tries++) {
++				r = vn_send_eth(pkt, (uint16_t)(pkt[12] << 8 | pkt[13]), pkt + 14, (uint32_t)len - 14);
++				if (r == -3) {
++					vince_smd_sleep(1);     /* DXE ring full */
++				}
++			}
++			if (r) {
++				ifnet_stat_increment_out(vif_ifp, 0, 0, 1);
++			} else {
++				ifnet_stat_increment_out(vif_ifp, 1, (u_int32_t)len, 0);
++			}
++		}
++		mbuf_freem(m);
++	}
++	if (vif_stalled) {
++		vif_stalled = false;
++		ifnet_start(vif_ifp);
++	}
++}
++
++static void
++vif_input(const uint8_t dst[6], const uint8_t src[6], uint16_t etype, const uint8_t *payload, uint32_t plen)
++{
++	struct ifnet_stat_increment_param stats;
++	unsigned int chunks = 1;
++	uint32_t len = 14 + plen;
++	uint8_t *d;
++	mbuf_t m;
++
++	if (mbuf_allocpacket(MBUF_DONTWAIT, len, &chunks, &m) != 0) {
++		ifnet_stat_increment_in(vif_ifp, 0, 0, 1);
++		return;
++	}
++	d = mbuf_data(m);
++	bcopy(dst, d, 6);
++	bcopy(src, d + 6, 6);
++	d[12] = (uint8_t)(etype >> 8);
++	d[13] = (uint8_t)etype;
++	bcopy(payload, d + 14, plen);
++	mbuf_setlen(m, len);
++	mbuf_pkthdr_setlen(m, len);
++	mbuf_pkthdr_setrcvif(m, vif_ifp);
++	mbuf_pkthdr_setheader(m, d);
++	mbuf_pkthdr_adjustlen(m, -(int)sizeof(struct ether_header));
++	mbuf_setdata(m, d + sizeof(struct ether_header), plen);
++	bzero(&stats, sizeof(stats));
++	stats.packets_in = 1;
++	stats.bytes_in = len;
++	ifnet_input(vif_ifp, m, &stats);
++}
++
++/* run the interface for us_total microseconds, or until the AP drops us */
++static void
++vif_run(uint64_t us_total)
++{
++	static uint8_t buf[1600];
++	uint8_t src[6];
++	uint16_t et;
++	uint64_t until = vd_now_us() + us_total;
++
++	while (vd_now_us() < until && !vn_link_lost()) {
++		int n;
++
++		vif_tx_drain();
++		n = vn_recv_eth(src, &et, buf, sizeof(buf), 2);
++		if (n > 0) {
++			vif_input(vn_last_dst(), src, et, buf, (uint32_t)n);
++		}
++	}
++}
++
++/* ---- the test: ICMP echo to the gateway through a kernel socket ---- */
++
++static uint16_t
++icmp_sum(const uint8_t *p, uint32_t n)
++{
++	uint32_t s = 0;
++
++	for (uint32_t i = 0; i + 1 < n; i += 2) {
++		s += (uint32_t)p[i] << 8 | p[i + 1];
++	}
++	if (n & 1) {
++		s += (uint32_t)p[n - 1] << 8;
++	}
++	while (s >> 16) {
++		s = (s & 0xffff) + (s >> 16);
++	}
++	return (uint16_t)~s;
++}
++
++static void
++vif_ping_thread(void *arg, wait_result_t w)
++{
++#pragma unused(arg, w)
++	struct sockaddr_in sin;
++	struct timeval tv;
++	struct iovec iov;
++	struct msghdr msg;
++	uint8_t echo[8 + 32], rx[128];
++	socket_t so = NULL;
++	int ok = 0, fail = 0;
++	errno_t err;
++
++	vince_smd_sleep(1500);          /* let the driver loop start */
++	err = sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_ICMP, NULL, NULL, &so);
++	if (err) {
++		err = sock_socket(PF_INET, SOCK_RAW, IPPROTO_ICMP, NULL, NULL, &so);
++	}
++	if (err) {
++		printf("VINCE WLAN: ICMP socket failed %d\n", err);
++		goto out;
++	}
++	tv.tv_sec = 1;
++	tv.tv_usec = 0;
++	sock_setsockopt(so, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++	bzero(&sin, sizeof(sin));
++	sin.sin_len = sizeof(sin);
++	sin.sin_family = AF_INET;
++	bcopy(vif_cfg.gw, &sin.sin_addr, 4);
++	for (int i = 0; i < 12; i++) {
++		uint64_t t0;
++		size_t sent = 0, got = 0;
++
++		bzero(echo, sizeof(echo));
++		echo[0] = 8;
++		echo[4] = 0x76;
++		echo[5] = 0x04;
++		echo[7] = (uint8_t)(i + 1);
++		for (int k = 0; k < 32; k++) {
++			echo[8 + k] = (uint8_t)k;
++		}
++		{
++			uint16_t cs = icmp_sum(echo, sizeof(echo));
++
++			echo[2] = (uint8_t)(cs >> 8);
++			echo[3] = (uint8_t)cs;
++		}
++		iov.iov_base = echo;
++		iov.iov_len = sizeof(echo);
++		bzero(&msg, sizeof(msg));
++		msg.msg_name = &sin;
++		msg.msg_namelen = sizeof(sin);
++		msg.msg_iov = &iov;
++		msg.msg_iovlen = 1;
++		t0 = vd_now_us();
++		err = sock_send(so, &msg, 0, &sent);
++		if (err) {
++			printf("VINCE WLAN: kernel ping %d: send failed %d\n", i, err);
++			fail++;
++		} else {
++			int good = 0;
++
++			for (int tries = 0; tries < 3 && !good; tries++) {
++				iov.iov_base = rx;
++				iov.iov_len = sizeof(rx);
++				bzero(&msg, sizeof(msg));
++				msg.msg_iov = &iov;
++				msg.msg_iovlen = 1;
++				got = 0;
++				err = sock_receive(so, &msg, 0, &got);
++				if (err) {
++					break;
++				}
++				{
++					const uint8_t *p = rx;
++					size_t n = got;
++
++					if (n >= 20 && (p[0] >> 4) == 4 && p[9] == 1) {
++						size_t hl = (size_t)(p[0] & 15) * 4;
++
++						p += hl;
++						n -= hl;
++					}
++					good = n >= 8 && p[0] == 0 && p[4] == 0x76 && p[5] == 0x04;
++				}
++			}
++			if (good) {
++				ok++;
++				printf("VINCE WLAN: kernel ping %d: reply in %u us\n", i, (uint32_t)(vd_now_us() - t0));
++			} else {
++				fail++;
++				printf("VINCE WLAN: kernel ping %d: no reply (%d)\n", i, err);
++			}
++		}
++		vince_smd_sleep(4000);
++	}
++	printf("VINCE WLAN: kernel ping done, %d ok, %d failed\n", ok, fail);
++	sock_close(so);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* attach en0, configure it from the lease, run the driver loop with a ping test beside it */
++void
++vif_stack_test(const struct vn_cfg *c)
++{
++	struct ifnet_stats_param st;
++	thread_t th;
++
++	vif_cfg = *c;
++	vn_set_stack_mode(1);
++	if (vif_attach(vw_mac) || vif_config(c)) {
++		vn_set_stack_mode(0);
++		return;
++	}
++	if (kernel_thread_start(vif_ping_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++	vif_run(75ULL * 1000000ULL);
++	if (ifnet_stat(vif_ifp, &st) == 0) {
++		printf("VINCE WLAN: %s packets in %llu out %llu, errors in %llu out %llu\n", if_name(vif_ifp),
++		    (unsigned long long)st.packets_in, (unsigned long long)st.packets_out,
++		    (unsigned long long)st.errors_in, (unsigned long long)st.errors_out);
++	}
++	ifnet_set_flags(vif_ifp, 0, IFF_RUNNING);
++	vn_set_stack_mode(0);
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
+diff --git a/bsd/dev/vince_wlan_net.c b/bsd/dev/vince_wlan_net.c
+index 3f65129..9e5e58b 100644
+--- a/bsd/dev/vince_wlan_net.c
++++ b/bsd/dev/vince_wlan_net.c
+@@ -17,6 +17,18 @@
+ 
+ static struct vn_cfg s_cfg;
+ static int s_unicast_reply;
++static int s_stack_mode;		/* the kernel's IP stack answers ARP / ICMP: the responder stays quiet */
++static uint8_t s_last_dst[6];
++
++void vn_set_stack_mode(int on)
++{
++	s_stack_mode = on;
++}
++
++const uint8_t *vn_last_dst(void)
++{
++	return s_last_dst;
++}
+ 
+ void vn_dhcp_unicast(int on)
+ {
+@@ -67,7 +79,7 @@ static uint16_t csum(const uint8_t *d, uint32_t n)
+ /* an Ethernet-style frame to dst through the AP */
+ int vn_send_eth(const uint8_t *dst, uint16_t etype, const uint8_t *payload, uint32_t plen)
+ {
+-	static uint8_t f[600];
++	static uint8_t f[1700];
+ 	struct vd_tx_ctx ctx;
+ 	const uint8_t *bssid = va_bssid(), *mac = va_mac();
+ 	uint32_t n = 0;
+@@ -135,7 +147,7 @@ static int respond(const uint8_t *src, uint16_t et, const uint8_t *p, uint32_t n
+ {
+ 	static uint8_t out[600];
+ 
+-	if (!s_cfg.have_ip)
++	if (!s_cfg.have_ip || s_stack_mode)
+ 		return 0;
+ 	if (et == ETH_ARP && n >= 28 && g16(p + 6) == 1 && eq(p + 24, s_cfg.ip, 4)) {
+ 		memcpy(out, p, 8);
+@@ -193,6 +205,8 @@ int vn_recv_eth(uint8_t *src, uint16_t *etype, uint8_t *payload, uint32_t max, u
+ 			uint32_t pl = fr.len - hl - 8;
+ 			for (int i = 0; i < 6; i++)
+ 				src[i] = fr.data[16 + i];
++			for (int i = 0; i < 6; i++)
++				s_last_dst[i] = fr.data[4 + i];
+ 			*etype = (uint16_t)g16(l + 6);
+ 			if (respond(src, *etype, l + 8, pl) || (s_hook && s_hook(src, *etype, l + 8, pl)))
+ 				continue;
