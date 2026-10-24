@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index f33d089..a5af49d 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -257,6 +257,20 @@ SweetCPU::initCPU(bool boot)
+ 	if (diag) {
+ 		diag[0] = __builtin_arm_rsr64("DAIF") | ((uint64_t)ml_get_interrupts_enabled() << 32);
+ 	}
++#endif
++#if defined(VINCE)
++	if (!fBoot) {
++		/*
++		 * Secondaries get here from arm_init_cpu -> cpu_machine_init with interrupts masked (measured: DAIF 0x3c0),
++		 * so the self-test below could never complete. Leave SGI1 pending instead: the CPU takes it when its
++		 * idle loop unmasks interrupts, and cpu_signal_handler then clears SIGPdisabled.
++		 */
++		ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
++		signalCPU(this);
++		vince_smp_mark(0x33);
++		setCPUState(kIOCPUStateRunning);
++		return;
++	}
+ #endif
+ 	assert(ml_get_interrupts_enabled());
+ 	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
