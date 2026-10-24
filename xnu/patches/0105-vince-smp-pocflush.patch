@@ -1,0 +1,31 @@
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 1a3d142..b65ae89 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -957,15 +957,18 @@ cpu_start(int cpu)
+ 		flush_dcache((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t), FALSE);
+ #if defined(VINCE)
+ 		/*
+-		 * PSCI starts the CPU with its MMU and caches off: what reset_vector/start_cpu read before the MMU is on.
+-		 * All of CpuDataEntries: entries are filled in registration order (cpu_number), not by this logical cpu
+-		 * id, and the CPUs register in parallel; the reset vector scans the whole array.
++		 * PSCI starts the CPU with its MMU and caches off, so what reset_vector/start_cpu read before the MMU is
++		 * on must be in DRAM. flush_dcache() above is a no-op here (__ARM_COHERENT_CACHE__: Apple cores reset
++		 * coherent); FlushPoC_DcacheRegion is a real DC CIVAC loop. Measured: without it the new CPU read a zero
++		 * cpu_reset_handler and empty CpuDataEntries that the shim (coherent, on CPU1) saw filled in.
++		 * The reset vector scans the whole CpuDataEntries array.
+ 		 */
+-		flush_dcache((vm_offset_t)&CpuDataEntries[0], sizeof(CpuDataEntries), FALSE);
+-		flush_dcache((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData), FALSE);
+-		flush_dcache((vm_offset_t)&const_boot_args, sizeof(const_boot_args), FALSE);
+-		flush_dcache((vm_offset_t)&sysreg_restore, sizeof(sysreg_restore), FALSE);
+-		flush_dcache((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep), FALSE);
++		FlushPoC_DcacheRegion((vm_offset_t)&CpuDataEntries[0], sizeof(CpuDataEntries));
++		FlushPoC_DcacheRegion((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t));
++		FlushPoC_DcacheRegion((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData));
++		FlushPoC_DcacheRegion((vm_offset_t)&const_boot_args, sizeof(const_boot_args));
++		FlushPoC_DcacheRegion((vm_offset_t)&sysreg_restore, sizeof(sysreg_restore));
++		FlushPoC_DcacheRegion((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
+ #endif
+ #if defined(KERNEL_INTEGRITY_CTRR)
+ 
