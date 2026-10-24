@@ -1,0 +1,95 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 5c0bb9d..8a45fdd 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -118,6 +118,19 @@
+ 	str		x11, [x9]
+ 	dsb		sy
+ .endmacro
++
++/* MMU off only: register to PA 0x913F0C00 + 0x40 * core + 8 * idx. Clobbers x9, x10. */
++.macro VINCE_SMP_DIAG idx, reg
++	mrs		x9, MPIDR_EL1
++	and		x10, x9, #0xff
++	ubfx	x9, x9, #8, #8
++	add		x10, x10, x9, lsl #2
++	movz	x9, #(0x0c00 + 8 * \idx)
++	movk	x9, #0x913f, lsl #16
++	add		x9, x9, x10, lsl #6
++	str		\reg, [x9]
++	dsb		sy
++.endmacro
+ #endif
+ 
+ 	.globl EXT(LowResetVectorBase)
+@@ -174,6 +187,11 @@ LEXT(reset_vector)
+ #endif
+ 	ldr		x1, [x19, CPU_DATA_ENTRIES]			// Load start of data entries
+ 	add		x3, x1, MAX_CPUS * 16				// end addr of data entries = start + (16 * MAX_CPUS)
++#if defined(VINCE)
++	VINCE_SMP_DIAG 0, x15
++	VINCE_SMP_DIAG 1, x1
++	VINCE_SMP_DIAG 2, x19
++#endif
+ Lcheck_cpu_data_entry:
+ 	ldr		x21, [x1, CPU_DATA_PADDR]			// Load physical CPU data address
+ 	cbz		x21, Lnext_cpu_data_entry
+@@ -183,7 +201,11 @@ Lcheck_cpu_data_entry:
+ Lnext_cpu_data_entry:
+ 	add		x1, x1, #16					// Increment to the next cpu data entry
+ 	cmp		x1, x3
++#if defined(VINCE)
++	b.eq	Lvince_not_found
++#else
+ 	b.eq	Lskip_cpu_reset_handler				// Not found
++#endif
+ 	b		Lcheck_cpu_data_entry	// loop
+ Lfound_cpu_data_entry:
+ #if defined(VINCE)
+@@ -192,6 +214,12 @@ Lfound_cpu_data_entry:
+ 	adrp	x20, EXT(const_boot_args)@page
+ 	add		x20, x20, EXT(const_boot_args)@pageoff
+ 	ldr		x0, [x21, CPU_RESET_HANDLER]		// Call CPU reset handler
++#if defined(VINCE)
++	VINCE_SMP_DIAG 3, x21
++	VINCE_SMP_DIAG 4, x0
++	ldr		w2, [x21, CPU_PHYS_ID]
++	VINCE_SMP_DIAG 5, x2
++#endif
+ 	cbz		x0, Lskip_cpu_reset_handler
+ 
+ 	// Validate that our handler is one of the two expected handlers
+@@ -201,6 +229,9 @@ Lfound_cpu_data_entry:
+ 	beq		1f
+ 	adrp	x2, EXT(start_cpu)@page
+ 	add		x2, x2, EXT(start_cpu)@pageoff
++#if defined(VINCE)
++	VINCE_SMP_DIAG 6, x2
++#endif
+ 	cmp		x0, x2
+ 	bne		Lskip_cpu_reset_handler
+ 1:
+@@ -222,6 +253,23 @@ Lfound_cpu_data_entry:
+ Lskip_cpu_reset_handler:
+ #if defined(VINCE)
+ 	VINCE_SMP_MARK 0x1f
++	b		.
++Lvince_not_found:
++	/* dump the first four entries' cpu_data_paddr and the phys id behind each */
++	ldr		x1, [x19, CPU_DATA_ENTRIES]
++	ldr		x2, [x1]
++	VINCE_SMP_DIAG 3, x2
++	ldr		x2, [x1, #16]
++	VINCE_SMP_DIAG 4, x2
++	ldr		x2, [x1, #32]
++	VINCE_SMP_DIAG 5, x2
++	ldr		x2, [x1, #48]
++	VINCE_SMP_DIAG 6, x2
++	cbz		x2, 1f
++	ldr		w2, [x2, CPU_PHYS_ID]
++	VINCE_SMP_DIAG 7, x2
++1:
++	VINCE_SMP_MARK 0x1e
+ #endif
+ 	b		.									// Hang if the handler is NULL or returns
+ 
