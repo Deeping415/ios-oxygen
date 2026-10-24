@@ -16,77 +16,81 @@ index a3fb21e..8bec50e 100644
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
 diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
-index 2a51698..ab27dea 100644
+index 2a51698..a74a8d8 100644
 --- a/bsd/dev/mem.c
 +++ b/bsd/dev/mem.c
-@@ -124,6 +124,44 @@ mmwrite(dev_t dev, struct uio *uio)
+@@ -124,35 +124,6 @@ mmwrite(dev_t dev, struct uio *uio)
  	return mmrw(dev, uio, UIO_WRITE);
  }
  
-+#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
-+/*
-+ * SWEET: daemons started by launchd write stdout/stderr to /dev/null, and
-+ * pointing a launchd job at /dev/console stops it from launching at all
-+ * (backboardd, v8 image). Instead, what the processes named in boot-arg
-+ * sweetnull (comma separated, default "backboardd,SpringBoard") write to
-+ * /dev/null goes to the console (and so to the persistent log) as
-+ * "|name| text". sweetnull=- turns it off.
-+ */
-+static char sweet_null_names[128];
-+static int sweet_null_parsed;
-+
-+static bool
-+sweet_null_tee(char *name, size_t len)
-+{
-+	if (!sweet_null_parsed) {
-+		if (!PE_parse_boot_argn("sweetnull", sweet_null_names, sizeof(sweet_null_names))) {
-+			strlcpy(sweet_null_names, "backboardd,SpringBoard", sizeof(sweet_null_names));
-+		}
-+		sweet_null_parsed = 1;
-+	}
-+	proc_selfname(name, (int)len);
-+	size_t n = strlen(name);
-+	for (const char *t = sweet_null_names; *t;) {
-+		const char *end = strchr(t, ',');
-+		size_t tl = end ? (size_t)(end - t) : strlen(t);
-+		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
-+			return true;
-+		}
-+		if (!end) {
-+			break;
-+		}
-+		t = end + 1;
-+	}
-+	return false;
-+}
-+#endif
-+
- int
- mmioctl(dev_t dev, u_long cmd, __unused caddr_t data,
-     __unused int flag, __unused struct proc *p)
-@@ -187,6 +225,22 @@ sweet_null_tee(char *name, size_t len)
- 		}
- 		t = end + 1;
- 	}
-+#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
-+			{
-+				char name[32];
-+				if (sweet_null_tee(name, sizeof(name))) {
-+					char buf[256];
-+					c = MIN(uio_curriovlen(uio), sizeof(buf));
-+					error = uiomove(buf, (int)c, uio);
-+					if (error) {
-+						break;
-+					}
-+					printf("|%s| %.*s%s", name, (int)c, buf,
-+					    (c > 0 && buf[c - 1] == '\n') ? "" : "\n");
-+					continue;
-+				}
-+			}
-+#endif
- 	return false;
+-int
+-mmioctl(dev_t dev, u_long cmd, __unused caddr_t data,
+-    __unused int flag, __unused struct proc *p)
+-{
+-	int minnum = minor(dev);
+-
+-	if (0 == minnum || 1 == minnum) {
+-		/* /dev/mem and /dev/kmem */
+-#if CONFIG_DEV_KMEM
+-		if (!dev_kmem_enabled) {
+-			return ENODEV;
+-		}
+-#else
+-		return ENODEV;
+-#endif
+-	}
+-
+-	switch (cmd) {
+-	case FIONBIO:
+-	case FIOASYNC:
+-		/* OK to do nothing: we always return immediately */
+-		break;
+-	default:
+-		return ENODEV;
+-	}
+-
+-	return 0;
+-}
+-
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ /*
+  * SWEET: daemons started by launchd write stdout/stderr to /dev/null, and
+@@ -191,6 +162,35 @@ sweet_null_tee(char *name, size_t len)
  }
  #endif
+ 
++int
++mmioctl(dev_t dev, u_long cmd, __unused caddr_t data,
++    __unused int flag, __unused struct proc *p)
++{
++	int minnum = minor(dev);
++
++	if (0 == minnum || 1 == minnum) {
++		/* /dev/mem and /dev/kmem */
++#if CONFIG_DEV_KMEM
++		if (!dev_kmem_enabled) {
++			return ENODEV;
++		}
++#else
++		return ENODEV;
++#endif
++	}
++
++	switch (cmd) {
++	case FIONBIO:
++	case FIOASYNC:
++		/* OK to do nothing: we always return immediately */
++		break;
++	default:
++		return ENODEV;
++	}
++
++	return 0;
++}
++
+ int
+ mmrw(dev_t dev, struct uio *uio, enum uio_rw rw)
+ {
 diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
 new file mode 100644
 index 0000000..a148608
@@ -3216,7 +3220,7 @@ index 0666a52..73afcef 100644
 +}
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
-index 5b8e184..422873e 100644
+index 5b8e184..f07a79d 100644
 --- a/bsd/kern/syscalls.master
 +++ b/bsd/kern/syscalls.master
 @@ -650,7 +650,7 @@
@@ -3224,7 +3228,7 @@ index 5b8e184..422873e 100644
  433	AUE_NULL	ALL	{ int pid_suspend(int pid); }
  434	AUE_NULL	ALL	{ int pid_resume(int pid); }
 -#if CONFIG_EMBEDDED
-+#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_SWEET)
++#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
  435	AUE_NULL	ALL	{ int pid_hibernate(int pid); }
  #else
  435     AUE_NULL        ALL     { int nosys(void); }
@@ -3307,7 +3311,7 @@ index 125d3ee..4cfbbad 100644
  		if (vfsp->vfc_mountroot) {
  			error = (*vfsp->vfc_mountroot)(mp, rootvp, ctx);
 diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
-index 5f5bdd6..adb881d 100644
+index 5f5bdd6..043019a 100644
 --- a/bsd/vm/vm_unix.c
 +++ b/bsd/vm/vm_unix.c
 @@ -1755,7 +1755,12 @@ out:
@@ -3329,7 +3333,7 @@ index 5f5bdd6..adb881d 100644
  	return error;
  }
 -#endif /* !XNU_TARGET_OS_OSX */
-+#endif /* !XNU_TARGET_OS_OSX || SWEET */
++#endif /* !XNU_TARGET_OS_OSX || SWEET || VINCE */
  
  #if SOCKETS
  int
