@@ -1,0 +1,70 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..abd7704 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -6482,6 +6482,12 @@ void
+ idle_thread(__assert_only void* parameter,
+     __unused wait_result_t result)
+ {
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	{
++		extern void vince_smp_mark(uint64_t code);
++		vince_smp_mark(0x46);
++	}
++#endif
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+ 	assert(parameter == NULL);
+ 
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index bec97fb..b7a8fb4 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -176,6 +176,12 @@ extern void vnguard_policy_init(void);
+ #include <i386/pmCPU.h>
+ static void             kernel_bootstrap_thread(void);
+ 
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++extern void vince_smp_mark(uint64_t code);
++#define VINCE_SMP_MARK(c) vince_smp_mark(c)
++#else
++#define VINCE_SMP_MARK(c) do { } while (0)
++#endif
+ static void             load_context(
+ 	thread_t        thread);
+ 
+@@ -829,6 +835,7 @@ slave_main(void *machine_param)
+ 	processor_t             processor = current_processor();
+ 	thread_t                thread;
+ 
++	VINCE_SMP_MARK(0x40);
+ 	/*
+ 	 *	Use the idle processor thread if there
+ 	 *	is no dedicated start up thread.
+@@ -866,7 +873,9 @@ processor_start_thread(void *machine_param,
+ 	processor_t             processor = current_processor();
+ 	thread_t                self = current_thread();
+ 
++	VINCE_SMP_MARK(0x44);
+ 	slave_machine_init(machine_param);
++	VINCE_SMP_MARK(0x45);
+ 
+ 	/*
+ 	 *	If running the idle processor thread,
+@@ -938,7 +947,9 @@ load_context(
+ 	processor->starting_pri = thread->sched_pri;
+ 	processor->deadline = UINT64_MAX;
+ 	thread->last_processor = processor;
++	VINCE_SMP_MARK(0x41);
+ 	processor_up(processor);
++	VINCE_SMP_MARK(0x42);
+ 	struct recount_snap snap = { 0 };
+ 	recount_snapshot(&snap);
+ 	processor->last_dispatch = snap.rsn_time_mach;
+@@ -946,6 +957,7 @@ load_context(
+ 	recount_update_snap(&snap);
+ 
+ 	cpu_quiescent_counter_join(processor->last_dispatch);
++	VINCE_SMP_MARK(0x43);
+ 
+ 	PMAP_ACTIVATE_USER(thread, processor->cpu_id);
+ 
