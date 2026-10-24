@@ -1,0 +1,112 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9423edf..873021b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/vince_mmc.c			standard
+ bsd/dev/vince_input.c			standard
++bsd/dev/vince_ctl.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/vince_ctl.c b/bsd/dev/vince_ctl.c
+new file mode 100644
+index 0000000..0e6d4cd
+--- /dev/null
++++ b/bsd/dev/vince_ctl.c
+@@ -0,0 +1,73 @@
++/*
++ * VINCE: clean halt requested from the shim's USB monitor (it runs on CPU1 for the whole session).
++ *
++ * The iOS root is a non-journaled HFS+ mounted read-write; every test boot used to end with a hard reset
++ * (shim `qf`), which left it dirty and, twice, corrupt. This thread watches one word in the shim-visible page
++ * at PA 0x913F0000 (outside XNU's RAM; the SMP marks live in the same page) and on 'HALT' runs
++ * reboot_kernel(RB_HALT): sync, process shutdown, root unmount (marks HFS clean), buffer drain, then halt.
++ * tools/vince_halt.py writes the word with the shim's `w`, waits for "syncing disks... done" in the console,
++ * then reboots with `qf`.
++ */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/reboot.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void vince_ctl_start(void);
++
++#define CTL_PAGE_PA     0x913F0000u
++#define CTL_WORD        0xff8u
++#define CTL_HALT        0x48414c54u     /* 'HALT', written by the shim */
++#define CTL_SEEN        0x5345454eu     /* 'SEEN', written back here */
++
++static int ctl_chan;
++static char ctl_msg[] = "vince: halt requested by the shim";
++
++static void
++ctl_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	vm_offset_t page = ml_io_map(CTL_PAGE_PA, 0x1000);
++	if (!page) {
++		printf("VINCE CTL: mapping failed\n");
++		return;
++	}
++	volatile uint32_t *word = (volatile uint32_t *)(page + CTL_WORD);
++	*word = 0;
++	printf("VINCE CTL: waiting for a halt request at PA %#x\n", CTL_PAGE_PA + CTL_WORD);
++	for (;;) {
++		if (*word == CTL_HALT) {
++			*word = CTL_SEEN;
++			printf("VINCE CTL: halt requested by the shim\n");
++			reboot_kernel(RB_HALT, ctl_msg);
++		}
++		uint64_t deadline;
++		clock_interval_to_deadline(250, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&ctl_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++void
++vince_ctl_start(void)
++{
++	static bool started;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	if (kernel_thread_start(ctl_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("VINCE CTL: thread not started\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
+diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
+index 0e6c53c..3c0f596 100644
+--- a/bsd/dev/vince_mmc.c
++++ b/bsd/dev/vince_mmc.c
+@@ -41,6 +41,8 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern void sweet_sample_start(void);
+ /* bsd/dev/vince_input.c: keys and touch threads for SweetHID */
+ extern void vince_input_start(void);
++/* bsd/dev/vince_ctl.c: clean halt when the shim asks (tools/vince_halt.py) */
++extern void vince_ctl_start(void);
+ 
+ #define SDCC1_PHYS      0x07824000ul    /* MCI core; the SDHCI registers start at +0x900 */
+ #define GCC_SDCC1_PHYS  0x01842000ul    /* SDCC1 BCR, then the apps RCG at +4 */
+@@ -894,6 +896,7 @@ vince_mmc_init(void)
+ 	    want, vm.first, vm.nsect * SECTOR >> 20, fs, vm.rw ? "read-write" : "read-only");
+ 	sweet_sample_start();
+ 	vince_input_start();
++	vince_ctl_start();
+ 	return 0;
+ }
+ 

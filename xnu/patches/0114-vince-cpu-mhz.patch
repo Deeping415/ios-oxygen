@@ -1,0 +1,55 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index b985d94..7e8cd48 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -50,6 +50,29 @@ vince_psci(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
+ 	return (int64_t)x0;
+ }
+ 
++/*
++ * This CPU's clock in MHz: PMCCNTR_EL0 against CNTVCT over about 10 ms (busy, interrupts as they are). LK leaves
++ * the A53 clusters at whatever it booted them with; there is no cpufreq here.
++ */
++static uint32_t
++vince_cpu_mhz(void)
++{
++	uint64_t pmcr = __builtin_arm_rsr64("PMCR_EL0");
++	__builtin_arm_wsr64("PMCR_EL0", (pmcr | 1) & ~(1ULL << 3));      /* enable, count every cycle (D = 0) */
++	__builtin_arm_wsr64("PMCNTENSET_EL0", 1ULL << 31);
++	__builtin_arm_isb(ISB_SY);
++	uint64_t f = __builtin_arm_rsr64("CNTFRQ_EL0");
++	uint64_t t0 = __builtin_arm_rsr64("CNTVCT_EL0"), c0 = __builtin_arm_rsr64("PMCCNTR_EL0");
++	uint64_t t1, c1;
++	do {
++		__builtin_arm_isb(ISB_SY);
++		t1 = __builtin_arm_rsr64("CNTVCT_EL0");
++	} while (t1 - t0 < f / 100);
++	c1 = __builtin_arm_rsr64("PMCCNTR_EL0");
++	return f ? (uint32_t)((c1 - c0) * f / (t1 - t0) / 1000000) : 0;
++}
++
++static uint32_t gVinceMHz[8];
+ static uint32_t gVinceBootRegistered;   /* the boot CPU finished processor_start */
+ static uint32_t gVinceStarted;
+ static uint32_t gVinceStartBusy;        /* one secondary at a time through register + start + wait */
+@@ -226,7 +249,9 @@ SweetCPU::finishStart(const ml_topology_info_t *topology)
+ 	cpusRunning();
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+-	IOLog("SWEET CPU: %u CPUs, initialization complete\n", topology->num_cpus);
++	IOLog("SWEET CPU: %u CPUs, initialization complete; MHz %u %u %u %u %u %u %u %u\n", topology->num_cpus,
++	    gVinceMHz[0], gVinceMHz[1], gVinceMHz[2], gVinceMHz[3], gVinceMHz[4], gVinceMHz[5], gVinceMHz[6],
++	    gVinceMHz[7]);
+ }
+ #endif
+ 
+@@ -246,6 +271,9 @@ SweetCPU::initCPU(bool boot)
+ 	assert(cpu_number() == (int)getCPUNumber());
+ #if defined(VINCE)
+ 	vince_smp_mark(0x31);
++	if (getCPUNumber() < 8) {
++		gVinceMHz[getCPUNumber()] = vince_cpu_mhz();
++	}
+ 	if (!fBoot) {
+ 		/* banked per CPU: SGI/PPI group 1, priority 0xA0, the timer PPI and SGI enables; then the CPU interface */
+ 		*(volatile uint32_t *)(vince_gicd_base + 0x080) = 0xFFFFFFFF;
