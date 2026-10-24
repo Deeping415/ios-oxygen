@@ -1,0 +1,114 @@
+diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
+index 0300091..0e6c53c 100644
+--- a/bsd/dev/vince_mmc.c
++++ b/bsd/dev/vince_mmc.c
+@@ -187,11 +187,12 @@ mmc_poll(volatile uint32_t *reg, uint32_t mask, uint32_t want, uint32_t ms)
+ {
+ 	uint64_t end = deadline_ms(ms);
+ 	for (;;) {
++		bool late = mach_absolute_time() > end;        /* before the read: see wait_int() */
+ 		uint32_t v = *reg;
+ 		if ((v & mask) == want) {
+ 			return 0;
+ 		}
+-		if (mach_absolute_time() > end) {
++		if (late) {
+ 			vm.err = v;
+ 			return ETIMEDOUT;
+ 		}
+@@ -206,6 +207,12 @@ wait_int(uint32_t mask, uint32_t ms)
+ {
+ 	uint64_t end = deadline_ms(ms);
+ 	for (;;) {
++		/*
++		 * The deadline is taken before the status read, so the last read always happens after it: with one CPU
++		 * saturated, the thread paging in for a low-priority daemon can be preempted for more than a second
++		 * between the two, and must not then call a transfer that finished meanwhile a timeout.
++		 */
++		bool late = mach_absolute_time() > end;
+ 		uint32_t s = hc_rd(INTSTS);
+ 		if (s & INT_ERR) {
+ 			vm.err = s;
+@@ -215,7 +222,7 @@ wait_int(uint32_t mask, uint32_t ms)
+ 			hc_wr(INTSTS, s & mask);
+ 			return 0;
+ 		}
+-		if (mach_absolute_time() > end) {
++		if (late) {
+ 			vm.err = s | 0x8000u;           /* bit 15 without error bits: our own timeout */
+ 			return ETIMEDOUT;
+ 		}
+@@ -378,9 +385,63 @@ fail:
+ #undef STEP
+ }
+ 
+-/* n (1..MAX_SECTORS) sectors at lba into the bounce buffer */
++/*
++ * After recover(): bring the card back to the transfer state. A data command that failed half way leaves it in
++ * data (5) or receive (6), where it ignores CMD17/18/24/25 until a CMD12; programming (7) ends by itself.
++ */
++static int
++mmc_resync(void)
++{
++	uint64_t end = deadline_ms(500);
++	int st = -1;
++	for (int i = 0;; i++) {
++		bool late = mach_absolute_time() > end;
++		st = mmc_state();
++		if (st == 4) {
++			return 0;
++		}
++		if ((st == 5 || st == 6 || st < 0) && i < 3) {
++			if (mmc_cmd(12, 0, F_R1B, 0, 0)) {
++				recover();
++			}
++		}
++		if (late) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("VINCE MMC: card stuck in state %d after an error\n", st);
++	return EIO;
++}
++
++/* n (1..MAX_SECTORS) sectors at lba into the bounce buffer; one retry after resyncing the card */
++static int mmc_read_once(uint64_t lba, uint32_t n);
++static int mmc_write_once(uint64_t rel, uint32_t n);
++
+ static int
+ mmc_read_sectors(uint64_t lba, uint32_t n)
++{
++	int error = mmc_read_once(lba, n);
++	if (error && error != EINVAL && !mmc_resync()) {
++		error = mmc_read_once(lba, n);
++		printf("VINCE MMC: read retry at 0x%llx %s\n", lba, error ? "failed" : "ok");
++	}
++	return error;
++}
++
++static int
++mmc_write_sectors(uint64_t rel, uint32_t n)
++{
++	int error = mmc_write_once(rel, n);
++	if (error && vm.rw && !mmc_resync()) {
++		error = mmc_write_once(rel, n);
++		printf("VINCE MMC: write retry at partition sector 0x%llx %s\n", rel, error ? "failed" : "ok");
++	}
++	return error;
++}
++
++static int
++mmc_read_once(uint64_t lba, uint32_t n)
+ {
+ 	if (lba > UINT32_MAX || n == 0 || n > MAX_SECTORS) {
+ 		return EINVAL;
+@@ -413,7 +474,7 @@ mmc_read_sectors(uint64_t lba, uint32_t n)
+  * on the absolute LBA that goes to the card, whatever the caller computed.
+  */
+ static int
+-mmc_write_sectors(uint64_t rel, uint32_t n)
++mmc_write_once(uint64_t rel, uint32_t n)
+ {
+ 	uint64_t lba = vm.first + rel;
+ 	if (!vm.rw || n == 0 || n > MAX_SECTORS || rel >= vm.nsect || n > vm.nsect - rel ||
