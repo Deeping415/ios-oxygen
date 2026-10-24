@@ -1,0 +1,510 @@
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index 1e4b8b1..fc1bd04 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -364,19 +364,17 @@ vw_log_bss(void)
+ 	printf("VINCE WLAN: dxe rx_l %u rx_h %u bad_bd %u errors %u\n", st.frames_l, st.frames_h, st.bad_bd, st.errors);
+ }
+ 
+-/* X2: DXE up, self station, active scan of channels 1..13 (120 ms each, two probe requests at the start) */
++/* DXE rings, a fresh station address (shim wlan.c: a new one per Pronto start) and the firmware's self station */
+ static int
+-vw_scan_all(void)
++vw_prepare(struct vd_tx_ctx *ctx)
+ {
+-	struct vd_tx_ctx ctx;
+-	uint8_t self[3], pr[64];
+-	uint32_t prlen;
++	uint8_t self[3];
+ 	uint64_t c;
+-	int r, probes = 2;
++	int r;
+ 
+ 	__asm__ volatile ("mrs %0, cntvct_el0" : "=r"(c));
+-	vw_mac[5] = (uint8_t)(c ^ c >> 8 ^ c >> 16);    /* a new station address per Pronto start (shim wlan.c) */
+-
++	vw_mac[5] = (uint8_t)(c ^ c >> 8 ^ c >> 16);
++	vw_have_self = false;
+ 	r = vd_init();
+ 	printf("VINCE WLAN: dxe init %d\n", r);
+ 	if (r) {
+@@ -389,11 +387,29 @@ vw_scan_all(void)
+ 	}
+ 	printf("VINCE WLAN: self %02x:%02x:%02x:%02x:%02x:%02x sta %u dpu %u/%u\n", vw_mac[0], vw_mac[1], vw_mac[2],
+ 	    vw_mac[3], vw_mac[4], vw_mac[5], self[0], self[1], self[2]);
+-	ctx.sta_index = self[0];
+-	ctx.dpu_desc_idx = self[1];
+-	ctx.dpu_sign = self[2];
+-	ctx.band_5ghz = 0;
+-	ctx.no_encrypt = 1;
++	if (ctx) {
++		ctx->sta_index = self[0];
++		ctx->dpu_desc_idx = self[1];
++		ctx->dpu_sign = self[2];
++		ctx->band_5ghz = 0;
++		ctx->no_encrypt = 1;
++	}
++	return 0;
++}
++
++/* X2: DXE up, self station, active scan of channels 1..13 (120 ms each, two probe requests at the start) */
++static int
++vw_scan_all(void)
++{
++	struct vd_tx_ctx ctx;
++	uint8_t pr[64];
++	uint32_t prlen;
++	int r, probes = 2;
++
++	r = vw_prepare(&ctx);
++	if (r) {
++		return r;
++	}
+ 	prlen = vw_probe_req(pr, vw_mac);
+ 	vd_bss_clear();
+ 	r = vw_scan_init();
+@@ -534,6 +550,159 @@ leave:
+ 	printf("VINCE WLAN: X3 done\n");
+ }
+ 
++
++/* ---- firmware crash detection and Pronto restart (shim mailbox, see shim monitor.c) ---- */
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define MBX_PA          0x47440000u
++#define MBX_MAGIC       0x584d4257u
++#define CRASH_ITEM      422u            /* SMEM_SSR_REASON_WCNSS0 */
++
++struct vw_mbx {
++	volatile uint32_t magic, req, done, result, beat, restarts;
++};
++static volatile struct vw_mbx *vw_mbx;
++static uint8_t vw_crash0[16];
++static bool vw_crash0_ok;
++
++static void
++vw_crash_baseline(void)
++{
++	uint32_t sz = 0;
++	vm_offset_t a = vince_smd_item(CRASH_ITEM, &sz);
++
++	vw_crash0_ok = false;
++	if (a && sz >= sizeof(vw_crash0)) {
++		for (unsigned i = 0; i < sizeof(vw_crash0); i++) {
++			vw_crash0[i] = ((volatile uint8_t *)a)[i];
++		}
++		vw_crash0_ok = true;
++	}
++}
++
++/* the firmware's ERR_FATAL handler overwrites the "SSR Init" text with the failing file, line and reason */
++bool
++vw_fw_crashed(void)
++{
++	uint32_t sz = 0;
++	vm_offset_t a;
++
++	if (!vw_crash0_ok) {
++		return false;
++	}
++	a = vince_smd_item(CRASH_ITEM, &sz);
++	if (!a || sz < sizeof(vw_crash0)) {
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(vw_crash0); i++) {
++		if (((volatile uint8_t *)a)[i] != vw_crash0[i]) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++vw_crash_log(void)
++{
++	uint32_t sz = 0;
++	vm_offset_t a = vince_smd_item(CRASH_ITEM, &sz);
++	char t[81];
++
++	if (!a) {
++		return;
++	}
++	for (unsigned i = 0; i < 80 && i < sz; i++) {
++		uint8_t b = ((volatile uint8_t *)a)[i];
++
++		t[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
++		t[i + 1] = 0;
++	}
++	printf("VINCE WLAN: firmware crash reason: \"%s\"\n", t);
++}
++
++/* ask the shim (CPU1 monitor) to restart Pronto; 0 when the firmware is back up with the WCNSS_CTRL handshake done */
++static int
++vw_restart_pronto(void)
++{
++	uint32_t b0, req;
++	uint64_t t0;
++
++	if (!vw_mbx) {
++		vw_mbx = (volatile struct vw_mbx *)ml_io_map(MBX_PA, 0x1000);
++	}
++	if (!vw_mbx || vw_mbx->magic != MBX_MAGIC) {
++		printf("VINCE WLAN: the shim has no restart service\n");
++		return -1;
++	}
++	b0 = vw_mbx->beat;
++	vince_smd_sleep(500);
++	if (vw_mbx->beat == b0) {
++		printf("VINCE WLAN: the shim's restart service is not running\n");
++		return -2;
++	}
++	vw_crash_log();
++	/* forget everything about the old firmware */
++	bzero(&vw_ch, sizeof(vw_ch));
++	vw_have_self = false;
++	vd_reset();
++	va_reset();
++	vwpa_stop();
++	vn_link_reset();
++	req = vw_mbx->done + 1;
++	vw_mbx->req = req;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	t0 = vd_now_us();
++	while (vw_mbx->done != req) {
++		if (vd_now_us() - t0 > 180000000ULL) {
++			printf("VINCE WLAN: the shim did not finish the restart\n");
++			return -3;
++		}
++		vince_smd_sleep(100);
++	}
++	printf("VINCE WLAN: the shim restarted Pronto, result %u, restarts so far %u\n", vw_mbx->result, vw_mbx->restarts);
++	return vw_mbx->result ? -4 : 0;
++}
++
++/* open WLAN_CTRL, SMSM bit, HAL start and feature exchange; 0 when the HAL is up */
++static int
++vw_bringup(int stage)
++{
++	int r = -1;
++
++	/* the channel list is complete once the shim has done the WCNSS_CTRL handshake; give it a minute anyway */
++	for (int i = 0; i < 240 && !vince_smd_find("WLAN_CTRL", &vw_ch); i++) {
++		vince_smd_sleep(250);
++	}
++	if (!vince_smd_find("WLAN_CTRL", &vw_ch)) {
++		printf("VINCE WLAN: no WLAN_CTRL channel (Pronto not started by the shim?)\n");
++		return -1;
++	}
++	for (int i = 0; i < 10 && (r = vw_open()) != 0; i++) {
++		vince_smd_sleep(500);
++	}
++	if (r) {
++		printf("VINCE WLAN: WLAN_CTRL open failed %d\n", r);
++		return r;
++	}
++	printf("VINCE WLAN: WLAN_CTRL open\n");
++	if (stage >= 2) {
++		if (!vd_map()) {
++			printf("VINCE WLAN: DXE mapping failed\n");
++			return -2;
++		}
++		/* mainline sets the tx-rings-empty SMSM bit before it starts the chip */
++		printf("VINCE WLAN: SMSM tx-rings-empty %d\n", vd_smsm_rings_empty());
++	}
++	if (vw_start() || vw_caps()) {
++		return -3;
++	}
++	vw_crash_baseline();
++	printf("VINCE WLAN: X1 done, HAL is up\n");
++	return 0;
++}
++
+ /* ---- X5: a station that stays connected (boot-args vincessid, vincepass, vincerun, vincecycle, vincelease) ---- */
+ 
+ /* HAL requests that get no answer: the firmware stopped reading WLAN_CTRL. Only the HAL steps count (not the over-the-air ones). */
+@@ -546,16 +715,18 @@ vw_hal_dead(int step, int err)
+ }
+ 
+ static void
+-vw_station(void)
++vw_station(int stage)
+ {
+ 	static char ssid[40], pass[72];
+ 	static struct va_result ar;
+ 	static struct vwpa_result wr;
+-	static const char *const why_names[] = { "?", "time over", "AP dropped us", "keep-alive / lease failed", "forced cycle", "lease changed" };
++	static const char *const why_names[] = { "?", "time over", "AP dropped us", "keep-alive / lease failed", "forced cycle",
++		                                  "lease changed", "firmware crashed" };
+ 	uint32_t n, pl = 0;
+ 	const struct vd_bss *b = vd_bss_list(&n), *hit = NULL;
+ 	struct vd_bss ap;
+-	int run_s = 600, cycle_s = 0, lease_s = 0, attempt = 0, cycles = 0;
++	int run_s = 600, cycle_s = 0, lease_s = 0, attempt = 0, cycles = 0, restarts = 0;
++	bool need_restart = false;
+ 	uint64_t end;
+ 
+ 	if (!PE_parse_boot_argn("vincessid", ssid, sizeof(ssid)) || !PE_parse_boot_argn("vincepass", pass, sizeof(pass))) {
+@@ -585,24 +756,42 @@ vw_station(void)
+ 	vif_start_ping((uint32_t)run_s / 5, 5000);
+ 	while (vd_now_us() < end) {
+ 		const struct vn_cfg *c;
+-		int r, why;
++		int r, why = 0, lr;
+ 
++		if (need_restart) {
++			need_restart = false;
++			if (restarts >= 8) {
++				printf("VINCE WLAN: too many Pronto restarts, giving up\n");
++				break;
++			}
++			restarts++;
++			printf("VINCE WLAN: restarting Pronto (restart %d)\n", restarts);
++			vif_down();
++			r = vw_restart_pronto();
++			if (r || vw_bringup(stage) || vw_prepare(NULL)) {
++				printf("VINCE WLAN: bring-up after the restart failed (%d)\n", r);
++				break;
++			}
++			attempt = 0;
++		}
+ 		va_use_rsn(1);
+ 		r = va_connect(&ap, &ar);
+ 		va_use_rsn(0);
+ 		vw_log_assoc(&ar);
+ 		if (r) {
+-			if (vw_hal_dead(ar.step, ar.err)) {
+-				printf("VINCE WLAN: the firmware stopped answering HAL requests (step %d): Wi-Fi needs a Pronto restart\n", ar.step);
+-				break;
++			if (vw_hal_dead(ar.step, ar.err) || vw_fw_crashed()) {
++				printf("VINCE WLAN: the firmware stopped answering (association step %d)\n", ar.step);
++				need_restart = true;
++				continue;
+ 			}
+ 		} else {
+ 			r = vwpa_handshake(&ap, pass, pl, &wr);
+ 			printf("VINCE WLAN: handshake %s at step %d (%s) err %d, gtk id %u\n", r ? "FAILED" : "done", wr.step,
+ 			    vwpa_step_name(wr.step), wr.err, wr.gtk_id);
+-			if (r && vw_hal_dead(wr.step, wr.err)) {
+-				printf("VINCE WLAN: the firmware stopped answering HAL requests: Wi-Fi needs a Pronto restart\n");
+-				break;
++			if (r && (vw_hal_dead(wr.step, wr.err) || vw_fw_crashed())) {
++				printf("VINCE WLAN: the firmware stopped answering (handshake)\n");
++				need_restart = true;
++				continue;
+ 			}
+ 			if (!r) {
+ 				r = vn_dhcp();
+@@ -615,8 +804,12 @@ vw_station(void)
+ 			uint32_t backoff = 2u << (attempt < 4 ? attempt : 4);
+ 
+ 			vwpa_stop();
+-			(void)va_leave(&ap, 1);
++			lr = va_leave(&ap, 1);
+ 			vn_link_reset();
++			if (lr <= -2 && lr >= -5) {
++				need_restart = true;
++				continue;
++			}
+ 			printf("VINCE WLAN: reconnect attempt %d failed, waiting %u s\n", attempt + 1, backoff);
+ 			attempt++;
+ 			vince_smd_sleep(backoff * 1000);
+@@ -642,11 +835,16 @@ vw_station(void)
+ 			}
+ 			(void)vif_up(vif_current_cfg());
+ 		}
+-		printf("VINCE WLAN: serve ended: %s\n", why >= 1 && why <= 5 ? why_names[why] : why_names[0]);
++		printf("VINCE WLAN: serve ended: %s\n", why >= 1 && why <= 6 ? why_names[why] : why_names[0]);
+ 		vif_down();
+ 		vwpa_stop();
+-		printf("VINCE WLAN: leave %d\n", va_leave(&ap, 1));
++		lr = va_leave(&ap, 1);
++		printf("VINCE WLAN: leave %d\n", lr);
+ 		vn_link_reset();
++		if (why == VIF_END_FWCRASH || (lr <= -2 && lr >= -5) || vw_fw_crashed()) {
++			need_restart = true;
++			continue;
++		}
+ 		if (why == VIF_END_TIME) {
+ 			break;
+ 		}
+@@ -656,53 +854,24 @@ vw_station(void)
+ 	bzero(pass, sizeof(pass));
+ 	vif_stop_ping();
+ 	vince_smd_sleep(6000);
+-	printf("VINCE WLAN: station done after %d reconnect cycles\n", cycles);
++	printf("VINCE WLAN: station done after %d reconnect cycles, %d Pronto restarts\n", cycles, restarts);
+ }
+ 
+ static void
+ vw_thread(void *arg, wait_result_t w)
+ {
+ #pragma unused(arg, w)
+-	int r = -1, stage = 0;
++	int stage = 0;
+ 
+ 	(void)PE_parse_boot_argn("vincewlan", &stage, sizeof(stage));
+-	/* the channel list is complete once the shim has done the WCNSS_CTRL handshake; give it a minute anyway */
+-	for (int i = 0; i < 240 && !vince_smd_find("WLAN_CTRL", &vw_ch); i++) {
+-		vince_smd_sleep(250);
+-	}
+-	if (!vince_smd_find("WLAN_CTRL", &vw_ch)) {
+-		printf("VINCE WLAN: no WLAN_CTRL channel (Pronto not started by the shim?)\n");
+-		goto out;
+-	}
+-	for (int i = 0; i < 10 && (r = vw_open()) != 0; i++) {
+-		vince_smd_sleep(500);
+-	}
+-	if (r) {
+-		printf("VINCE WLAN: WLAN_CTRL open failed %d\n", r);
+-		goto out;
+-	}
+-	printf("VINCE WLAN: WLAN_CTRL open\n");
+-	if (stage >= 2) {
+-		if (!vd_map()) {
+-			printf("VINCE WLAN: DXE mapping failed\n");
+-			goto out;
+-		}
+-		/* mainline sets the tx-rings-empty SMSM bit before it starts the chip */
+-		printf("VINCE WLAN: SMSM tx-rings-empty %d\n", vd_smsm_rings_empty());
+-	}
+-	if (vw_start() || vw_caps()) {
+-		goto out;
+-	}
+-	printf("VINCE WLAN: X1 done, HAL is up\n");
+-	if (stage >= 2 && vw_scan_all() == 0) {
++	if (vw_bringup(stage) == 0 && stage >= 2 && vw_scan_all() == 0) {
+ 		printf("VINCE WLAN: X2 done\n");
+ 		if (stage >= 5) {
+-			vw_station();
++			vw_station(stage);
+ 		} else if (stage >= 3) {
+ 			vw_connect_test(stage);
+ 		}
+ 	}
+-out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+diff --git a/bsd/dev/vince_wlan.h b/bsd/dev/vince_wlan.h
+index 02f9bf0..9a56011 100755
+--- a/bsd/dev/vince_wlan.h
++++ b/bsd/dev/vince_wlan.h
+@@ -55,6 +55,7 @@ bool vd_map(void);                                      /* DXE, CCU and the desc
+ int vd_smsm_rings_empty(void);                          /* apps SMSM bit 9 = 1, bit 10 = 0; 0 ok */
+ int vd_init(void);                                      /* reset, CCU select, four channels, interrupt mask; once per Pronto start */
+ bool vd_ready(void);
++void vd_reset(void);                                    /* after a Pronto restart */
+ void vd_poll(uint32_t ms);                              /* handle RX frames for ms milliseconds (sleeps 1 ms between passes) */
+ int vd_tx_mgmt(const struct vd_tx_ctx *ctx, const uint8_t *frame, uint32_t len, int bcast);
+ int vd_tx_data(const struct vd_tx_ctx *ctx, const uint8_t *frame, uint32_t len);
+@@ -67,7 +68,8 @@ void vd_get_stats(struct vd_stats *s);
+ uint64_t vd_now_us(void);
+ 
+ /* HAL client (vince_wlan.c) */
+-extern uint8_t vw_mac[6];                               /* our station address (a new one per Pronto start) */
++extern uint8_t vw_mac[6];
++bool vw_fw_crashed(void);                               /* the firmware wrote a crash reason into SMEM item 422 */                               /* our station address (a new one per Pronto start) */
+ int vw_raw(uint16_t type, const void *body, uint32_t blen, void *rsp, uint32_t max);
+ int vw_cmd(uint16_t type, const void *body, uint32_t blen, uint32_t *status);   /* 0 when the firmware says success */
+ const uint8_t *vw_self_info(void);                      /* sta index, DPU index, DPU signature of the self station; 0 before ADD_STA_SELF */
+@@ -85,6 +87,7 @@ struct va_result {
+ 	uint64_t t_assoc_resp_us, t_post_sent_us, t_done_us;
+ };
+ 
++void va_reset(void);                                    /* after a Pronto restart */
+ int va_data_ctx(struct vd_tx_ctx *ctx);                 /* TX context for data frames of the association; 0 if not connected */
+ const uint8_t *va_bssid(void);
+ const uint8_t *va_mac(void);
+@@ -148,6 +151,7 @@ void vif_stack_test(const struct vn_cfg *c);
+ #define VIF_END_DEAD    3               /* keep-alive or lease renewal failed for good */
+ #define VIF_END_CYCLE   4               /* the test asked for a forced reconnect */
+ #define VIF_END_RECFG   5               /* the lease changed: configure the interface again */
++#define VIF_END_FWCRASH 6               /* the firmware reported a fatal error (SMEM crash reason changed) */
+ int vif_up(const struct vn_cfg *c);     /* attach (once), stack mode, address + default route from the lease */
+ void vif_down(void);                    /* not running, address removed */
+ int vif_serve(uint64_t us_total, uint32_t cycle_s, uint32_t t1_override_s);
+diff --git a/bsd/dev/vince_wlan_assoc.c b/bsd/dev/vince_wlan_assoc.c
+index a53a9ef..0c5ebec 100644
+--- a/bsd/dev/vince_wlan_assoc.c
++++ b/bsd/dev/vince_wlan_assoc.c
+@@ -562,6 +562,15 @@ int va_leave(const struct vd_bss *ap, int full)
+ 	return teardown_fw(ap->bssid, full);
+ }
+ 
++/* Pronto was restarted: the old association is gone with it */
++void va_reset(void)
++{
++	s_connected = 0;
++	s_encrypted = 0;
++	s_have_gtk = 0;
++	s_last.sta_index = s_last.bss_index = 0xff;
++}
++
+ /* the link is gone without a goodbye (the AP vanished): only the firmware side is cleaned up */
+ int va_drop(const struct vd_bss *ap, int full)
+ {
+diff --git a/bsd/dev/vince_wlan_dxe.c b/bsd/dev/vince_wlan_dxe.c
+index 2a81dab..3c376d9 100755
+--- a/bsd/dev/vince_wlan_dxe.c
++++ b/bsd/dev/vince_wlan_dxe.c
+@@ -745,6 +745,17 @@ vd_bss_clear(void)
+ 	s_nbss = 0;
+ }
+ 
++/* Pronto was restarted: the next vd_init() rebuilds the rings (it zeroes the window and reprograms the channels) */
++void
++vd_reset(void)
++{
++	s_ready = false;
++	s_q_head = s_q_tail = 0;
++	s_nbss = 0;
++	s_filter_on = false;
++	s_stats.first_data_us = 0;
++}
++
+ void
+ vd_get_stats(struct vd_stats *s)
+ {
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index 5b45916..b0c97c4 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -56,6 +56,7 @@ static uint32_t vif_txh, vif_txn;
+ static volatile bool vif_stalled;       /* start() left packets in the stack's queue because ours was full */
+ static struct vn_cfg vif_cfg;
+ static bool vif_have_addr;
++static uint8_t vif_mac[6];
+ static uint8_t vif_addr[4];
+ static volatile bool vif_ping_quit;
+ static uint32_t vif_ping_n, vif_ping_period_ms;
+@@ -167,6 +168,7 @@ vif_attach(const uint8_t mac[6])
+ 		return err;
+ 	}
+ 	ifnet_set_lladdr(vif_ifp, mac, ETHER_ADDR_LEN);
++	bcopy(mac, vif_mac, 6);
+ 	printf("VINCE WLAN: %s attached, %02x:%02x:%02x:%02x:%02x:%02x\n", if_name(vif_ifp), mac[0], mac[1], mac[2],
+ 	    mac[3], mac[4], mac[5]);
+ 	return 0;
+@@ -373,6 +375,9 @@ vif_serve(uint64_t us_total, uint32_t cycle_s, uint32_t t1_override_s)
+ 		if (vn_link_lost()) {
+ 			return VIF_END_LOST;
+ 		}
++		if (vw_fw_crashed()) {
++			return VIF_END_FWCRASH;
++		}
+ 		if (cycle_s && now - t0 >= (uint64_t)cycle_s * 1000000ULL) {
+ 			return VIF_END_CYCLE;
+ 		}
+@@ -597,6 +602,11 @@ vif_up(const struct vn_cfg *c)
+ 		vn_set_stack_mode(0);
+ 		return -1;
+ 	}
++	if (bcmp(vif_mac, vw_mac, 6) != 0) {
++		/* the firmware restarted: the station got a new address */
++		ifnet_set_lladdr(vif_ifp, vw_mac, ETHER_ADDR_LEN);
++		bcopy(vw_mac, vif_mac, 6);
++	}
+ 	vif_unconfig();
+ 	return vif_config(c);
+ }
