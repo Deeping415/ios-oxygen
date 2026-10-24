@@ -1,0 +1,471 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 873021b..209dae5 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/vince_mmc.c			standard
+ bsd/dev/vince_input.c			standard
+ bsd/dev/vince_ctl.c			standard
++bsd/dev/vince_smd.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
+index 3c0f596..8df3fb7 100644
+--- a/bsd/dev/vince_mmc.c
++++ b/bsd/dev/vince_mmc.c
+@@ -43,6 +43,7 @@ extern void sweet_sample_start(void);
+ extern void vince_input_start(void);
+ /* bsd/dev/vince_ctl.c: clean halt when the shim asks (tools/vince_halt.py) */
+ extern void vince_ctl_start(void);
++extern void vince_smd_start(void);
+ 
+ #define SDCC1_PHYS      0x07824000ul    /* MCI core; the SDHCI registers start at +0x900 */
+ #define GCC_SDCC1_PHYS  0x01842000ul    /* SDCC1 BCR, then the apps RCG at +4 */
+@@ -897,6 +898,7 @@ vince_mmc_init(void)
+ 	sweet_sample_start();
+ 	vince_input_start();
+ 	vince_ctl_start();
++	vince_smd_start();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+new file mode 100644
+index 0000000..4fb6bd7
+--- /dev/null
++++ b/bsd/dev/vince_smd.c
+@@ -0,0 +1,433 @@
++/*
++ * VINCE (Redmi 5 Plus, MSM8953) SMD packet channels to Pronto (WCNSS), W2 of reports/WIFI_BT_PLAN.md.
++ * A port of vince-bringup/shim/smd.c, which was proven on the phone first (WCNSS_CTRL opened, version 1.5 1.2,
++ * NV download, cold boot complete).
++ *
++ * Pronto is started by the shim before the handover (tools/mkwcnss_ramdisk.py --append puts the firmware blob
++ * behind the XNU payload; shim pas_autostart), and the shim also does the WCNSS_CTRL version request and the NV
++ * download there: the firmware gives up on a WCNSS_CTRL that nobody opens within a short time, but once that is done
++ * the other channels open whenever the OS likes (seen on the phone, 100 s later). This file finds the apps<->Pronto
++ * partition in SMEM (0x86300000), opens APPS_RIVA_BT_CMD, sends an HCI Reset and logs the answer. Polled, no
++ * interrupt.
++ *
++ * Byte-access packet channel (mainline qcom_smd.c): info item 40 bytes, tx half (ours) then rx half (20 bytes each:
++ * state u32, flags u8 fDSR fCTS fCD fRI fHEAD fTAIL fSTATE fBLOCKREADINTR, tail u32 @12, head u32 @16), FIFO item
++ * tx then rx half. A packet is a 20-byte header (length first) plus the payload. Doorbell: APCS IPC 0x0B011008
++ * bit 17.
++ *
++ * Boot-arg: vincesmd=1 turns it on (default off). Never touches 0x8E800000..0x8EE55FFF (Pronto firmware, guide H3).
++ */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void vince_smd_start(void);
++
++#define SMEM_PA         0x86300000u
++#define SMEM_SIZE       0x00100000u
++#define APCS_PA         0x0B011000u
++#define APCS_IPC        0x008u
++#define APCS_IPC_WCNSS  (1u << 17)
++
++#define PTABLE_OFF      (SMEM_SIZE - 0x1000u)
++#define PTABLE_ENTRY    48u
++#define PART_HDR        32u
++#define PRIV_ENTRY      16u
++#define PRIV_CANARY     0xa5a5u
++#define PRONTO_HOST     4u
++#define PRONTO_EDGE     6u
++
++#define I_STATE         0x00u
++#define I_FDSR          0x04u
++#define I_FCTS          0x05u
++#define I_FCD           0x06u
++#define I_FHEAD         0x08u
++#define I_FTAIL         0x09u
++#define I_FSTATE        0x0Au
++#define I_FBLOCK        0x0Bu
++#define I_TAIL          0x0Cu
++#define I_HEAD          0x10u
++#define I_HALF          20u
++
++#define ST_CLOSED       0u
++#define ST_OPENING      1u
++#define ST_OPENED       2u
++#define SMD_HDR         20u
++#define MAX_PKT         0x1000u
++
++static vm_offset_t smem, apcs;
++static bool smd_started;
++static int smd_chan;
++
++struct vsmd_ch {
++	vm_offset_t info, fifo;         /* mapped addresses */
++	uint32_t half;
++	bool open;
++};
++
++static void
++vs_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&smd_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- SMEM (offsets from the mapped base, every access bounds-checked) ---- */
++
++static uint32_t
++srd32(uint32_t off)
++{
++	if ((off & 3) || off > SMEM_SIZE - 4) {
++		return 0;
++	}
++	return *(volatile uint32_t *)(smem + off);
++}
++
++static uint8_t
++rd8(vm_offset_t a)
++{
++	return *(volatile uint8_t *)a;
++}
++
++static void
++wr8(vm_offset_t a, uint8_t v)
++{
++	*(volatile uint8_t *)a = v;
++}
++
++static uint32_t
++rd32(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static void
++wr32(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++static void
++kick(void)
++{
++	__asm__ volatile("dsb osh" ::: "memory");
++	wr32(apcs + APCS_IPC, APCS_IPC_WCNSS);
++}
++
++/* the private partition between the apps (host 0) and host: off/size, 0 if none */
++static bool
++smem_partition(uint32_t host, uint32_t *off, uint32_t *size, uint32_t *cacheline)
++{
++	if (srd32(PTABLE_OFF) != 0x434f5424u || srd32(PTABLE_OFF + 4) != 1) {   /* "$TOC", version 1 */
++		return false;
++	}
++	uint32_t n = srd32(PTABLE_OFF + 8);
++	if (n > 64) {
++		return false;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t e = PTABLE_OFF + 32 + i * PTABLE_ENTRY;
++		uint32_t o = srd32(e), s = srd32(e + 4), h = srd32(e + 12);
++		uint32_t h0 = h & 0xffff, h1 = h >> 16;
++		if (!o || !s || !((h0 == 0 && h1 == host) || (h1 == 0 && h0 == host))) {
++			continue;
++		}
++		if (o > SMEM_SIZE || s > SMEM_SIZE - o || srd32(o) != 0x54525024u ||          /* "$PRT" */
++		    srd32(o + 4) != (h1 << 16 | h0) || srd32(o + 8) != s || srd32(o + 12) > s) {
++			return false;
++		}
++		*off = o;
++		*size = s;
++		*cacheline = srd32(e + 16) ? srd32(e + 16) : 4;
++		return true;
++	}
++	return false;
++}
++
++/* item of a private partition: offset of its data, size via *sz; 0 if absent */
++static uint32_t
++part_get(uint32_t po, uint32_t ps, uint32_t cl, uint32_t item, uint32_t *sz)
++{
++	uint32_t e = po + PART_HDR, end = po + srd32(po + 12);
++
++	for (int n = 0; e < end && n < 1024; n++) {
++		uint32_t w0 = srd32(e), s = srd32(e + 4), w2 = srd32(e + 8);
++		uint32_t pad_hdr = w2 >> 16, pad_data = w2 & 0xffff;
++		if ((w0 & 0xffff) != PRIV_CANARY || s > ps || pad_data > s) {
++			return 0;
++		}
++		if ((w0 >> 16) == item) {
++			*sz = s - pad_data;
++			uint32_t d = e + PRIV_ENTRY + pad_hdr;
++			return d + s <= SMEM_SIZE ? d : 0;
++		}
++		e += PRIV_ENTRY + pad_hdr + s;
++	}
++	uint32_t hdr_al = (PRIV_ENTRY + cl - 1) / cl * cl;
++	e = po + ps - hdr_al;
++	end = po + srd32(po + 16);
++	for (int n = 0; e > end && n < 1024; n++) {
++		uint32_t w0 = srd32(e), s = srd32(e + 4), w2 = srd32(e + 8);
++		if ((w0 & 0xffff) != PRIV_CANARY || s > ps || (w2 & 0xffff) > s) {
++			return 0;
++		}
++		if ((w0 >> 16) == item) {
++			*sz = s - (w2 & 0xffff);
++			return e >= s ? e - s : 0;
++		}
++		e -= s + hdr_al;
++	}
++	return 0;
++}
++
++static const struct { uint32_t alloc, info, fifo; } vtbls[2] = { { 13, 14, 338 }, { 266, 138, 202 } };
++
++/* find the channel called name on the Pronto edge; false if Pronto has not created it (yet) */
++static bool
++vs_find(const char *name, struct vsmd_ch *c)
++{
++	uint32_t po, ps, cl;
++
++	c->open = false;
++	if (!smem_partition(PRONTO_HOST, &po, &ps, &cl)) {
++		return false;
++	}
++	for (int t = 0; t < 2; t++) {
++		uint32_t tsz = 0, tbl = part_get(po, ps, cl, vtbls[t].alloc, &tsz);
++		if (!tbl) {
++			continue;
++		}
++		for (uint32_t i = 0; i < 64 && (i + 1) * 32 <= tsz; i++) {
++			uint32_t e = tbl + i * 32;
++			char nm[21];
++			for (int j = 0; j < 20; j += 4) {
++				uint32_t w = srd32(e + j);
++				for (int b = 0; b < 4; b++) {
++					char ch = (char)(w >> (8 * b));
++					nm[j + b] = (ch >= 0x20 && ch < 0x7f) ? ch : 0;
++				}
++			}
++			nm[20] = 0;
++			uint32_t cid = srd32(e + 20), flags = srd32(e + 24), ref = srd32(e + 28);
++			if (!nm[0] || !ref || (flags & 0xff) != PRONTO_EDGE || strncmp(nm, name, 20) != 0) {
++				continue;
++			}
++			uint32_t isz = 0, fsz = 0;
++			uint32_t io = part_get(po, ps, cl, vtbls[t].info + cid, &isz);
++			uint32_t fo = part_get(po, ps, cl, vtbls[t].fifo + cid, &fsz);
++			if (!io || !fo || isz != 40 || fsz < 0x100 || (fsz & (fsz - 1)) || fo + fsz > SMEM_SIZE) {
++				return false;
++			}
++			c->info = smem + io;
++			c->fifo = smem + fo;
++			c->half = fsz / 2;
++			return true;
++		}
++	}
++	return false;
++}
++
++/* ---- the channel ---- */
++
++static void
++vs_set_state(struct vsmd_ch *c, uint32_t st)
++{
++	uint8_t open = st == ST_OPENED;
++
++	wr8(c->info + I_FDSR, open);
++	wr8(c->info + I_FCTS, open);
++	wr8(c->info + I_FCD, open);
++	wr32(c->info + I_STATE, st);
++	wr8(c->info + I_FSTATE, 1);
++	kick();
++}
++
++static bool
++vs_wait_remote(struct vsmd_ch *c, uint32_t a, uint32_t b, unsigned ms)
++{
++	for (unsigned t = 0; t <= ms; t += 5) {
++		uint32_t r = rd32(c->info + I_HALF + I_STATE);
++		if (r == a || r == b) {
++			return true;
++		}
++		vs_sleep(5);
++	}
++	return false;
++}
++
++static int
++vs_open(struct vsmd_ch *c)
++{
++	if (rd32(c->info + I_HALF + I_STATE) == ST_CLOSED) {
++		return -1;      /* the firmware has not opened its side */
++	}
++	vs_set_state(c, ST_OPENING);
++	if (!vs_wait_remote(c, ST_OPENING, ST_OPENED, 1000)) {
++		vs_set_state(c, ST_CLOSED);
++		return -2;
++	}
++	vs_set_state(c, ST_OPENED);
++	if (!vs_wait_remote(c, ST_OPENED, ST_OPENED, 1000)) {
++		vs_set_state(c, ST_CLOSED);
++		return -3;
++	}
++	wr8(c->info + I_HALF + I_FSTATE, 0);
++	wr32(c->info + I_HEAD, rd32(c->info + I_TAIL));
++	wr32(c->info + I_HALF + I_TAIL, rd32(c->info + I_HALF + I_HEAD));
++	__asm__ volatile("dsb osh" ::: "memory");
++	c->open = true;
++	return 0;
++}
++
++static int
++vs_send(struct vsmd_ch *c, const void *data, uint32_t len)
++{
++	const uint8_t *p = data;
++	uint32_t head = rd32(c->info + I_HEAD), tail = rd32(c->info + I_TAIL);
++
++	if (!c->open || !len || len > MAX_PKT || head >= c->half || tail >= c->half) {
++		return -1;
++	}
++	if ((c->half - 1) - ((head - tail) & (c->half - 1)) < SMD_HDR + len) {
++		return -2;
++	}
++	uint8_t hdr[SMD_HDR] = { (uint8_t)len, (uint8_t)(len >> 8), (uint8_t)(len >> 16), (uint8_t)(len >> 24) };
++	wr8(c->info + I_FTAIL, 0);
++	for (uint32_t i = 0; i < SMD_HDR; i++) {
++		wr8(c->fifo + head, hdr[i]);
++		head = (head + 1) & (c->half - 1);
++	}
++	for (uint32_t i = 0; i < len; i++) {
++		wr8(c->fifo + head, p[i]);
++		head = (head + 1) & (c->half - 1);
++	}
++	__asm__ volatile("dsb osh" ::: "memory");
++	wr32(c->info + I_HEAD, head);
++	wr8(c->info + I_FHEAD, 1);
++	kick();
++	return 0;
++}
++
++/* one packet if there is one within ms: its length, 0 if none, <0 on a bad header; data cut at max */
++static int
++vs_recv(struct vsmd_ch *c, void *buf, uint32_t max, unsigned ms)
++{
++	uint8_t *out = buf;
++	vm_offset_t rx = c->fifo + c->half;
++
++	for (unsigned t = 0;; t += 5) {
++		uint32_t avail = (rd32(c->info + I_HALF + I_HEAD) - rd32(c->info + I_HALF + I_TAIL)) & (c->half - 1);
++		if (avail >= SMD_HDR) {
++			uint32_t tail = rd32(c->info + I_HALF + I_TAIL), len = 0;
++			for (uint32_t i = 0; i < 4; i++) {
++				len |= (uint32_t)rd8(rx + ((tail + i) & (c->half - 1))) << (8 * i);
++			}
++			if (!len || len > MAX_PKT || SMD_HDR + len > c->half - 1) {
++				return -1;
++			}
++			if (avail >= SMD_HDR + len) {
++				tail = (tail + SMD_HDR) & (c->half - 1);
++				for (uint32_t i = 0; i < len; i++) {
++					uint8_t b = rd8(rx + tail);
++					tail = (tail + 1) & (c->half - 1);
++					if (i < max) {
++						out[i] = b;
++					}
++				}
++				__asm__ volatile("dsb osh" ::: "memory");
++				wr32(c->info + I_HALF + I_TAIL, tail);
++				wr8(c->info + I_HALF + I_FHEAD, 0);
++				wr8(c->info + I_HALF + I_FTAIL, 1);
++				if (!rd8(c->info + I_HALF + I_FBLOCK)) {
++					kick();
++				}
++				return (int)len;
++			}
++		}
++		if (t >= ms) {
++			return 0;
++		}
++		vs_sleep(5);
++	}
++}
++
++/* ---- the thread: HCI Reset on APPS_RIVA_BT_CMD ---- */
++
++static void
++smd_thread(void *arg, wait_result_t w)
++{
++#pragma unused(arg, w)
++	struct vsmd_ch c;
++	uint8_t buf[64], req[3] = { 0x03, 0x0c, 0x00 };         /* HCI_Reset, no H4 type byte (btqcomsmd.c) */
++	int r;
++
++	/* the shim has run AUTH_AND_RESET and the WCNSS_CTRL handshake already; the channel list is complete then */
++	for (int i = 0; i < 240 && !vs_find("APPS_RIVA_BT_CMD", &c); i++) {
++		vs_sleep(250);
++	}
++	if (!vs_find("APPS_RIVA_BT_CMD", &c)) {
++		printf("VINCE SMD: no APPS_RIVA_BT_CMD channel (Pronto not started by the shim?)\n");
++		goto out;
++	}
++	printf("VINCE SMD: BT_CMD info %#lx fifo %#lx half %#x remote state %u\n",
++	    (unsigned long)(c.info - smem), (unsigned long)(c.fifo - smem), c.half, rd32(c.info + I_HALF + I_STATE));
++	r = vs_open(&c);
++	if (r) {
++		printf("VINCE SMD: open BT_CMD failed %d (tx %u rx %u)\n", r, rd32(c.info + I_STATE),
++		    rd32(c.info + I_HALF + I_STATE));
++		goto out;
++	}
++	printf("VINCE SMD: BT_CMD open (tx %u rx %u)\n", rd32(c.info + I_STATE), rd32(c.info + I_HALF + I_STATE));
++	r = vs_send(&c, req, sizeof(req));
++	if (r) {
++		printf("VINCE SMD: HCI Reset not sent %d\n", r);
++		goto out;
++	}
++	r = vs_recv(&c, buf, sizeof(buf), 3000);
++	if (r == 6 && buf[0] == 0x0e && buf[3] == 0x03 && buf[4] == 0x0c) {      /* Command Complete for opcode 0x0c03 */
++		printf("VINCE SMD: HCI Reset answered, status %u\n", buf[5]);
++	} else {
++		printf("VINCE SMD: HCI answer r=%d bytes %02x %02x %02x %02x %02x %02x\n", r, buf[0], buf[1], buf[2],
++		    buf[3], buf[4], buf[5]);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++vince_smd_start(void)
++{
++	int on = 0;
++	thread_t thread;
++
++	if (smd_started) {
++		return;
++	}
++	smd_started = true;
++	(void)PE_parse_boot_argn("vincesmd", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	smem = ml_io_map(SMEM_PA, SMEM_SIZE);
++	apcs = ml_io_map(APCS_PA, 0x1000);
++	if (!smem || !apcs) {
++		printf("VINCE SMD: mapping failed\n");
++		return;
++	}
++	if (kernel_thread_start(smd_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("VINCE SMD: thread not started\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
