@@ -1,0 +1,75 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index bb124b0..b985d94 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -293,29 +293,6 @@ SweetCPU::initCPU(bool boot)
+ 			diag[3] = *(volatile uint32_t *)(vince_gicc_base + 0x000) |
+ 			    ((uint64_t)*(volatile uint32_t *)(vince_gicc_base + 0x004) << 32);
+ 		}
+-		/*
+-		 * 0110 probe, mark page word 0x1e0 + 2 * core (PA 0x913F0F00 + 16 * core):
+-		 * [0] GICC_HPPIR | GICC_RPR << 32 with SGI1 pending, [1] SIGP enabled after 5 ms with IRQs unmasked |
+-		 * this CPU's IRQ count << 32 (sleh counters) | HPPIR afterwards << 48.
+-		 */
+-		if (vince_smp_mark_va != NULL && core < 8) {
+-			volatile uint64_t *x = vince_smp_mark_va + 0x1e0 + 2 * core;
+-			for (int i = 0; i < 1000; i++) {
+-				__asm__ volatile("yield");
+-			}
+-			x[0] = *(volatile uint32_t *)(vince_gicc_base + 0x018) |
+-			    ((uint64_t)*(volatile uint32_t *)(vince_gicc_base + 0x014) << 32);
+-			uint64_t t0 = mach_absolute_time(), span;
+-			nanoseconds_to_absolutetime(5 * NSEC_PER_MSEC, &span);
+-			boolean_t was = ml_set_interrupts_enabled(TRUE);
+-			while (mach_absolute_time() - t0 < span && !ml_cpu_signal_is_enabled()) {
+-				__asm__ volatile("yield");
+-			}
+-			ml_set_interrupts_enabled(was);
+-			x[1] = (uint64_t)ml_cpu_signal_is_enabled() |
+-			    ((vince_smp_mark_va[0x1c1 + 2 * core] & 0xffff) << 32) |
+-			    ((uint64_t)(*(volatile uint32_t *)(vince_gicc_base + 0x018) & 0xffff) << 48);
+-		}
+ 		vince_smp_mark(0x33);
+ 		setCPUState(kIOCPUStateRunning);
+ 		return;
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 9acfde3..bd97018 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1865,19 +1865,6 @@ sleh_irq(arm_saved_state_t *state)
+ 	extern uint32_t vince_vtimer_intid;
+ 	uint32_t iar = *(volatile uint32_t *)(vince_gicc_base + 0x0c);
+ 	uint32_t intid = iar & 0x3ff;
+-	{
+-		/* SMP diagnostics: per-core counts of timer and SGI interrupts (0108) */
+-		extern volatile uint64_t *vince_smp_mark_va;
+-		uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
+-		unsigned core = (unsigned)((mpidr & 0xff) + ((mpidr >> 8) & 0xff) * 4);
+-		if (vince_smp_mark_va != NULL && core < 8) {
+-			if (intid == vince_vtimer_intid) {
+-				vince_smp_mark_va[0x1c0 + 2 * core]++;
+-			} else if (intid < 16) {
+-				vince_smp_mark_va[0x1c1 + 2 * core]++;
+-			}
+-		}
+-	}
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index abd7704..8e29586 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -6482,12 +6482,6 @@ void
+ idle_thread(__assert_only void* parameter,
+     __unused wait_result_t result)
+ {
+-#if defined(ARM64_BOARD_CONFIG_VINCE)
+-	{
+-		extern void vince_smp_mark(uint64_t code);
+-		vince_smp_mark(0x46);
+-	}
+-#endif
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+ 	assert(parameter == NULL);
+ 
