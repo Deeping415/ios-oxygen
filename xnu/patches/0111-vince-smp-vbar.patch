@@ -1,0 +1,21 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 03397d4..65ed5f3 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -693,6 +693,16 @@ arm_init_cpu(
+ #if defined(VINCE)
+ 	extern void vince_smp_mark(uint64_t code);
+ 	vince_smp_mark(0x21);
++	/*
++	 * common_start leaves VBAR_EL1 at LowExceptionVectorBase (VINCE: every vector -> L_vince_trap, a WFE loop);
++	 * the boot CPU switches to ExceptionVectorsBase in arm_init. Measured: a secondary with SGI1 pending
++	 * (GICC_HPPIR 0x801) stopped dead as soon as it unmasked IRQs.
++	 */
++	{
++		extern void ExceptionVectorsBase;
++		__builtin_arm_wsr64("VBAR_EL1", (uint64_t)(uintptr_t)&ExceptionVectorsBase);
++		__builtin_arm_isb(ISB_SY);
++	}
+ #endif
+ 
+ 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
