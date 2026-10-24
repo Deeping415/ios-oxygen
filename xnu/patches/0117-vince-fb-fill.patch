@@ -1,0 +1,32 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4ff1cd1..bf90e43 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -218,7 +218,10 @@ AppleCLCD::start(IOService *provider)
+ 	if (fPanelBpp == 3 && !crop && (fLogicalW != fWidth || fLogicalH != fHeight)) {
+ 		/* Fit the height, keep the aspect; the width rounded to a multiple of 8 so the bars are whole words. */
+ 		uint32_t outW = ((fLogicalW * fHeight + fLogicalH / 2) / fLogicalH + 4) & ~7u;
+-		if (outW > fWidth) {
++		int fill = 0;
++		PE_parse_boot_argn("vincefb_fill", &fill, sizeof(fill));
++		if (outW > fWidth || fill) {
++			/* vincefb_fill=1: the whole panel width, no bars (the picture about 8% wider than tall) */
+ 			outW = fWidth & ~7u;
+ 		}
+ 		fXMap = (uint16_t *)IOMalloc(outW * sizeof(uint16_t));
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index bf53dcc..7000d01 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -453,6 +453,11 @@ SweetHIDTouch::start(IOService *provider)
+ 	if (!native && !crop) {
+ 		/* SweetFramebuffer.cpp shows 1125x2436 scaled into 1000x2160 at column 40: undo exactly that */
+ 		int outW = ((1125 * SWEET_TOUCH_PANEL_H + 2436 / 2) / 2436 + 4) & ~7;
++		int fill = 0;
++		PE_parse_boot_argn("vincefb_fill", &fill, sizeof(fill));
++		if (fill) {
++			outW = 1080;
++		}
+ 		fMinX = (1080 - outW) / 2;
+ 		fMaxX = fMinX + outW - 1;
+ 		fOffX = -fMinX;
