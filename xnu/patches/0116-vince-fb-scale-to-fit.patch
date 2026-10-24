@@ -1,0 +1,190 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6fe9eaa..4ff1cd1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -121,6 +121,15 @@ public:
+ 	uintptr_t     fPanel;
+ 	uint32_t      fPanelRowBytes;
+ 	IOMemoryMap  *fPanelMap;
++	/*
++	 * VINCE scale-to-fit (default; boot-arg vincefb_crop=1 keeps the old centred crop): the shadow is the whole
++	 * logical display (fShadowW x fShadowH = 1125x2436) and flushPanel() samples it down to fOutW x fHeight
++	 * (1000x2160) at panel column fBarX (40), black bars either side. fXMap/fYMap: shadow column/row per panel
++	 * pixel (nearest, centre-sampled).
++	 */
++	bool          fScaled;
++	uint32_t      fShadowW, fShadowH, fOutW, fBarX;
++	uint16_t     *fXMap, *fYMap;
+ 	void flushPanel(void);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -200,12 +209,44 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	fShadowW = fWidth;
++	fShadowH = fHeight;
++	fScaled = false;
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	int crop = 0;
++	PE_parse_boot_argn("vincefb_crop", &crop, sizeof(crop));
++	if (fPanelBpp == 3 && !crop && (fLogicalW != fWidth || fLogicalH != fHeight)) {
++		/* Fit the height, keep the aspect; the width rounded to a multiple of 8 so the bars are whole words. */
++		uint32_t outW = ((fLogicalW * fHeight + fLogicalH / 2) / fLogicalH + 4) & ~7u;
++		if (outW > fWidth) {
++			outW = fWidth & ~7u;
++		}
++		fXMap = (uint16_t *)IOMalloc(outW * sizeof(uint16_t));
++		fYMap = (uint16_t *)IOMalloc(fHeight * sizeof(uint16_t));
++		if (fXMap != NULL && fYMap != NULL) {
++			for (uint32_t x = 0; x < outW; x++) {
++				fXMap[x] = (uint16_t)(((2 * x + 1) * fLogicalW) / (2 * outW));
++			}
++			for (uint32_t y = 0; y < fHeight; y++) {
++				fYMap[y] = (uint16_t)(((2 * y + 1) * fLogicalH) / (2 * fHeight));
++			}
++			fScaled = true;
++			fOutW = outW;
++			fBarX = (fWidth - outW) / 2;
++			fShadowW = fLogicalW;
++			fShadowH = fLogicalH;
++			fRowBytes = fShadowW * 4;
++			fOffX = fOffY = 0;
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+-#if defined(ARM64_BOARD_CONFIG_VINCE)
+ 	if (fPanelBpp == 3) {
+-		fSurface = fPanel != 0 ? sweet_surface_create_buffer(fWidth, fHeight, SWEET_FB_FORMAT_BGRA) : NULL;
++		fSurface = fPanel != 0 ? sweet_surface_create_buffer(fShadowW, fShadowH, SWEET_FB_FORMAT_BGRA) : NULL;
+ 	} else
++#else
++	fLock = IOLockAlloc();
++	fClients = OSArray::withCapacity(4);
+ #endif
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+@@ -232,6 +273,10 @@ AppleCLCD::start(IOService *provider)
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, panel %u bpp\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPanelBpp * 8);
++	if (fScaled) {
++		IOLog("SWEET FB: scaled to fit: %ux%u -> %ux%u at x %u (vincefb_crop=1 for the centred crop)\n",
++		    fShadowW, fShadowH, fOutW, fHeight, fBarX);
++	}
+ 	return true;
+ }
+ 
+@@ -261,9 +306,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+-			for (uint32_t y = 0; y < fb->fHeight; y++) {
++			for (uint32_t y = 0; y < fb->fShadowH; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
++				for (uint32_t x = 0; x < fb->fShadowW; x++) {
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
+@@ -412,11 +457,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (h > (int32_t)s->height - sy) {
+ 			h = (int32_t)s->height - sy;
+ 		}
+-		if (w > (int32_t)fWidth - dx) {
+-			w = (int32_t)fWidth - dx;
++		if (w > (int32_t)fShadowW - dx) {
++			w = (int32_t)fShadowW - dx;
+ 		}
+-		if (h > (int32_t)fHeight - dy) {
+-			h = (int32_t)fHeight - dy;
++		if (h > (int32_t)fShadowH - dy) {
++			h = (int32_t)fShadowH - dy;
+ 		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+@@ -448,6 +493,30 @@ AppleCLCD::present(const uint8_t *rec)
+ void
+ AppleCLCD::flushPanel(void)
+ {
++	if (fScaled) {
++		/* nearest sample of the logical display per panel pixel; bars rewritten each time (240 bytes a row) */
++		uint32_t barBytes = fBarX * 3, endBytes = (fBarX + fOutW) * 3;
++		for (uint32_t y = 0; y < fHeight; y++) {
++			const uint32_t *s = (const uint32_t *)(fPixels + (uint64_t)fYMap[y] * fRowBytes);
++			volatile uint32_t *row = (volatile uint32_t *)(fPanel + (uint64_t)y * fPanelRowBytes);
++			for (uint32_t i = 0; i < barBytes / 4; i++) {
++				row[i] = 0;
++			}
++			for (uint32_t i = endBytes / 4; i < fWidth * 3 / 4; i++) {
++				row[i] = 0;
++			}
++			volatile uint32_t *d = row + barBytes / 4;
++			const uint16_t *xm = fXMap;
++			for (uint32_t x = 0; x + 4 <= fOutW; x += 4, xm += 4, d += 3) {
++				uint32_t p0 = s[xm[0]] & 0xffffff, p1 = s[xm[1]] & 0xffffff, p2 = s[xm[2]] & 0xffffff;
++				uint32_t p3 = s[xm[3]] & 0xffffff;
++				d[0] = p0 | p1 << 24;
++				d[1] = p1 >> 8 | p2 << 16;
++				d[2] = p2 >> 16 | p3 << 8;
++			}
++		}
++		return;
++	}
+ 	for (uint32_t y = 0; y < fHeight; y++) {
+ 		const uint32_t *s = (const uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
+ 		volatile uint32_t *d = (volatile uint32_t *)(fPanel + (uint64_t)y * fPanelRowBytes);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 52207e7..bf53dcc 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -374,6 +374,7 @@ protected:
+ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fMinX, fMaxX;       /* panel columns that show the display (VINCE scale-to-fit: the bars are outside) */
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -444,6 +445,22 @@ SweetHIDTouch::start(IOService *provider)
+ 	fLogicalH = native ? SWEET_TOUCH_PANEL_H : 2436;
+ 	fOffX = (fLogicalW - 1080) / 2;
+ 	fOffY = (fLogicalH - SWEET_TOUCH_PANEL_H) / 2;
++	fMinX = 0;
++	fMaxX = 1079;
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	int crop = 0;
++	PE_parse_boot_argn("vincefb_crop", &crop, sizeof(crop));
++	if (!native && !crop) {
++		/* SweetFramebuffer.cpp shows 1125x2436 scaled into 1000x2160 at column 40: undo exactly that */
++		int outW = ((1125 * SWEET_TOUCH_PANEL_H + 2436 / 2) / 2436 + 4) & ~7;
++		fMinX = (1080 - outW) / 2;
++		fMaxX = fMinX + outW - 1;
++		fOffX = -fMinX;
++		fLogicalW = outW;
++		fOffY = 0;
++		fLogicalH = SWEET_TOUCH_PANEL_H;
++	}
++#endif
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -464,7 +481,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
++	x = x < fMinX ? fMinX : (x > fMaxX ? fMaxX : x);
+ 	y = y < 0 ? 0 : (y > SWEET_TOUCH_PANEL_H - 1 ? SWEET_TOUCH_PANEL_H - 1 : y);
+ 
+ 	IOLockLock(fLock);
+@@ -478,7 +495,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
++		fEdge[finger] = x < fMinX + SWEET_TOUCH_EDGE_PX || x > fMaxX - SWEET_TOUCH_EDGE_PX ||
+ 		    y < SWEET_TOUCH_EDGE_PX || y > SWEET_TOUCH_PANEL_H - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
