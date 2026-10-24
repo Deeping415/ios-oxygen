@@ -1,0 +1,247 @@
+diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
+index 6ae8a1a..e4d18e7 100644
+--- a/bsd/dev/vince_mmc.c
++++ b/bsd/dev/vince_mmc.c
+@@ -13,8 +13,12 @@
+  *
+  * It finds one GPT partition by name (boot-arg mmcroot=, default "userdata") and exposes it as the BSD disk
+  * mmcroot0 (rmmcroot0) with 512-byte sectors. Root on it with rd=mmcroot0. mmcprobe=1 (with any other root) only
+- * initialises it and logs the partition and the filesystem signature found on it. Writes are refused, and no
+- * command that writes the card's data (CMD24/25) exists here.
++ * initialises it and logs the partition and the filesystem signature found on it.
++ *
++ * Writes (CMD25, PIO) exist only with boot-arg mmcrw=1 and only for the partition named "userdata": iOS's
++ * mount-phase-1 remounts / read-write and fails otherwise (pair with rootrw=1). Every write is checked against the
++ * partition's bounds right before the command is sent. At init a write/read-back self-test runs on a sector past
++ * the end of the HFS+ volume (unused space at the partition's tail); if it does not read back, writes stay off.
+  */
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ #include <sys/param.h>
+@@ -71,6 +75,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define PS_DAT_INHIBIT  (1u << 1)
+ #define INT_CMD         (1u << 0)
+ #define INT_XFER        (1u << 1)
++#define INT_WRREADY     (1u << 4)
+ #define INT_RDREADY     (1u << 5)
+ #define INT_ERR         (1u << 15)
+ #define CLK_INT_EN      (1u << 0)
+@@ -120,6 +125,7 @@ static struct {
+ 	uint32_t err;                   /* interrupt status (or the polled register) at the last failure */
+ 	uint64_t first, nsect;          /* partition, in 512-byte sectors */
+ 	uint32_t secsize;               /* logical sector size for the BSD layer */
++	bool rw;                        /* mmcrw=1, partition "userdata", self-test passed */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -398,6 +404,42 @@ mmc_read_sectors(uint64_t lba, uint32_t n)
+ 	return error;
+ }
+ 
++/*
++ * n (1..MAX_SECTORS) sectors from the bounce buffer to partition-relative sector rel. The bounds are checked here,
++ * on the absolute LBA that goes to the card, whatever the caller computed.
++ */
++static int
++mmc_write_sectors(uint64_t rel, uint32_t n)
++{
++	uint64_t lba = vm.first + rel;
++	if (!vm.rw || n == 0 || n > MAX_SECTORS || rel >= vm.nsect || n > vm.nsect - rel ||
++	    lba < vm.first || lba + n > vm.first + vm.nsect || lba + n > UINT32_MAX) {
++		printf("VINCE MMC: refused write of %u sectors at partition sector 0x%llx\n", n, rel);
++		return EIO;
++	}
++	uint32_t xm = XM_BLKCNT | (n > 1 ? XM_MULTI | XM_ACMD12 : 0);
++	int error = mmc_cmd(n > 1 ? 25 : 24, (uint32_t)lba, F_R1 | C_DATA, xm, n);
++	if (!error && (vm.resp & R1_ERR)) {
++		vm.err = vm.resp;
++		error = EIO;
++	}
++	const uint32_t *w = vince_mmc_bounce;
++	for (uint32_t b = 0; !error && b < n; b++) {
++		error = wait_int(INT_WRREADY, 1000);
++		for (uint32_t i = 0; !error && i < SECTOR / 4; i++) {
++			hc_wr(BUF, *w++);
++		}
++	}
++	if (!error) {
++		error = wait_int(INT_XFER, 5000);       /* programming busy of the last block (and auto CMD12) */
++	}
++	if (error) {
++		printf("VINCE MMC: write of %u sectors at 0x%llx failed (status 0x%08x)\n", n, lba, vm.err);
++		recover();
++	}
++	return error;
++}
++
+ static uint32_t
+ crc32_le(const uint8_t *p, size_t n)
+ {
+@@ -499,13 +541,62 @@ mmc_fs_signature(void)
+ 	return "unknown";
+ }
+ 
++/*
++ * Write path check on a sector nothing uses: past the end of the HFS+ volume (volume header at byte 1024:
++ * blockSize @40, totalBlocks @44, big endian), at least 1 MiB in, inside the partition. Original contents are put
++ * back. Returns 0 when the pattern read back intact.
++ */
++static int
++mmc_write_selftest(void)
++{
++	if (mmc_read_sectors(vm.first + 2, 1)) {
++		return EIO;
++	}
++	const uint8_t *vh = (const uint8_t *)vince_mmc_bounce;
++	if (!((vh[0] == 'H' && vh[1] == '+') || (vh[0] == 'H' && vh[1] == 'X'))) {
++		printf("VINCE MMC: no HFS+ volume header, no write self-test\n");
++		return ENXIO;
++	}
++	uint32_t bsz = (uint32_t)vh[40] << 24 | (uint32_t)vh[41] << 16 | (uint32_t)vh[42] << 8 | vh[43];
++	uint32_t blocks = (uint32_t)vh[44] << 24 | (uint32_t)vh[45] << 16 | (uint32_t)vh[46] << 8 | vh[47];
++	uint64_t test = (uint64_t)bsz * blocks / SECTOR + 2048;
++	if (bsz < SECTOR || test + 1 > vm.nsect) {
++		printf("VINCE MMC: no free sector past the volume (block %u x %u), no write self-test\n", bsz, blocks);
++		return ENOSPC;
++	}
++	static uint32_t saved[SECTOR / 4];
++	if (mmc_read_sectors(vm.first + test, 1)) {
++		return EIO;
++	}
++	memcpy(saved, vince_mmc_bounce, SECTOR);
++	for (uint32_t i = 0; i < SECTOR / 4; i++) {
++		vince_mmc_bounce[i] = 0x56494e43u ^ (i * 0x9e3779b9u);     /* "VINC" ^ golden ratio walk */
++	}
++	int error = mmc_write_sectors(test, 1);
++	if (!error) {
++		error = mmc_read_sectors(vm.first + test, 1);
++	}
++	for (uint32_t i = 0; !error && i < SECTOR / 4; i++) {
++		if (vince_mmc_bounce[i] != (0x56494e43u ^ (i * 0x9e3779b9u))) {
++			printf("VINCE MMC: write self-test read back word %u = 0x%08x\n", i, vince_mmc_bounce[i]);
++			error = EIO;
++		}
++	}
++	memcpy(vince_mmc_bounce, saved, SECTOR);
++	if (mmc_write_sectors(test, 1) && !error) {
++		error = EIO;
++	}
++	printf("VINCE MMC: write self-test at partition sector 0x%llx: %s\n", test, error ? "FAILED" : "ok");
++	return error;
++}
++
+ static int
+ vince_mmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+ {
+ 	if (!vm.ready) {
+ 		return ENXIO;
+ 	}
+-	return (flags & FWRITE) ? EROFS : 0;
++	return ((flags & FWRITE) && !vm.rw) ? EROFS : 0;
+ }
+ 
+ static int
+@@ -523,8 +614,10 @@ vince_mmc_strategy(buf_t bp)
+ 	uint32_t count = buf_count(bp);
+ 	uint64_t part_bytes = vm.nsect * SECTOR;
+ 
++	bool reading = (buf_flags(bp) & B_READ) != 0;
++
+ 	buf_setresid(bp, count);
+-	if (!(buf_flags(bp) & B_READ)) {
++	if (!reading && !vm.rw) {
+ 		error = EROFS;
+ 		goto done;
+ 	}
+@@ -546,11 +639,26 @@ vince_mmc_strategy(buf_t bp)
+ 		uint32_t skip = (uint32_t)(pos % SECTOR);
+ 		uint32_t want = MIN(count - done, MAX_SECTORS * SECTOR - skip);
+ 		uint32_t n = (skip + want + SECTOR - 1) / SECTOR;
+-		error = mmc_read_sectors(vm.first + pos / SECTOR, n);
+-		if (error) {
+-			break;
++		if (reading) {
++			error = mmc_read_sectors(vm.first + pos / SECTOR, n);
++			if (error) {
++				break;
++			}
++			memcpy(vaddr + done, (const uint8_t *)vince_mmc_bounce + skip, want);
++		} else {
++			if (skip || (want % SECTOR)) {
++				/* partial first or last sector: read the sectors first, then merge */
++				error = mmc_read_sectors(vm.first + pos / SECTOR, n);
++				if (error) {
++					break;
++				}
++			}
++			memcpy((uint8_t *)vince_mmc_bounce + skip, vaddr + done, want);
++			error = mmc_write_sectors(pos / SECTOR, n);
++			if (error) {
++				break;
++			}
+ 		}
+-		memcpy(vaddr + done, (const uint8_t *)vince_mmc_bounce + skip, want);
+ 		done += want;
+ 		buf_setresid(bp, count - done);
+ 	}
+@@ -591,13 +699,15 @@ vince_mmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		*o = vm.nsect * SECTOR / vm.secsize;
+ 		return 0;
+ 	case DKIOCISWRITABLE:
+-		*f = 0;
++		*f = vm.rw ? 1 : 0;
+ 		return 0;
++	case DKIOCSYNCHRONIZE:
++		return 0;                       /* PIO writes complete before strategy returns; card cache is off */
+ 	case DKIOCGETMAXBLOCKCOUNTREAD:
+ 		*o = MAX_IO / vm.secsize;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTWRITE:
+-		*o = 0;
++		*o = vm.rw ? MAX_IO / vm.secsize : 0;
+ 		return 0;
+ 	case DKIOCGETMAXSEGMENTCOUNTREAD:
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+@@ -633,9 +743,12 @@ vince_mmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
+ }
+ 
+ static int
+-vince_mmc_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++vince_mmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	return EROFS;
++	if (!vm.rw) {
++		return EROFS;
++	}
++	return physio(vince_mmc_strategy, NULL, dev, B_WRITE, minphys, uio, (int)vm.secsize);
+ }
+ 
+ static const struct bdevsw vince_mmc_bdevsw = {
+@@ -683,6 +796,17 @@ vince_mmc_init(void)
+ 		error = mmc_find_partition(want);
+ 	}
+ 	const char *fs = error ? "" : mmc_fs_signature();
++	int want_rw = 0;
++	if (!error && PE_parse_boot_argn("mmcrw", &want_rw, sizeof(want_rw)) && want_rw) {
++		if (strcmp(want, "userdata") != 0) {
++			printf("VINCE MMC: mmcrw=1 is only allowed for \"userdata\", not \"%s\"\n", want);
++		} else {
++			vm.rw = true;
++			if (mmc_write_selftest()) {
++				vm.rw = false;
++			}
++		}
++	}
+ 	lck_mtx_unlock(&vince_mmc_lock);
+ 	if (error) {
+ 		printf("VINCE MMC: eMMC root unavailable: %d (LK's last command CMD%u)\n", error, lk_cmd);
+@@ -701,8 +825,8 @@ vince_mmc_init(void)
+ 	devfs_make_node(vm.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "mmcroot0");
+ 	devfs_make_node(makedev(vm.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rmmcroot0");
+ 	vm.ready = true;
+-	printf("VINCE MMC: \"%s\" at sector 0x%llx, %llu MiB, %s, read-only (8-bit HS 50 MHz, PIO)\n",
+-	    want, vm.first, vm.nsect * SECTOR >> 20, fs);
++	printf("VINCE MMC: \"%s\" at sector 0x%llx, %llu MiB, %s, %s (8-bit HS 50 MHz, PIO)\n",
++	    want, vm.first, vm.nsect * SECTOR >> 20, fs, vm.rw ? "read-write" : "read-only");
+ 	return 0;
+ }
+ 
