@@ -1,0 +1,54 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index fe548a5..7ea4db9 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -164,6 +164,9 @@ SweetCPU::start(IOService *provider)
+ 			for (int i = 0; i < 8; i++) {
+ 				((volatile uint64_t *)marks)[0x100 + i] = 0;
+ 			}
++			for (int i = 0; i < 16; i++) {
++				((volatile uint64_t *)marks)[0x1c0 + i] = 0;
++			}
+ 			vince_smp_mark_va = (volatile uint64_t *)marks;
+ 		}
+ 	}
+@@ -281,6 +284,15 @@ SweetCPU::initCPU(bool boot)
+ 		 */
+ 		ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
+ 		signalCPU(this);
++		if (diag) {
++			/* banked state as this CPU sees it (0108) */
++			diag[1] = *(volatile uint32_t *)(vince_gicd_base + 0x080) |
++			    ((uint64_t)*(volatile uint32_t *)(vince_gicd_base + 0x100) << 32);
++			diag[2] = *(volatile uint32_t *)(vince_gicd_base + 0x200) |
++			    ((uint64_t)*(volatile uint32_t *)(vince_gicd_base + 0x800) << 32);
++			diag[3] = *(volatile uint32_t *)(vince_gicc_base + 0x000) |
++			    ((uint64_t)*(volatile uint32_t *)(vince_gicc_base + 0x004) << 32);
++		}
+ 		vince_smp_mark(0x33);
+ 		setCPUState(kIOCPUStateRunning);
+ 		return;
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index bd97018..9acfde3 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1865,6 +1865,19 @@ sleh_irq(arm_saved_state_t *state)
+ 	extern uint32_t vince_vtimer_intid;
+ 	uint32_t iar = *(volatile uint32_t *)(vince_gicc_base + 0x0c);
+ 	uint32_t intid = iar & 0x3ff;
++	{
++		/* SMP diagnostics: per-core counts of timer and SGI interrupts (0108) */
++		extern volatile uint64_t *vince_smp_mark_va;
++		uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++		unsigned core = (unsigned)((mpidr & 0xff) + ((mpidr >> 8) & 0xff) * 4);
++		if (vince_smp_mark_va != NULL && core < 8) {
++			if (intid == vince_vtimer_intid) {
++				vince_smp_mark_va[0x1c0 + 2 * core]++;
++			} else if (intid < 16) {
++				vince_smp_mark_va[0x1c1 + 2 * core]++;
++			}
++		}
++	}
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
