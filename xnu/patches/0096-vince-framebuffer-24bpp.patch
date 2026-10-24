@@ -1,0 +1,207 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..6fe9eaa 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,7 +38,7 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+-#if defined(SWEET)
++#if defined(SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+@@ -116,6 +116,12 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* VINCE 24-bpp panel: fPixels/fRowBytes are the 32-bpp shadow, these the real panel memory */
++	uint32_t      fPanelBpp;
++	uintptr_t     fPanel;
++	uint32_t      fPanelRowBytes;
++	IOMemoryMap  *fPanelMap;
++	void flushPanel(void);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -162,6 +168,24 @@ AppleCLCD::start(IOService *provider)
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
++	fPanelBpp = 4;
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	/*
++	 * VINCE: LK's continuous-splash buffer is 24 bpp (bytes B, G, R; 1080x2160, stride 3240). The iOS side only
++	 * knows 32-bpp BGRA, so userland and the layer copies below work on a 32-bpp shadow in normal cached RAM, and
++	 * flushPanel() packs it into the panel memory after each present.
++	 */
++	if (fPhys != 0 && (video.v_depth == 24 || fRowBytes < fWidth * 4) && fRowBytes >= fWidth * 3) {
++		IOMemoryDescriptor *pm = IOMemoryDescriptor::withPhysicalAddress(fPhys,
++		    round_page((uint64_t)fRowBytes * fHeight), kIODirectionInOut);
++		fPanelMap = pm != NULL ? pm->map(kIOMapWriteCombineCache) : NULL;
++		OSSafeReleaseNULL(pm);
++		fPanel = fPanelMap != NULL ? (uintptr_t)fPanelMap->getVirtualAddress() : 0;
++		fPanelRowBytes = fRowBytes;
++		fRowBytes = fWidth * 4;
++		fPanelBpp = 3;
++	}
++#endif
+ 	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+@@ -178,6 +202,11 @@ AppleCLCD::start(IOService *provider)
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	if (fPanelBpp == 3) {
++		fSurface = fPanel != 0 ? sweet_surface_create_buffer(fWidth, fHeight, SWEET_FB_FORMAT_BGRA) : NULL;
++	} else
++#endif
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+@@ -201,8 +230,8 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, panel %u bpp\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPanelBpp * 8);
+ 	return true;
+ }
+ 
+@@ -238,6 +267,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++			if (fb->fPanelBpp == 3) {
++				fb->flushPanel();
++			}
++#endif
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -399,7 +433,40 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	if (fPanelBpp == 3) {
++		flushPanel();
++	}
++#endif
++}
++
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++/*
++ * 32-bpp shadow (B, G, R, X) to the 24-bpp panel (B, G, R): four pixels into three words, the whole frame
++ * (about 9 MB read, 7 MB written; a few ms, at sweetfb_hz).
++ */
++void
++AppleCLCD::flushPanel(void)
++{
++	for (uint32_t y = 0; y < fHeight; y++) {
++		const uint32_t *s = (const uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++		volatile uint32_t *d = (volatile uint32_t *)(fPanel + (uint64_t)y * fPanelRowBytes);
++		uint32_t x = 0;
++		for (; x + 4 <= fWidth; x += 4, s += 4, d += 3) {
++			uint32_t p0 = s[0] & 0xffffff, p1 = s[1] & 0xffffff, p2 = s[2] & 0xffffff, p3 = s[3] & 0xffffff;
++			d[0] = p0 | p1 << 24;
++			d[1] = p1 >> 8 | p2 << 16;
++			d[2] = p2 >> 16 | p3 << 8;
++		}
++		volatile uint8_t *db = (volatile uint8_t *)d;
++		for (; x < fWidth; x++, s++) {
++			*db++ = (uint8_t)*s;
++			*db++ = (uint8_t)(*s >> 8);
++			*db++ = (uint8_t)(*s >> 16);
++		}
++	}
+ }
++#endif
+ 
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..6708085 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -27,7 +27,7 @@
+  */
+ #include "SweetSurface.h"
+ 
+-#if defined(SWEET)
++#if defined(SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+@@ -248,6 +248,39 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+ 	return s;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++SweetSurface *
++sweet_surface_create_buffer(uint32_t width, uint32_t height, uint32_t pixelFormat)
++{
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = width * 4;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page(s->bytesPerRow * height);
++	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	if (mem == NULL) {
++		s->release();
++		return NULL;
++	}
++	OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);   /* free() takes it back */
++	bzero(mem->getBytesNoCopy(), s->allocSize);
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	if (!sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++#endif
++
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..f4ee301 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -10,7 +10,7 @@
+ 
+ #include <pexpert/arm64/board_config.h>
+ 
+-#if defined(SWEET)
++#if defined(SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/c++/OSObject.h>
+@@ -61,5 +61,13 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++/*
++ * A surface over a new zeroed kernel buffer (cached, like the surfaces userland creates): VINCE's 32-bpp shadow of
++ * its 24-bpp panel (SweetFramebuffer.cpp). Retained; stays in the id table like sweet_surface_create_physical's.
++ */
++SweetSurface *sweet_surface_create_buffer(uint32_t width, uint32_t height, uint32_t pixelFormat);
++#endif
++
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */

@@ -133,8 +133,10 @@ def build_vince_adt(seed=None):
         ph(),
         ('device_type', cstr('display-subsystem')),
         ('compatible', cstr('vince,display') + cstr('sweet,display') + b'\0'),
-        ('canvas-width', u32(FB_W)),
-        ('canvas-height', u32(FB_H)),
+        # IOMobileFramebuffer reads the canvas from this node: the iPhone X size AppleCLCD presents (1125x2436,
+        # 375x812 points @3x; the panel shows the centered 1080x2160 part), as sweet's ADT does.
+        ('canvas-width', u32(1125)),
+        ('canvas-height', u32(2436)),
     ])
 
     # SDHCI eMMC Storage Node
