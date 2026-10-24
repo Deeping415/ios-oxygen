@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 7ea4db9..bb124b0 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -164,7 +164,7 @@ SweetCPU::start(IOService *provider)
+ 			for (int i = 0; i < 8; i++) {
+ 				((volatile uint64_t *)marks)[0x100 + i] = 0;
+ 			}
+-			for (int i = 0; i < 16; i++) {
++			for (int i = 0; i < 32; i++) {
+ 				((volatile uint64_t *)marks)[0x1c0 + i] = 0;
+ 			}
+ 			vince_smp_mark_va = (volatile uint64_t *)marks;
+@@ -293,6 +293,29 @@ SweetCPU::initCPU(bool boot)
+ 			diag[3] = *(volatile uint32_t *)(vince_gicc_base + 0x000) |
+ 			    ((uint64_t)*(volatile uint32_t *)(vince_gicc_base + 0x004) << 32);
+ 		}
++		/*
++		 * 0110 probe, mark page word 0x1e0 + 2 * core (PA 0x913F0F00 + 16 * core):
++		 * [0] GICC_HPPIR | GICC_RPR << 32 with SGI1 pending, [1] SIGP enabled after 5 ms with IRQs unmasked |
++		 * this CPU's IRQ count << 32 (sleh counters) | HPPIR afterwards << 48.
++		 */
++		if (vince_smp_mark_va != NULL && core < 8) {
++			volatile uint64_t *x = vince_smp_mark_va + 0x1e0 + 2 * core;
++			for (int i = 0; i < 1000; i++) {
++				__asm__ volatile("yield");
++			}
++			x[0] = *(volatile uint32_t *)(vince_gicc_base + 0x018) |
++			    ((uint64_t)*(volatile uint32_t *)(vince_gicc_base + 0x014) << 32);
++			uint64_t t0 = mach_absolute_time(), span;
++			nanoseconds_to_absolutetime(5 * NSEC_PER_MSEC, &span);
++			boolean_t was = ml_set_interrupts_enabled(TRUE);
++			while (mach_absolute_time() - t0 < span && !ml_cpu_signal_is_enabled()) {
++				__asm__ volatile("yield");
++			}
++			ml_set_interrupts_enabled(was);
++			x[1] = (uint64_t)ml_cpu_signal_is_enabled() |
++			    ((vince_smp_mark_va[0x1c1 + 2 * core] & 0xffff) << 32) |
++			    ((uint64_t)(*(volatile uint32_t *)(vince_gicc_base + 0x018) & 0xffff) << 48);
++		}
+ 		vince_smp_mark(0x33);
+ 		setCPUState(kIOCPUStateRunning);
+ 		return;
