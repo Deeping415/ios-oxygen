@@ -1,0 +1,517 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b8c0135..58782e3 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/vince_mmc.c			standard
+ bsd/dev/vince_input.c			standard
+ bsd/dev/vince_ctl.c			standard
+ bsd/dev/vince_smd.c			standard
++bsd/dev/vince_pmic.c			standard
+ bsd/dev/vince_wlan.c			standard
+ bsd/dev/vince_wlan_dxe.c		standard
+ bsd/dev/vince_wlan_if.c		standard
+diff --git a/bsd/dev/vince_pmic.c b/bsd/dev/vince_pmic.c
+new file mode 100644
+index 0000000..07fccc0
+--- /dev/null
++++ b/bsd/dev/vince_pmic.c
+@@ -0,0 +1,217 @@
++/*
++ * VINCE PMIC reads over the SPMI arbiter, for the battery service (iokit/Kernel/arm/SweetBattery.cpp).
++ * A port of the read path of vince-bringup/shim/spmi.c (measured on the phone: PMIC_ARB_VERSION 0x20010000). Reads go
++ * through the observer channels, which are read only, so nothing here can change a PMIC register. PPID = SID << 8 |
++ * peripheral page: PMI8950 (SID 2) has the SMBCHG charger at 0x210..0x216 and the fuel gauge at 0x240..0x244.
++ */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define ARB_CORE        0x0200F000u
++#define ARB_CNFG        0x0200A000u
++#define ARB_OBSRVR      0x02C00000u
++#define CMD             0x00u
++#define STATUS          0x08u
++#define RDATA0          0x18u
++#define OP_EXT_READL    1u
++
++static vm_offset_t pmic_core, pmic_cnfg;
++static struct {
++	unsigned ppid;
++	vm_offset_t chan;
++} pmic_chan[8];
++static unsigned pmic_nchan;
++static lck_grp_t *pmic_grp;
++static lck_mtx_t *pmic_lock;
++
++int
++vince_pmic_init(void)
++{
++	if (pmic_lock) {
++		return 0;
++	}
++	pmic_core = ml_io_map(ARB_CORE, 0x1000);
++	pmic_cnfg = ml_io_map(ARB_CNFG, 0x1000);
++	if (!pmic_core || !pmic_cnfg) {
++		return -1;
++	}
++	pmic_grp = lck_grp_alloc_init("vince_pmic", LCK_GRP_ATTR_NULL);
++	pmic_lock = lck_mtx_alloc_init(pmic_grp, LCK_ATTR_NULL);
++	return 0;
++}
++
++static vm_offset_t
++pmic_channel(unsigned ppid)
++{
++	for (unsigned i = 0; i < pmic_nchan; i++) {
++		if (pmic_chan[i].ppid == ppid) {
++			return pmic_chan[i].chan;
++		}
++	}
++	if (pmic_nchan >= sizeof(pmic_chan) / sizeof(pmic_chan[0])) {
++		return 0;
++	}
++	for (unsigned apid = 0; apid < 256; apid++) {
++		uint32_t v = *(volatile uint32_t *)(pmic_core + 0x800 + 4 * apid);
++
++		if (v && ((v >> 8) & 0xFFF) == ppid) {
++			vm_offset_t c = ml_io_map(ARB_OBSRVR + 0x8000u * apid, 0x1000);
++
++			if (c) {
++				pmic_chan[pmic_nchan].ppid = ppid;
++				pmic_chan[pmic_nchan].chan = c;
++				pmic_nchan++;
++			}
++			return c;
++		}
++	}
++	return 0;
++}
++
++/* 0 ok; <0 no such peripheral or the read failed */
++int
++vince_pmic_read(unsigned ppid, unsigned reg, uint8_t *val)
++{
++	vm_offset_t c;
++	int r = -100;
++
++	if (!pmic_lock) {
++		return -2;
++	}
++	lck_mtx_lock(pmic_lock);
++	c = pmic_channel(ppid);
++	if (!c) {
++		lck_mtx_unlock(pmic_lock);
++		return -1;
++	}
++	*(volatile uint32_t *)(c + CMD) = OP_EXT_READL << 27 | (reg & 0xFFu) << 4;
++	for (int i = 0; i < 10000; i++) {
++		uint32_t s = *(volatile uint32_t *)(c + STATUS);
++
++		if (s & 0xE) {
++			r = -(int)s;
++			break;
++		}
++		if (s & 1) {
++			*val = (uint8_t)*(volatile uint32_t *)(c + RDATA0);
++			r = 0;
++			break;
++		}
++		delay(1);
++	}
++	lck_mtx_unlock(pmic_lock);
++	return r;
++}
++
++/*
++ * Wall clock. The PM8953 RTC (PPID 0x060) is owned by another execution environment: it only counts seconds since its
++ * own reset, Android keeps the real date as an offset elsewhere. Reads are fine (observer channel); writes from the
++ * apps are not allowed. What the apps do own is the alarm peripheral (PPID 0x061, EE 0): while the alarm stays disabled
++ * (CTRL1 bit 7 clear) its 32-bit time register 0x40..0x43 is a free battery-backed word, used to keep the offset
++ * "unix time - RTC seconds" across reboots. Only those four registers can be written, and only if the owner is EE 0.
++ */
++#define RTC_PPID        0x060u
++#define ALARM_PPID      0x061u
++#define ALARM_RW        0x40u
++#define ALARM_CTRL1     0x46u
++#define ARB_CHNLS       0x02400000u
++#define WDATA0          0x10u
++#define OP_EXT_WRITEL   0u
++
++/* 0 ok; the 32-bit seconds counter, read twice until two reads agree */
++int
++vince_pmic_rtc_seconds(uint32_t *out)
++{
++	uint32_t prev = 0;
++
++	for (int attempt = 0; attempt < 4; attempt++) {
++		uint8_t b[4];
++		uint32_t v;
++
++		for (unsigned i = 0; i < 4; i++) {
++			if (vince_pmic_read(RTC_PPID, 0x48 + i, &b[i])) {
++				return -1;
++			}
++		}
++		v = b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++		if (attempt && v == prev) {
++			*out = v;
++			return 0;
++		}
++		prev = v;
++	}
++	return -2;
++}
++
++int
++vince_pmic_load_offset(uint32_t *out)
++{
++	uint8_t b[4], ctrl;
++
++	if (vince_pmic_read(ALARM_PPID, ALARM_CTRL1, &ctrl) || (ctrl & 0x80)) {
++		return -1;      /* the alarm is armed: not ours */
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		if (vince_pmic_read(ALARM_PPID, ALARM_RW + i, &b[i])) {
++			return -2;
++		}
++	}
++	*out = b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++	return 0;
++}
++
++int
++vince_pmic_store_offset(uint32_t v)
++{
++	uint8_t ctrl;
++	unsigned apid;
++	vm_offset_t chan;
++	int r = 0;
++
++	if (!pmic_lock || vince_pmic_read(ALARM_PPID, ALARM_CTRL1, &ctrl) || (ctrl & 0x80)) {
++		return -1;
++	}
++	lck_mtx_lock(pmic_lock);
++	for (apid = 0; apid < 256; apid++) {
++		uint32_t m = *(volatile uint32_t *)(pmic_core + 0x800 + 4 * apid);
++
++		if (m && ((m >> 8) & 0xFFF) == ALARM_PPID) {
++			break;
++		}
++	}
++	if (apid == 256 || (*(volatile uint32_t *)(pmic_cnfg + 0x700 + 4 * apid) & 7) != 0) {
++		lck_mtx_unlock(pmic_lock);
++		return -2;      /* not found, or not owned by the apps */
++	}
++	chan = ml_io_map(ARB_CHNLS + 0x8000u * apid, 0x1000);
++	if (!chan) {
++		lck_mtx_unlock(pmic_lock);
++		return -3;
++	}
++	for (unsigned i = 0; i < 4 && !r; i++) {
++		*(volatile uint32_t *)(chan + WDATA0) = (v >> (8 * i)) & 0xFF;
++		*(volatile uint32_t *)(chan + CMD) = OP_EXT_WRITEL << 27 | (ALARM_RW + i) << 4;
++		r = -100;
++		for (int k = 0; k < 10000; k++) {
++			uint32_t s = *(volatile uint32_t *)(chan + STATUS);
++
++			if (s & 0xE) {
++				r = -(int)s;
++				break;
++			}
++			if (s & 1) {
++				r = 0;
++				break;
++			}
++			delay(1);
++		}
++	}
++	lck_mtx_unlock(pmic_lock);
++	return r;
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..f0f3673 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -4,7 +4,7 @@
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOWorkLoop.h>
+@@ -12,9 +12,17 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++/* bsd/dev/vince_pmic.c: PMI8950 (SMBCHG charger, FG state of charge) over the SPMI arbiter, read only */
++extern "C" int vince_pmic_init(void);
++extern "C" int vince_pmic_read(unsigned ppid, unsigned reg, uint8_t *out);
++#define BATT_MAH 4000u          /* Redmi 5 Plus */
++#else
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++#define BATT_MAH 5020u
++#endif
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -101,11 +109,11 @@ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (DT nominal=BATT_MAH). powerd computes C*100/M. */
++	const unsigned capacity = (BATT_MAH * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(BATT_MAH);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,8 +127,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", BATT_MAH);
++	putNumber("DesignCapacity", BATT_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -137,7 +145,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, BATT_MAH, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -163,6 +171,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ /* Keep the proven single-byte observer command. Read two matching whole
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
+ bool
+ SweetBattery::readWord(unsigned address, uint16_t *value)
+ {
+@@ -183,6 +192,8 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+ 	return false;
+ }
+ 
++#endif /* SWEET || VINCE */
++
+ unsigned
+ SweetBattery::estimatePercent(unsigned mv)
+ {
+@@ -206,6 +217,37 @@ SweetBattery::estimatePercent(unsigned mv)
+ void
+ SweetBattery::poll(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	/*
++	 * PMI8950: fuel gauge monotonic SOC (page 0x240, reg 0x09/0x0a shadow pair, 0..255) mapped like qpnp-fg
++	 * get_prop_capacity; charger USB presence (0x213 RT_STS bit2 source detect, bit1 over-voltage, INPUT_STS 0x0d
++	 * bits 3..5), CHGR_STS (0x210 reg 0x0e: bit3 hold-off, bits 2:1 charge type 0 none/1 pre/2 fast/3 taper) and
++	 * RT_STS (0x210 reg 0x10: bit7 termination reached, bit1 inhibit); battery present 0x212 reg 0x08 bit7. Voltage,
++	 * current and temperature are not read (they live in the FG SRAM): estimated and flagged as such.
++	 */
++	uint8_t s0 = 0, s1 = 1, bat = 0, usb = 0, inp = 0, sts = 0, crt = 0;
++	bool valid = fReal;
++
++	for (int i = 0; valid && i < 4 && s0 != s1; i++) {
++		valid = !vince_pmic_read(0x240, 0x09, &s0) && !vince_pmic_read(0x240, 0x0a, &s1);
++	}
++	valid = valid && s0 == s1 && s0 != 0 &&
++	    !vince_pmic_read(0x212, 0x08, &bat) && (bat & 0x80) &&
++	    !vince_pmic_read(0x213, 0x10, &usb) && !vince_pmic_read(0x213, 0x0d, &inp) &&
++	    !vince_pmic_read(0x210, 0x0e, &sts) && !vince_pmic_read(0x210, 0x10, &crt);
++	if (!valid) {
++		/* an unreadable or empty gauge must not become 0 % (the shutdown paths treat it as critical) */
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	unsigned percent = s0 >= 255 ? 100u : ((unsigned)(s0 - 1) * 98u + 126u) / 253u + 1u;
++	bool external = (usb & 0x04u) && !(usb & 0x02u) && (inp & 0x38u);
++	unsigned type = (sts >> 1) & 3u;
++	bool full = external && ((crt & 0x80u) || (crt & 0x02u));
++	bool charging = external && !full && !(sts & 0x08u) && type != 0;
++	unsigned mv = 3300u + percent * 9u;
++	publish(full ? 100u : percent, mv, charging ? 500 : 0, external, external, charging, full, true, false);
++#else
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -244,6 +286,7 @@ SweetBattery::poll(void)
+ 	}
+ 	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
++#endif
+ }
+ 
+ void
+@@ -262,9 +305,15 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	int real = 1;
++	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++	fReal = real != 0 && vince_pmic_init() == 0;
++#else
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++#endif
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -316,4 +365,4 @@ SweetBattery::free(void)
+ 	OSSafeReleaseNULL(fLoop);
+ 	IOPMPowerSource::free();
+ }
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* SWEET || VINCE */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0705c63..264ef5c 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -15,6 +15,10 @@ class SweetPlatformExpert : public IODTPlatformExpert {
+ 
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
++#endif
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+@@ -22,6 +26,105 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++/*
++ * Wall clock on VINCE: PMIC RTC seconds + a persisted offset (see bsd/dev/vince_pmic.c). With no valid offset the
++ * clock starts at the build time of this kernel (parsed from __DATE__ / __TIME__, built on a UTC machine), so that
++ * dates are never 1970; timed corrects it from the network and the new offset is stored.
++ */
++extern "C" int vince_pmic_init(void);
++extern "C" int vince_pmic_rtc_seconds(uint32_t *out);
++extern "C" int vince_pmic_load_offset(uint32_t *out);
++extern "C" int vince_pmic_store_offset(uint32_t v);
++
++static bool vince_rtc_ready;
++static bool vince_rtc_ok;
++static uint32_t vince_rtc_offset;
++
++static long
++vince_build_epoch(void)
++{
++	static const char *const months = "JanFebMarAprMayJunJulAugSepOctNovDec";
++	const char *d = __DATE__;     /* "Oct 25 2026" */
++	const char *t = __TIME__;     /* "02:39:19" */
++	int m = 0, day, year, hh, mm, ss;
++
++	for (int i = 0; i < 12; i++) {
++		if (d[0] == months[3 * i] && d[1] == months[3 * i + 1] && d[2] == months[3 * i + 2]) {
++			m = i + 1;
++		}
++	}
++	day = (d[4] == ' ' ? 0 : d[4] - '0') * 10 + (d[5] - '0');
++	year = (d[7] - '0') * 1000 + (d[8] - '0') * 100 + (d[9] - '0') * 10 + (d[10] - '0');
++	hh = (t[0] - '0') * 10 + (t[1] - '0');
++	mm = (t[3] - '0') * 10 + (t[4] - '0');
++	ss = (t[6] - '0') * 10 + (t[7] - '0');
++	/* days from 1970-01-01 (civil date algorithm) */
++	int y = year - (m <= 2);
++	int era = y / 400;
++	int yoe = y - era * 400;
++	int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + day - 1;
++	int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++	long days = (long)era * 146097 + doe - 719468;
++
++	return days * 86400 + hh * 3600 + mm * 60 + ss;
++}
++
++static void
++vince_rtc_setup(void)
++{
++	uint32_t sec = 0, off = 0;
++	long build = vince_build_epoch();
++
++	if (vince_rtc_ready) {
++		return;
++	}
++	vince_rtc_ready = true;
++	if (vince_pmic_init() == 0 && vince_pmic_rtc_seconds(&sec) == 0) {
++		vince_rtc_ok = true;
++		/* a stored offset is believed when it puts the clock between the build time and ten years later */
++		if (vince_pmic_load_offset(&off) == 0 && (long)off + sec >= build - 86400 && (long)off + sec < build + 315360000L) {
++			vince_rtc_offset = off;
++			IOLog("VINCE RTC: stored offset %u, clock %ld\n", off, (long)off + sec);
++		} else {
++			vince_rtc_offset = (uint32_t)(build - (long)sec);
++			IOLog("VINCE RTC: no valid stored offset, starting at the build time %ld\n", build);
++		}
++	} else {
++		IOLog("VINCE RTC: PMIC RTC unreadable, clock fixed at the build time\n");
++		vince_rtc_offset = (uint32_t)build;
++	}
++}
++
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	uint32_t sec = 0;
++
++	vince_rtc_setup();
++	if (vince_rtc_ok && vince_pmic_rtc_seconds(&sec) == 0) {
++		return (long)vince_rtc_offset + (long)sec;
++	}
++	return (long)vince_rtc_offset;
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	uint32_t sec = 0;
++
++	vince_rtc_setup();
++	if (!vince_rtc_ok || vince_pmic_rtc_seconds(&sec) != 0) {
++		vince_rtc_offset = (uint32_t)secs;
++		return;
++	}
++	vince_rtc_offset = (uint32_t)(secs - (long)sec);
++	IOLog("VINCE RTC: clock set to %ld, offset %u stored: %d\n", secs, vince_rtc_offset,
++	    vince_pmic_store_offset(vince_rtc_offset));
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -30,6 +133,9 @@ SweetPlatformExpert::start(IOService *provider)
+ 		return false;
+ 	}
+ 	registerService();
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	publishResource("IORTC");      /* IOKitInitializeTime waits 30 s for it */
++#endif
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }

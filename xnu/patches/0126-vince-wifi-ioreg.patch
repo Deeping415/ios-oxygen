@@ -267,10 +267,10 @@ index b0c97c4..4455ff0 100755
  	bzero(&e, sizeof(e));
 diff --git a/iokit/Kernel/arm/VinceWiFi.cpp b/iokit/Kernel/arm/VinceWiFi.cpp
 new file mode 100644
-index 0000000..a773325
+index 0000000..b737d86
 --- /dev/null
 +++ b/iokit/Kernel/arm/VinceWiFi.cpp
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,248 @@
 +/*
 + * VINCE Wi-Fi in the IORegistry, X7 of reports/OVERNIGHT_PLAN.md.
 + *
@@ -288,6 +288,7 @@ index 0000000..a773325
 +#if defined(ARM64_BOARD_CONFIG_VINCE)
 +#include <device/device_types.h>
 +#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
 +#include <IOKit/IOUserClient.h>
 +#include <IOKit/IOKitKeys.h>
 +#include <IOKit/IOLib.h>
