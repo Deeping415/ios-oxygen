@@ -1,0 +1,632 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8bec50e..9423edf 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/vince_mmc.c			standard
++bsd/dev/vince_input.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/vince_input.c b/bsd/dev/vince_input.c
+new file mode 100644
+index 0000000..05294a8
+--- /dev/null
++++ b/bsd/dev/vince_input.c
+@@ -0,0 +1,546 @@
++/*
++ * VINCE (Redmi 5 Plus, MSM8953) keys and touch screen for SweetHID.cpp.
++ * Started once from vince_mmc.c after the root device is up; each source
++ * runs on its own kernel thread and feeds sweet_hid_key()/sweet_hid_touch().
++ *
++ * Keys (polled every 20 ms): power = PM8953 PON INT_RT_STS (0x810) bit 0,
++ * volume down = bit 1, read through the SPMI arbiter v2 observer channel
++ * (EE 0, read only); volume up = TLMM GPIO 85 (input, pull-up, active low,
++ * set up by LK).
++ *
++ * Touch: Synaptics TD4310 TDDI, RMI4 over I2C at 0x20 on BLSP1 QUP3. LK
++ * leaves it alone (clock off, pins plain GPIO, held in reset by GPIO 64's
++ * pull-down), so the thread sets pins, reset, clock and the QUP up itself.
++ * The QUP is polled in FIFO mode with v1 tags (Linux i2c-qup.c v1 path),
++ * one START..STOP transaction per message. Reports: F01 interrupt status,
++ * then F12 data1 (8 bytes per finger: type, x, y, z, wx, wy) for the first
++ * VINCE_TOUCH_FINGERS fingers; the 32-byte input FIFO limits one read to 4.
++ * Coordinates are panel pixels (1080x2160). Proven first in the shim
++ * (vince-bringup/shim/touch.c). The only controller writes are the RMI4
++ * page select (0xFF).
++ *
++ * Boot-args: vincekeys=0 / vincetouch=0 turn a source off.
++ */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void vince_input_start(void);
++
++#define SPMI_CORE_PA    0x0200f000u
++#define SPMI_CNFG_PA    0x0200a000u
++#define SPMI_OBS_PA     0x02c00000u
++#define PON_PPID        0x008u
++#define PON_RT_STS      0x0810u
++#define NO_APID         0xffffu
++
++#define TLMM_PA         0x01000000u
++#define TLMM_SIZE       0x56000u
++#define GPIO_CTL(n)     ((uint32_t)(n) * 0x1000u)
++#define GPIO_IO(n)      (GPIO_CTL(n) + 4u)
++#define GPIO_SDA        10
++#define GPIO_SCL        11
++#define GPIO_RST        64
++#define GPIO_ATTN       65
++#define GPIO_VOLUP      85
++
++#define GCC_QUP3_PA     0x01804000u     /* blsp1_qup3_i2c_apps: RCG CMD +0, CFG +4, CBCR +0x20 */
++#define QUP3_PA         0x078b7000u
++
++#define QUP_CONFIG      0x000u
++#define QUP_STATE       0x004u
++#define QUP_IO_MODE     0x008u
++#define QUP_SW_RESET    0x00cu
++#define QUP_OPERATIONAL 0x018u
++#define QUP_ERROR_FLAGS 0x01cu
++#define QUP_HW_VERSION  0x030u
++#define QUP_MX_OUT_CNT  0x100u
++#define QUP_OUT_FIFO    0x110u
++#define QUP_MX_WR_CNT   0x150u
++#define QUP_MX_IN_CNT   0x200u
++#define QUP_MX_RD_CNT   0x208u
++#define QUP_IN_FIFO     0x218u
++#define QUP_CLK_CTL     0x400u
++#define QUP_I2C_STATUS  0x404u
++
++#define ST_RESET        0u
++#define ST_RUN          1u
++#define ST_PAUSE        3u
++#define ST_MASK         3u
++#define ST_VALID        (1u << 2)
++#define ST_MAST_GEN     (1u << 4)
++#define OP_OUT_NOT_EMPTY (1u << 4)
++#define OP_IN_NOT_EMPTY (1u << 5)
++#define OP_OUT_SVC      (1u << 8)
++#define OP_IN_SVC       (1u << 9)
++#define OP_MX_OUT_DONE  (1u << 10)
++#define CFG_NO_INPUT    (1u << 7)
++#define CFG_I2C         ((2u << 8) | 15u)       /* I2C mini core, 16-bit entries */
++#define IO_REPACK       0xc000u
++#define I2C_ERR_MASK    0x38000fcu
++#define I2C_NACK        (1u << 3)
++#define I2C_BUS_ACTIVE  (1u << 8)
++#define QUP_ERR_MASK    0x7cu
++#define TAG_START       0x100u
++#define TAG_DATA        0x200u
++#define TAG_STOP        0x300u
++#define TAG_REC         0x400u
++#define CLK_CTL_400K    0xe031cu                /* 19.2 MHz XO, Linux's fast-mode divider */
++#define CLK_CTL_100K    0x35du                  /* what the shim proved */
++
++#define RMI_ADDR        0x20
++#define VINCE_TOUCH_FINGERS 4
++#define TOUCH_POLL_MS   8
++
++static vm_offset_t spmi_core, spmi_cnfg, spmi_obs, tlmm, gcc, qup;
++static uint32_t qup_in_fifo, qup_out_fifo, qup_clk_ctl = CLK_CTL_400K;
++static int rmi_page = -1;
++static bool input_started;
++static int keys_chan, touch_chan;
++
++static uint32_t
++in_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++in_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++in_sleep(int *chan, unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- keys ---- */
++
++static uint16_t
++spmi_find_apid(uint16_t ppid)
++{
++	for (uint32_t apid = 0; apid < 256; apid++) {
++		uint32_t map = in_rd(spmi_core, 0x800u + 4u * apid);
++		if (map && ((map >> 8) & 0xfffu) == ppid) {
++			return (uint16_t)apid;
++		}
++	}
++	return NO_APID;
++}
++
++/* EXT_READL of one byte on the observer channel; bits 1..3 of STATUS are failed/denied/dropped */
++static bool
++spmi_read(uint16_t addr, uint8_t *out)
++{
++	in_wr(spmi_obs, 0x00u, (1u << 27) | ((uint32_t)(addr & 0xffu) << 4));
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t s = in_rd(spmi_obs, 0x08u);
++		if (s & 0x0eu) {
++			return false;
++		}
++		if (s & 1u) {
++			*out = (uint8_t)in_rd(spmi_obs, 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++keys_thread(void *arg, wait_result_t result)
++{
++	int state[3] = {0, 0, 0};
++	unsigned errors = 0;
++	(void)arg;
++	(void)result;
++	for (;;) {
++		uint8_t pon = 0;
++		bool ok = spmi_read(PON_RT_STS, &pon);
++		int now[3] = {!!(pon & 1u), !(in_rd(tlmm, GPIO_IO(GPIO_VOLUP)) & 1u), !!(pon & 2u)};
++		if (!ok && (errors++ % 250u) == 0) {
++			printf("VINCE INPUT: PON read error\n");
++		}
++		for (int k = 0; k < 3; k++) {
++			if ((k == 1 || ok) && now[k] != state[k]) {
++				state[k] = now[k];
++				printf("VINCE INPUT: key %d %s\n", k, state[k] ? "down" : "up");
++				sweet_hid_key(k, state[k]);
++			}
++		}
++		in_sleep(&keys_chan, 20);
++	}
++}
++
++/* ---- QUP3 I2C ---- */
++
++static int
++qup_poll(uint32_t want, uint32_t mask)
++{
++	for (int i = 0; i < 1000; i++) {
++		uint32_t s = in_rd(qup, QUP_STATE);
++		if ((s & ST_VALID) && (s & mask) == want) {
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++static int
++qup_set_state(uint32_t st)
++{
++	if (qup_poll(0, 0)) {
++		return -1;
++	}
++	in_wr(qup, QUP_STATE, st);
++	return qup_poll(st, ST_MASK);
++}
++
++/* -2 NACK, -3 other bus/QUP error (cleared, QUP left in reset) */
++static int
++qup_check_err(void)
++{
++	uint32_t be = in_rd(qup, QUP_I2C_STATUS) & I2C_ERR_MASK;
++	uint32_t qe = in_rd(qup, QUP_ERROR_FLAGS) & QUP_ERR_MASK;
++	if (!be && !qe) {
++		return 0;
++	}
++	if (qe) {
++		in_wr(qup, QUP_ERROR_FLAGS, qe);
++	}
++	if (be) {
++		in_wr(qup, QUP_I2C_STATUS, be);
++	}
++	in_wr(qup, QUP_STATE, ST_RESET);
++	return (be & I2C_NACK) ? -2 : -3;
++}
++
++/* One START..STOP message: write n bytes of tx, or read n bytes into rx. -4 timeout, -5 too long. */
++static int
++qup_msg(int rd, const uint8_t *tx, uint8_t *rx, uint32_t n)
++{
++	uint32_t addr8 = (RMI_ADDR << 1) | (rd ? 1u : 0u);
++	uint32_t ntx = rd ? 2 : n + 1;
++	uint32_t cfg = CFG_I2C, got = 0;
++	int r;
++
++	if (!n || (rd ? n > qup_in_fifo : ntx > qup_out_fifo)) {
++		return -5;
++	}
++	in_wr(qup, QUP_SW_RESET, 1);
++	if (qup_poll(ST_RESET, ST_MASK)) {
++		return -1;
++	}
++	in_wr(qup, QUP_CONFIG, CFG_I2C);
++	if (qup_poll(ST_MAST_GEN, ST_MAST_GEN)) {
++		return -1;
++	}
++	in_wr(qup, QUP_MX_OUT_CNT, 0);
++	in_wr(qup, QUP_MX_WR_CNT, ntx);
++	if (rd) {
++		in_wr(qup, QUP_MX_IN_CNT, 0);
++		in_wr(qup, QUP_MX_RD_CNT, n);
++	} else {
++		cfg |= CFG_NO_INPUT;
++	}
++	in_wr(qup, QUP_CONFIG, cfg);
++	in_wr(qup, QUP_IO_MODE, IO_REPACK);
++	if (qup_set_state(ST_RUN)) {
++		return -1;
++	}
++	in_wr(qup, QUP_CLK_CTL, qup_clk_ctl);
++	if (qup_set_state(ST_PAUSE)) {
++		return -1;
++	}
++	if (rd) {
++		in_wr(qup, QUP_OUT_FIFO, ((TAG_REC | (n & 0xffu)) << 16) | TAG_START | addr8);
++	} else {
++		/* two 16-bit entries per word: (START, byte 0), (byte 1, byte 2), ...; STOP on the last byte */
++		uint32_t val = TAG_START | addr8;
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t e = (i == n - 1 ? TAG_STOP : TAG_DATA) | tx[i];
++			if (i & 1) {
++				val = e;
++				if (i == n - 1) {
++					in_wr(qup, QUP_OUT_FIFO, val);
++				}
++			} else {
++				in_wr(qup, QUP_OUT_FIFO, val | e << 16);
++			}
++		}
++	}
++	if (qup_set_state(ST_RUN)) {
++		return -1;
++	}
++	for (int t = 0;; t++) {
++		if ((r = qup_check_err())) {
++			return r;
++		}
++		uint32_t op = in_rd(qup, QUP_OPERATIONAL);
++		if (rd) {
++			while (got < n && (in_rd(qup, QUP_OPERATIONAL) & OP_IN_NOT_EMPTY)) {
++				uint32_t v = in_rd(qup, QUP_IN_FIFO);
++				rx[got++] = (uint8_t)v;
++				if (got < n) {
++					rx[got++] = (uint8_t)(v >> 16);
++				}
++			}
++			if (got == n) {
++				break;
++			}
++		} else if (!(op & OP_OUT_NOT_EMPTY) && (op & (OP_MX_OUT_DONE | OP_OUT_SVC))) {
++			break;
++		}
++		if (t >= 20000) {
++			in_wr(qup, QUP_SW_RESET, 1);
++			return -4;
++		}
++		delay(5);
++	}
++	for (int t = 0; in_rd(qup, QUP_I2C_STATUS) & I2C_BUS_ACTIVE; t++) {
++		if (t >= 5000) {
++			return -4;
++		}
++		delay(2);
++	}
++	r = qup_check_err();    /* a NACK on the last byte shows once the bus is idle */
++	in_wr(qup, QUP_OPERATIONAL, OP_OUT_SVC | OP_IN_SVC);
++	if (qup_set_state(ST_RESET) && !r) {
++		r = -1;
++	}
++	return r;
++}
++
++static int
++rmi_read(uint16_t reg, uint8_t *buf, uint32_t n)
++{
++	uint8_t a = (uint8_t)reg;
++	int r = 0;
++	if ((int)(reg >> 8) != rmi_page) {
++		uint8_t sel[2] = {0xff, (uint8_t)(reg >> 8)};
++		r = qup_msg(0, sel, NULL, 2);
++		rmi_page = r ? -1 : (int)(reg >> 8);
++	}
++	if (!r) {
++		r = qup_msg(0, &a, NULL, 1);
++	}
++	if (!r) {
++		r = qup_msg(1, NULL, buf, n);
++	}
++	if (r) {
++		rmi_page = -1;
++	}
++	return r;
++}
++
++/* ---- touch ---- */
++
++static void
++tlmm_cfg(unsigned pin, unsigned func, unsigned pull, unsigned drive, bool out, bool high)
++{
++	if (out) {
++		/* latch first, then the output enable (reset is active low) */
++		in_wr(tlmm, GPIO_IO(pin), (in_rd(tlmm, GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t cfg = in_rd(tlmm, GPIO_CTL(pin)) & ~0x3ffu;
++	in_wr(tlmm, GPIO_CTL(pin), cfg | (func << 2) | pull | (drive << 6) | (out ? 0x200u : 0u));
++}
++
++static bool
++touch_hw_init(void)
++{
++	static const uint8_t blk[4] = {4, 16, 32, 0};
++
++	tlmm_cfg(GPIO_SDA, 2, 0, 0, false, false);      /* blsp_i2c3, no pull (board pull-ups), 2 mA */
++	tlmm_cfg(GPIO_SCL, 2, 0, 0, false, false);
++	tlmm_cfg(GPIO_ATTN, 0, 3, 0, false, false);     /* input, pull-up */
++	tlmm_cfg(GPIO_RST, 0, 3, 3, true, true);        /* out of reset */
++	in_sleep(&touch_chan, 200);
++
++	if (in_rd(gcc, 0x20) & 0x80000000u) {
++		in_wr(gcc, 0x04, 0);                    /* source XO, divider bypass */
++		in_wr(gcc, 0x00, in_rd(gcc, 0x00) | 1u);
++		for (int i = 0; i < 1000 && (in_rd(gcc, 0x00) & 1u); i++) {
++			delay(1);
++		}
++		in_wr(gcc, 0x20, in_rd(gcc, 0x20) | 1u);
++		for (int i = 0; i < 1000 && (in_rd(gcc, 0x20) & 0x80000000u); i++) {
++			delay(1);
++		}
++		if (in_rd(gcc, 0x20) & 0x80000000u) {
++			printf("VINCE INPUT: QUP3 clock did not start (cmd %#x cbcr %#x)\n",
++			    in_rd(gcc, 0x00), in_rd(gcc, 0x20));
++			return false;
++		}
++	}
++	in_wr(qup, QUP_SW_RESET, 1);
++	if (qup_poll(ST_RESET, ST_MASK)) {
++		printf("VINCE INPUT: QUP3 reset timeout (state %#x)\n", in_rd(qup, QUP_STATE));
++		return false;
++	}
++	uint32_t io = in_rd(qup, QUP_IO_MODE);
++	uint32_t ob = blk[io & 3u], ib = blk[(io >> 5) & 3u];
++	if (!ob || !ib) {
++		printf("VINCE INPUT: QUP3 io mode %#x unsupported\n", io);
++		return false;
++	}
++	qup_out_fifo = ob / 2 * (2u << ((io >> 2) & 7u));
++	qup_in_fifo = ib / 2 * (2u << ((io >> 7) & 7u));
++	printf("VINCE INPUT: QUP3 hw %#x io %#x fifo in %u out %u\n",
++	    in_rd(qup, QUP_HW_VERSION), io, qup_in_fifo, qup_out_fifo);
++	return true;
++}
++
++static void
++touch_release_all(void)
++{
++	for (int i = 0; i < VINCE_TOUCH_FINGERS; i++) {
++		sweet_hid_touch(i, 0, 0, 0);
++	}
++}
++
++static void
++touch_thread(void *arg, wait_result_t result)
++{
++	uint16_t f01_data = 0, f12_data = 0;
++	uint8_t f12_mask = 0, bit = 0, d[VINCE_TOUCH_FINGERS * 8];
++	unsigned errors = 0, idle = 0;
++	(void)arg;
++	(void)result;
++
++	if (!touch_hw_init()) {
++		goto out;
++	}
++	/* Page 0 PDT, top down; interrupt bits are given out in this order. */
++	for (int a = 0xe9; a >= 0x0a; a -= 6) {
++		uint8_t e[6];
++		int r = rmi_read((uint16_t)a, e, 6);
++		if (r && a == 0xe9 && qup_clk_ctl != CLK_CTL_100K) {
++			printf("VINCE INPUT: RMI4 read at 400 kHz failed %d, retrying at 100 kHz\n", r);
++			qup_clk_ctl = CLK_CTL_100K;
++			r = rmi_read((uint16_t)a, e, 6);
++		}
++		if (r) {
++			printf("VINCE INPUT: RMI4 PDT read at %#x failed %d\n", a, r);
++			goto out;
++		}
++		if (e[5] == 0 || e[5] == 0xff) {
++			break;
++		}
++		if (e[5] == 0x01) {
++			f01_data = e[3];
++		} else if (e[5] == 0x12) {
++			f12_data = e[3];
++			f12_mask = (uint8_t)(((1u << (e[4] & 7u)) - 1u) << bit);
++		}
++		printf("VINCE INPUT: RMI4 F%02x query %#x ctrl %#x data %#x irqs %u\n",
++		    e[5], e[0], e[2], e[3], e[4] & 7u);
++		bit = (uint8_t)(bit + (e[4] & 7u));
++	}
++	if (!f01_data && !f12_data) {
++		printf("VINCE INPUT: no RMI4 F01/F12; touch off\n");
++		goto out;
++	}
++	printf("VINCE INPUT: touch on, F12 data %#x irq mask %#x, %d fingers\n",
++	    f12_data, f12_mask, VINCE_TOUCH_FINGERS);
++
++	for (;;) {
++		/* the attention line (low) says a report is waiting; check anyway every ~100 ms */
++		if ((in_rd(tlmm, GPIO_IO(GPIO_ATTN)) & 1u) && ++idle < 12) {
++			in_sleep(&touch_chan, TOUCH_POLL_MS);
++			continue;
++		}
++		idle = 0;
++		uint8_t irq = 0;
++		int r = rmi_read((uint16_t)(f01_data + 1), &irq, 1);  /* reading acks the controller */
++		if (!r && (irq & f12_mask)) {
++			r = rmi_read(f12_data, d, sizeof(d));
++			if (!r) {
++				for (int i = 0; i < VINCE_TOUCH_FINGERS; i++) {
++					const uint8_t *p = d + 8 * i;
++					int down = p[0] == 1 || p[0] == 2;     /* finger, stylus */
++					sweet_hid_touch(i, down, p[1] | p[2] << 8, p[3] | p[4] << 8);
++				}
++			}
++		}
++		if (r) {
++			if ((errors++ % 100u) == 0) {
++				printf("VINCE INPUT: touch read error %d (i2c %#x qup %#x)\n", r,
++				    in_rd(qup, QUP_I2C_STATUS), in_rd(qup, QUP_ERROR_FLAGS));
++			}
++			if (errors == 5) {
++				touch_release_all();
++			}
++		} else {
++			errors = 0;
++		}
++		in_sleep(&touch_chan, TOUCH_POLL_MS);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++vince_input_start(void)
++{
++	int keys = 1, touch = 1;
++	thread_t thread;
++
++	if (input_started) {
++		return;
++	}
++	input_started = true;
++	(void)PE_parse_boot_argn("vincekeys", &keys, sizeof(keys));
++	(void)PE_parse_boot_argn("vincetouch", &touch, sizeof(touch));
++	tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
++	if (!tlmm) {
++		printf("VINCE INPUT: TLMM mapping failed\n");
++		return;
++	}
++	if (keys) {
++		spmi_core = ml_io_map(SPMI_CORE_PA, 0x1000);
++		spmi_cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
++		uint16_t apid = spmi_core ? spmi_find_apid(PON_PPID) : NO_APID;
++		uint32_t owner = (apid != NO_APID && spmi_cnfg) ? in_rd(spmi_cnfg, 0x700u + 4u * apid) & 7u : 0;
++		if (apid != NO_APID) {
++			spmi_obs = ml_io_map(SPMI_OBS_PA + 0x8000u * apid, 0x1000);
++		}
++		printf("VINCE INPUT: keys: arbiter %#x PON apid %u owner EE %u\n",
++		    spmi_core ? in_rd(spmi_core, 0) : 0, apid, owner);
++		if (spmi_obs && kernel_thread_start(keys_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("VINCE INPUT: keys not started\n");
++		}
++	}
++	if (touch) {
++		gcc = ml_io_map(GCC_QUP3_PA, 0x1000);
++		qup = ml_io_map(QUP3_PA, 0x1000);
++		if (gcc && qup && kernel_thread_start(touch_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("VINCE INPUT: touch not started\n");
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
+diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
+index 3bc55b0..0300091 100644
+--- a/bsd/dev/vince_mmc.c
++++ b/bsd/dev/vince_mmc.c
+@@ -39,6 +39,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ /* bsd/dev/sweet_sample.c: SMP backtraces of the processes in boot-arg sweetsample (sweet starts it from its UFS root) */
+ extern void sweet_sample_start(void);
++/* bsd/dev/vince_input.c: keys and touch threads for SweetHID */
++extern void vince_input_start(void);
+ 
+ #define SDCC1_PHYS      0x07824000ul    /* MCI core; the SDHCI registers start at +0x900 */
+ #define GCC_SDCC1_PHYS  0x01842000ul    /* SDCC1 BCR, then the apps RCG at +4 */
+@@ -830,6 +832,7 @@ vince_mmc_init(void)
+ 	printf("VINCE MMC: \"%s\" at sector 0x%llx, %llu MiB, %s, %s (8-bit HS 50 MHz, PIO)\n",
+ 	    want, vm.first, vm.nsect * SECTOR >> 20, fs, vm.rw ? "read-write" : "read-only");
+ 	sweet_sample_start();
++	vince_input_start();
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..52207e7 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -356,6 +356,12 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++/* vince: 1080x2160 panel showing the centered part of 1125x2436 (SweetFramebuffer.cpp) */
++#define SWEET_TOUCH_PANEL_H 2160
++#else
++#define SWEET_TOUCH_PANEL_H 2400
++#endif
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -435,9 +441,9 @@ SweetHIDTouch::start(IOService *provider)
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
++	fLogicalH = native ? SWEET_TOUCH_PANEL_H : 2436;
+ 	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	fOffY = (fLogicalH - SWEET_TOUCH_PANEL_H) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -459,7 +465,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	y = y < 0 ? 0 : (y > SWEET_TOUCH_PANEL_H - 1 ? SWEET_TOUCH_PANEL_H - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -473,7 +479,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	}
+ 	if (!was && down) {
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		    y < SWEET_TOUCH_EDGE_PX || y > SWEET_TOUCH_PANEL_H - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
