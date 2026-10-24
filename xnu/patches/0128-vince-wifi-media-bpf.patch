@@ -1,0 +1,106 @@
+diff --git a/bsd/dev/vince_wlan_dxe.c b/bsd/dev/vince_wlan_dxe.c
+index 3c376d9..caa9a26 100755
+--- a/bsd/dev/vince_wlan_dxe.c
++++ b/bsd/dev/vince_wlan_dxe.c
+@@ -569,7 +569,7 @@ note_frame(const volatile uint8_t *buf, uint32_t hdr_off, uint32_t len, uint32_t
+ 				mine &= f[4 + k] == s_filter[k];
+ 				bcast &= f[4 + k] == 0xff;
+ 			}
+-			if (mine || (bcast && type == 2)) {
++			if (mine || (type == 2 && (f[4] & 1))) {   /* unicast to us, or group addressed data (broadcast, multicast) */
+ 				push_frame(f, n, hwch, rssi);
+ 			}
+ 		}
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index 4455ff0..a8e0785 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -26,6 +26,8 @@
+ #include <net/if.h>
+ #include <net/if_types.h>
+ #include <net/if_dl.h>
++#include <net/if_media.h>
++#include <net/bpf.h>
+ #include <net/ethernet.h>
+ #include <net/route.h>
+ #include <net/dlil.h>
+@@ -103,6 +105,7 @@ struct a80211_req {
+ #define A80211_HARDWARE_VERSION 44
+ #define A80211_COUNTRY_CODE     51
+ 
++static bool vif_link_up;
+ static uint32_t a80211_power = 1;               /* APPLE80211_POWER_ON */
+ static uint8_t a80211_seen[2][512 / 8];
+ 
+@@ -279,6 +282,20 @@ vif_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 			return EINVAL;
+ 		}
+ 		return ifnet_set_mtu(ifp, (u_int32_t)ifr->ifr_mtu);
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		/*
++		 * wifid asks every interface it is told about for its media and ignores it unless the media type is
++		 * IFM_IEEE80211 (0x80); the status says whether the link is up.
++		 */
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++
++		ifmr->ifm_current = ifmr->ifm_active = IFM_IEEE80211;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (vif_link_up ? IFM_ACTIVE : 0);
++		ifmr->ifm_count = 0;
++		return 0;
++	}
+ 	case SIOCADDMULTI:
+ 	case SIOCDELMULTI:
+ 		return 0;
+@@ -361,6 +378,7 @@ vif_attach(const uint8_t mac[6])
+ 	}
+ 	ifnet_set_lladdr(vif_ifp, mac, ETHER_ADDR_LEN);
+ 	bcopy(mac, vif_mac, 6);
++	bpfattach(vif_ifp, DLT_EN10MB, sizeof(struct ether_header));
+ 	printf("VINCE WLAN: %s attached, %02x:%02x:%02x:%02x:%02x:%02x\n", if_name(vif_ifp), mac[0], mac[1], mac[2],
+ 	    mac[3], mac[4], mac[5]);
+ 	return 0;
+@@ -485,6 +503,7 @@ vif_tx_drain(void)
+ 			int r = -3;
+ 
+ 			mbuf_copydata(m, 0, len, pkt);
++			bpf_tap_out(vif_ifp, DLT_EN10MB, m, NULL, 0);
+ 			for (int tries = 0; tries < 50 && r == -3; tries++) {
+ 				r = vn_send_eth(pkt, (uint16_t)(pkt[12] << 8 | pkt[13]), pkt + 14, (uint32_t)len - 14);
+ 				if (r == -3) {
+@@ -530,6 +549,7 @@ vif_input(const uint8_t dst[6], const uint8_t src[6], uint16_t etype, const uint
+ 	mbuf_pkthdr_setheader(m, d);
+ 	mbuf_pkthdr_adjustlen(m, -(int)sizeof(struct ether_header));
+ 	mbuf_setdata(m, d + sizeof(struct ether_header), plen);
++	bpf_tap_in(vif_ifp, DLT_EN10MB, m, d, sizeof(struct ether_header));
+ 	bzero(&stats, sizeof(stats));
+ 	stats.packets_in = 1;
+ 	stats.bytes_in = len;
+@@ -800,12 +820,14 @@ vif_up(const struct vn_cfg *c)
+ 		bcopy(vw_mac, vif_mac, 6);
+ 	}
+ 	vif_unconfig();
++	vif_link_up = true;
+ 	return vif_config(c);
+ }
+ 
+ void
+ vif_down(void)
+ {
++	vif_link_up = false;
+ 	if (vif_ifp) {
+ 		ifnet_set_flags(vif_ifp, 0, IFF_RUNNING);
+ 	}
+diff --git a/iokit/Kernel/arm/VinceWiFi.cpp b/iokit/Kernel/arm/VinceWiFi.cpp
+index b737d86..17b9eec 100644
+--- a/iokit/Kernel/arm/VinceWiFi.cpp
++++ b/iokit/Kernel/arm/VinceWiFi.cpp
+@@ -13,7 +13,6 @@
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+-#include <device/device_types.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IOUserClient.h>
