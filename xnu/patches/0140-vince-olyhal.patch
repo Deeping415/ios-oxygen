@@ -1,0 +1,41 @@
+diff --git a/iokit/Kernel/arm/VinceBT.cpp b/iokit/Kernel/arm/VinceBT.cpp
+index c6986d2..25be65d 100755
+--- a/iokit/Kernel/arm/VinceBT.cpp
++++ b/iokit/Kernel/arm/VinceBT.cpp
+@@ -206,6 +206,18 @@ AppleBTHciUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 	}
+ }
+ 
++/*
++ * AppleOLYHAL: libMobileGestalt (in BlueTool, bluetoothd, wifid ...) waits for a service of this class to appear
++ * before it answers the Bluetooth address / capability questions; without one BlueTool sits in IOServiceMatching for
++ * ~60 s and exits. The class carries the controller's address.
++ */
++class AppleOLYHAL : public IOService {
++	OSDeclareDefaultStructors(AppleOLYHAL);
++};
++OSDefineMetaClassAndStructors(AppleOLYHAL, IOService);
++
++static AppleOLYHAL *vbt_oly;
++
+ /* ---- publishing, called from vince_bt.c once the controller's SMD channels are open ---- */
+ 
+ static AppleBTMgmt *vbt_mgmt;
+@@ -265,6 +277,17 @@ vince_bt_iokit_publish(void)
+ 	    !vbt_hci->attach(IOService::getPlatform())) {
+ 		return -2;
+ 	}
++	vbt_oly = new AppleOLYHAL;
++	if (vbt_oly && vbt_oly->init()) {
++		static const uint8_t addr[6] = { 0x02, 0x56, 0x49, 0x4e, 0x43, 0x02 };
++
++		vbt_oly->setProperty("local-mac-address", (void *)addr, 6);
++		vbt_oly->setProperty("BluetoothAddress", (void *)addr, 6);
++		vbt_oly->setProperty("IOBuiltin", true);
++		if (vbt_oly->attach(IOService::getPlatform())) {
++			vbt_oly->registerService();
++		}
++	}
+ 	vbt_mod->registerService();
+ 	vbt_mgmt->registerService();
+ 	vbt_hci->registerService();
