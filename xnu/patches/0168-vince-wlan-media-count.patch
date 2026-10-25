@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index 7a760a6..d255316 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -617,13 +617,38 @@ vif_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 		 * wifid asks every interface it is told about for its media and ignores it unless the media type is
+ 		 * IFM_IEEE80211 (0x80); the status says whether the link is up.
+ 		 */
+-		struct ifmediareq *ifmr = (struct ifmediareq *)data;
+-
+-		ifmr->ifm_current = ifmr->ifm_active = IFM_IEEE80211;
+-		ifmr->ifm_mask = 0;
+-		ifmr->ifm_status = IFM_AVALID | (vif_link_up ? IFM_ACTIVE : 0);
+-		ifmr->ifm_count = 0;
+-		return 0;
++		/*
++		 * configd's KernelEventMonitor publishes State:/Network/Interface/en0/Link (and so IPConfiguration starts
++		 * DHCP) only for an interface that lists at least one media word: ifm_count 0 means "no media, link
++		 * unknown". So report one (IEEE 802.11 autoselect) and copy it out when asked.
++		 */
++		int word = IFM_IEEE80211 | IFM_AUTO;
++		int want, err = 0;
++		user_addr_t ulist;
++
++		if (cmd == SIOCGIFMEDIA64) {
++			struct ifmediareq64 *m = (struct ifmediareq64 *)data;
++
++			want = m->ifm_count;
++			ulist = (user_addr_t)m->ifmu_ulist;
++			m->ifm_current = m->ifm_active = IFM_IEEE80211 | IFM_AUTO;
++			m->ifm_mask = 0;
++			m->ifm_status = IFM_AVALID | (vif_link_up ? IFM_ACTIVE : 0);
++			m->ifm_count = 1;
++		} else {
++			struct ifmediareq32 *m = (struct ifmediareq32 *)data;
++
++			want = m->ifm_count;
++			ulist = (user_addr_t)m->ifmu_ulist;
++			m->ifm_current = m->ifm_active = IFM_IEEE80211 | IFM_AUTO;
++			m->ifm_mask = 0;
++			m->ifm_status = IFM_AVALID | (vif_link_up ? IFM_ACTIVE : 0);
++			m->ifm_count = 1;
++		}
++		if (want >= 1 && ulist != USER_ADDR_NULL) {
++			err = copyout(&word, ulist, sizeof(word));
++		}
++		return err;
+ 	}
+ 	case SIOCGIFDEVMTU:
+ 		ifr->ifr_devmtu.ifdm_current = VIF_MTU;
