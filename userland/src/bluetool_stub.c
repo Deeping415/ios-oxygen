@@ -13,7 +13,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
-extern int proc_name(int pid, void *buffer, uint32_t buffersize);
+#include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <string.h>
@@ -126,12 +126,22 @@ wt_remote(const char *name)
 {
 	pid_t pid = 0;
 
-	for (int p = 1; p < 2048; p++) {
-		char nm[64] = "";
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	size_t sz = 0;
 
-		if (proc_name(p, nm, sizeof nm) > 0 && !strcmp(nm, name)) {
-			pid = p;
+	if (sysctl(mib, 3, NULL, &sz, NULL, 0) == 0) {
+		struct kinfo_proc *kp = malloc(sz + 4096);
+
+		sz += 4096;
+		if (kp && sysctl(mib, 3, kp, &sz, NULL, 0) == 0) {
+			for (size_t i = 0; i < sz / sizeof(*kp); i++) {
+				if (!strcmp(kp[i].kp_proc.p_comm, name)) {
+					pid = kp[i].kp_proc.p_pid;
+				}
+			}
 		}
+		printf("vince-wifitest: sysctl proc list %zu entries\n", kp ? sz / sizeof(*kp) : 0);
+		free(kp);
 	}
 	mach_port_t task = MACH_PORT_NULL;
 	kern_return_t (*tfp)(mach_port_t, int, mach_port_t *) = dlsym(RTLD_DEFAULT, "task_for_pid");
