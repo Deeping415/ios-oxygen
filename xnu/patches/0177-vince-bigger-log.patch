@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+index 0f48af9..1db9539 100755
+--- a/bsd/dev/vince_bt.c
++++ b/bsd/dev/vince_bt.c
+@@ -38,7 +38,7 @@ extern int vince_bt_iokit_publish(void);
+ 
+ #define RXSZ            0x8000u         /* H4 byte ring towards bluetoothd, power of two */
+ #define MAXH4           (4 + 1024 + 64)
+-#define LOGMAX          1500
++#define LOGMAX          100000
+ 
+ static lck_grp_t *vbt_grp;
+ static lck_mtx_t *vbt_lock;
+@@ -536,7 +536,7 @@ vince_bt_hci_write(const uint8_t *d, uint32_t n, uint8_t *out)
+ 		{
+ 			static unsigned wlog;
+ 
+-			if (wlog < 400) {
++			if (wlog < 50000) {
+ 				wlog++;
+ 				printf("VINCE BT: write pipe %u count %u size %u -> status %#x written %u\n", dp[0], dp[1], size, status, written);
+ 			}
+@@ -677,7 +677,7 @@ vince_bt_hci_read(const uint8_t *d, uint32_t n, uint8_t *out)
+ 		for (uint32_t i = 0; i < n; i++) {
+ 			any += dd[i].cnt;
+ 		}
+-		if ((any || ret) && rlog < 400) {
++		if ((any || ret) && rlog < 50000) {
+ 			rlog++;
+ 			printf("VINCE BT: read ret %d items %u (", ret, any);
+ 			for (uint32_t i = 0; i < n; i++) {
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index ddba943..877eb67 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -553,7 +553,7 @@ a80211_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 		bool noisy = rq->type == 11 || rq->type == 21 || rq->type == 103 || rq->type == 19 || rq->type == 254 ||
+ 		    rq->type == 27 || rq->type == 51 || rq->type == 10 || rq->type == 383 || rq->type == 12;
+ 
+-		if (!(*seen & bit) || (nlog < 4000 && !noisy && nlog++ >= 0)) {
++		if (!(*seen & bit) || (nlog < 50000 && !noisy && nlog++ >= 0)) {
+ 			char nm[32];
+ 
+ 			*seen |= bit;
+@@ -843,7 +843,7 @@ vif_trace(const char *dir, const uint8_t *eth, uint32_t len, int r)
+ 	static unsigned n;
+ 	uint16_t et;
+ 
+-	if (n >= 300 || len < 14) {
++	if (n >= 50000 || len < 14) {
+ 		return;
+ 	}
+ 	n++;
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 402a3cf..55c39c4 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -272,7 +272,7 @@ _cnputc(char c, bool poll)
+  * also goes to this RAM ring. vince_conlog_pos counts every byte ever written; the newest byte is at
+  * (pos - 1) % sizeof(vince_conlog). tools/xnulog.py reads it through the shim's USB monitor.
+  */
+-char vince_conlog[1 << 20];
++char vince_conlog[1 << 23];
+ volatile uint64_t vince_conlog_pos;
+ 
+ static void
