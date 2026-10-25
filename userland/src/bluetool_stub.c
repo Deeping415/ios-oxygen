@@ -12,8 +12,11 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
+#include <dirent.h>
 #include <dlfcn.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <time.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <string.h>
@@ -346,6 +349,121 @@ sc_dump(void)
 	CFRelease(u);
 }
 
+/*
+ * wifid's own debug log. With /private/var/Managed Preferences/mobile/com.apple.MobileWiFi.debug.plist saying
+ * WiFiManagerLoggingEnabled = "true" (read when wifid starts, so it takes effect from the next boot on) wifid writes
+ * its full log to /var/mobile/Library/Logs/CrashReporter/WiFi/WiFiManager/wifi-buf-*.log. This copies new lines of the
+ * newest such file to stdout (the kernel console) as "vince-wlog:".
+ */
+#define WLOG_DIR "/var/mobile/Library/Logs/CrashReporter/WiFi/WiFiManager"
+
+static void
+wlog_enable(void)
+{
+	static const char plist[] =
+	    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+	    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+	    "<plist version=\"1.0\">\n<dict>\n\t<key>WiFiManagerLoggingEnabled</key>\n\t<string>true</string>\n</dict>\n</plist>\n";
+	const char *dir = "/private/var/Managed Preferences/mobile";
+	char path[160];
+
+	mkdir("/private/var/Managed Preferences", 0755);
+	mkdir(dir, 0755);
+	snprintf(path, sizeof path, "%s/com.apple.MobileWiFi.debug.plist", dir);
+	if (access(path, F_OK) != 0) {
+		FILE *f = fopen(path, "w");
+
+		if (f) {
+			int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+			size_t sz = 0;
+
+			fputs(plist, f);
+			fclose(f);
+			printf("vince-wlog: wifid debug log enabled; restarting wifid once so it reads it\n");
+			if (sysctl(mib, 3, NULL, &sz, NULL, 0) == 0) {
+				struct kinfo_proc *kp = malloc(sz + 4096);
+
+				sz += 4096;
+				if (kp && sysctl(mib, 3, kp, &sz, NULL, 0) == 0) {
+					for (size_t i = 0; i < sz / sizeof(*kp); i++) {
+						if (!strcmp(kp[i].kp_proc.p_comm, "wifid")) {
+							kill(kp[i].kp_proc.p_pid, SIGTERM);
+						}
+					}
+				}
+				free(kp);
+			}
+		} else {
+			printf("vince-wlog: cannot write %s\n", path);
+		}
+	}
+}
+
+static void *
+wlog_thread(void *arg)
+{
+	char cur[256] = "";
+	long off = 0;
+	static char line[1024];
+
+	(void)arg;
+	for (;;) {
+		DIR *d = opendir(WLOG_DIR);
+		char best[256] = "";
+		time_t bt = 0;
+
+		if (d) {
+			struct dirent *e;
+
+			while ((e = readdir(d))) {
+				char p[256];
+				struct stat st;
+
+				if (strncmp(e->d_name, "wifi-buf-", 9) != 0) {
+					continue;
+				}
+				snprintf(p, sizeof p, "%s/%s", WLOG_DIR, e->d_name);
+				if (stat(p, &st) == 0 && st.st_mtime >= bt) {
+					bt = st.st_mtime;
+					strlcpy(best, p, sizeof best);
+				}
+			}
+			closedir(d);
+		}
+		if (best[0] && strcmp(best, cur) != 0) {
+			strlcpy(cur, best, sizeof cur);
+			off = 0;
+			printf("vince-wlog: following %s\n", cur);
+		}
+		if (cur[0]) {
+			FILE *f = fopen(cur, "r");
+
+			if (f) {
+				int n = 0;
+
+				fseek(f, off, SEEK_SET);
+				while (n < 400 && fgets(line, sizeof line, f)) {
+					size_t l = strlen(line);
+
+					if (l && line[l - 1] == '\n') {
+						line[l - 1] = '\0';
+					} else if (!feof(f)) {
+						continue;       /* an over-long line: its rest follows */
+					} else {
+						break;          /* a partial last line: read it next time */
+					}
+					off = ftell(f);
+					printf("vince-wlog: %.300s\n", line);
+					n++;
+				}
+				fclose(f);
+			}
+		}
+		sleep(3);
+	}
+	return NULL;
+}
+
 static void *
 sc_thread(void *arg)
 {
@@ -364,9 +482,11 @@ main(int argc, char **argv)
 	(void)argv;
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	printf("vince-bluetool: stand-in for com.apple.BlueTool starting\n");
-	pthread_t wt, sct;
+	pthread_t wt, sct, wlt;
 	pthread_create(&wt, NULL, wt_thread, NULL);
 	pthread_create(&sct, NULL, sc_thread, NULL);
+	wlog_enable();
+	pthread_create(&wlt, NULL, wlog_thread, NULL);
 	xpc_connection_t listener = xpc_connection_create_mach_service("com.apple.BlueTool", dispatch_get_main_queue(), LISTENER);
 	if (!listener) {
 		printf("vince-bluetool: cannot create the service\n");
