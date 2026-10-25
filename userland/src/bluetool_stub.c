@@ -13,7 +13,8 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
-#include <libproc.h>
+extern int proc_listallpids(void *buffer, int buffersize);
+extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 #include <mach/mach.h>
 #include <pthread.h>
 #include <string.h>
