@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index e6758e6..3ab6c55 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -46,7 +46,8 @@ unix_syscall(struct arm_saved_state * regs, thread_t thread_act, struct proc * p
+ 
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ extern int vince_trace_on;
+-extern void vince_sc_trace(const char *comm, int code, uint64_t *arg, int error, int ret, int exit_entry);
++extern void vince_sc_trace(const char *comm, int code, uint64_t *arg, int error, int ret, int exit_entry, uint64_t pc,
++    uint64_t lr, uint64_t fp);
+ #endif
+ 
+ static int      arm_get_syscall_args(uthread_t, struct arm_saved_state *, const struct sysent *);
+@@ -184,7 +185,8 @@ unix_syscall(
+ 
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ 	if (__improbable(vince_trace_on) && code == 1) {
+-		vince_sc_trace(proc->p_comm, code, &uthread->uu_arg[0], 0, 0, 1);
++		vince_sc_trace(proc->p_comm, code, &uthread->uu_arg[0], 0, 0, 1, get_saved_state_pc(state),
++		    get_saved_state_lr(state), get_saved_state_fp(state));
+ 	}
+ #endif
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+@@ -192,7 +194,7 @@ unix_syscall(
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ 	if (__improbable(vince_trace_on)) {
+-		vince_sc_trace(proc->p_comm, code, &uthread->uu_arg[0], error, (int)uthread->uu_rval[0], 0);
++		vince_sc_trace(proc->p_comm, code, &uthread->uu_arg[0], error, (int)uthread->uu_rval[0], 0, 0, 0, 0);
+ 	}
+ #endif
+ 
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+index a7c82f3..47a48ab 100755
+--- a/bsd/dev/vince_bt.c
++++ b/bsd/dev/vince_bt.c
+@@ -404,7 +404,8 @@ static char vince_trace_name[MAXCOMLEN + 1];
+ static int vince_trace_budget = 8000;
+ 
+ void
+-vince_sc_trace(const char *comm, int code, uint64_t *arg, int error, int ret, int exit_entry)
++vince_sc_trace(const char *comm, int code, uint64_t *arg, int error, int ret, int exit_entry, uint64_t pc,
++    uint64_t lr, uint64_t fp)
+ {
+ 	char path[96];
+ 	size_t len = 0;
+@@ -429,7 +430,17 @@ vince_sc_trace(const char *comm, int code, uint64_t *arg, int error, int ret, in
+ 		break;
+ 	}
+ 	if (exit_entry) {
+-		printf("VINCE TRC: %s exit(%d)\n", comm, (int)arg[0]);
++		uint64_t fr[2];
++		const uint64_t mask = 0x7fffffffffULL;
++
++		printf("VINCE TRC: %s exit(%d) pc %llx lr %llx\n", comm, (int)arg[0], pc & mask, lr & mask);
++		for (int i = 0; i < 12 && fp != 0; i++) {
++			if (copyin((user_addr_t)(fp & mask), fr, sizeof(fr)) != 0) {
++				break;
++			}
++			printf("VINCE TRC:   frame %d ret %llx\n", i, fr[1] & mask);
++			fp = fr[0];
++		}
+ 	} else {
+ 		printf("VINCE TRC: %s sc %d a0 %llx%s%s%s err %d ret %d\n", comm, code, arg[0],
+ 		    haspath ? " \"" : "", haspath ? path : "", haspath ? "\"" : "", error, ret);
