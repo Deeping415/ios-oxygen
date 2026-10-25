@@ -431,7 +431,9 @@ wlog_thread(void *arg)
 				char p[256];
 				struct stat st;
 
-				if (strncmp(e->d_name, "wifi-buf-", 9) != 0) {
+				size_t nl = strlen(e->d_name);
+
+				if (nl < 5 || strcmp(e->d_name + nl - 4, ".log") != 0) {
 					continue;
 				}
 				snprintf(p, sizeof p, "%s/%s", WLOG_DIR, e->d_name);
@@ -587,7 +589,8 @@ pb_walk(const char *dir, int depth, bool move)
 		if (strstr(e->d_name, "PRDataStore") || strstr(e->d_name, "PosterBoard") || strstr(e->d_name, "Poster")) {
 			pb_hits++;
 			printf("vince-pb: found %s\n", p);
-			if (move && strncmp(e->d_name, "PRDataStore", 11) == 0 && !strstr(e->d_name, ".vince-bak")) {
+			if (move && (strncmp(e->d_name, "PRDataStore", 11) == 0 || strcmp(e->d_name, "PRBPosterExtensionDataStore") == 0) &&
+			    !strstr(e->d_name, ".vince-bak")) {
 				char r[1100];
 
 				snprintf(r, sizeof r, "%s.vince-bak", p);
@@ -605,7 +608,7 @@ pb_walk(const char *dir, int depth, bool move)
 static void *
 pb_thread(void *arg)
 {
-	const char *marker = "/private/var/tmp/vince-pbreset2-done";
+	const char *marker = "/private/var/tmp/vince-pbreset3-done";
 	bool move = access(marker, F_OK) != 0;
 
 	(void)arg;
