@@ -1,0 +1,474 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 58782e3..dc76709 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/vince_input.c			standard
+ bsd/dev/vince_ctl.c			standard
+ bsd/dev/vince_smd.c			standard
+ bsd/dev/vince_pmic.c			standard
++bsd/dev/vince_bt.c			standard
+ bsd/dev/vince_wlan.c			standard
+ bsd/dev/vince_wlan_dxe.c		standard
+ bsd/dev/vince_wlan_if.c		standard
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+new file mode 100755
+index 0000000..67a3edb
+--- /dev/null
++++ b/bsd/dev/vince_bt.c
+@@ -0,0 +1,437 @@
++/*
++ * VINCE Bluetooth: /dev/uart.bluetooth and /dev/cu.bluetooth speaking HCI H4 to the Pronto BT controller over SMD,
++ * B1 of reports/WIFI_BT_PLAN.md. iOS's bluetoothd opens one of these serial ports (device tree
++ * "bluetooth"/transport-encoding = 1 selects H4) and sends HCI commands; the controller's two SMD channels are
++ *   APPS_RIVA_BT_CMD: commands in, events out (no H4 type byte), proven with an HCI Reset in vince_smd.c
++ *   APPS_RIVA_BT_ACL: ACL data both ways (no type byte).
++ * This file adds the type byte on the way up (0x04 event, 0x02 ACL), strips it on the way down, and answers the
++ * vendor commands (OGF 0x3f: Broadcom / Apple bring-up) locally, because the Qualcomm Iris controller does not know
++ * them. It is a character device, not a tty: ioctls that bluetoothd uses on a serial port are accepted and ignored.
++ *
++ * Boot-arg vincebt=1 starts the bridge (default off). Log lines start with "VINCE BT:" (tools/xnulog.py --con).
++ * The first commands/events are logged to learn bluetoothd's bring-up sequence.
++ */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/ioctl.h>
++#include <sys/termios.h>
++#include <sys/uio.h>
++#include <sys/proc.h>
++#include <sys/select.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/ttycom.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include "vince_smd.h"
++
++extern kern_return_t thread_terminate(thread_t);
++void vince_bt_start(void);
++
++#define RXSZ            0x8000u         /* H4 byte ring towards bluetoothd, power of two */
++#define MAXH4           (4 + 1024 + 64)
++#define LOGMAX          160
++
++static lck_grp_t *vbt_grp;
++static lck_mtx_t *vbt_lock;
++static uint8_t vbt_rx[RXSZ];
++static uint32_t vbt_head, vbt_tail;             /* free-running */
++static struct selinfo vbt_sel;
++static struct vsmd_ch vbt_cmd, vbt_acl;
++static bool vbt_up;
++static int vbt_opens;
++static int vbt_logged;
++static struct termios vbt_tios;
++static int vbt_major = -1;
++
++/* host -> controller: H4 stream assembly */
++static uint8_t vbt_tx[MAXH4];
++static uint32_t vbt_txn;
++
++static void
++vbt_log(const char *what, const uint8_t *p, uint32_t n)
++{
++	char s[3 * 24 + 1];
++	uint32_t k = n < 24 ? n : 24;
++
++	if (vbt_logged >= LOGMAX) {
++		return;
++	}
++	vbt_logged++;
++	for (uint32_t i = 0; i < k; i++) {
++		snprintf(s + 3 * i, 4, "%02x ", p[i]);
++	}
++	s[3 * k] = 0;
++	printf("VINCE BT: %s %u bytes: %s\n", what, n, s);
++}
++
++static uint32_t
++vbt_rx_avail(void)
++{
++	return vbt_head - vbt_tail;
++}
++
++/* controller -> host: one H4 packet into the ring (caller does not hold the lock) */
++static void
++vbt_rx_push(uint8_t type, const uint8_t *p, uint32_t n)
++{
++	lck_mtx_lock(vbt_lock);
++	if (RXSZ - vbt_rx_avail() < n + 1) {
++		lck_mtx_unlock(vbt_lock);
++		printf("VINCE BT: rx ring full, packet dropped\n");
++		return;
++	}
++	vbt_rx[vbt_head++ & (RXSZ - 1)] = type;
++	for (uint32_t i = 0; i < n; i++) {
++		vbt_rx[vbt_head++ & (RXSZ - 1)] = p[i];
++	}
++	lck_mtx_unlock(vbt_lock);
++	wakeup(&vbt_head);
++	selwakeup(&vbt_sel);
++}
++
++/* a command the controller must not see: Command Complete with status 0 */
++static void
++vbt_fake_complete(uint16_t opcode)
++{
++	uint8_t ev[6] = { 0x0e, 0x04, 0x01, (uint8_t)opcode, (uint8_t)(opcode >> 8), 0x00 };
++
++	vbt_rx_push(0x04, ev, sizeof(ev));
++}
++
++/* one complete H4 packet from bluetoothd */
++static void
++vbt_send_packet(const uint8_t *p, uint32_t n)
++{
++	if (!vbt_up) {
++		return;
++	}
++	vbt_log("host->ctrl", p, n);
++	switch (p[0]) {
++	case 0x01: {            /* command: opcode(2) len(1) params */
++		uint16_t op = (uint16_t)(p[1] | p[2] << 8);
++
++		if ((op >> 10) == 0x3f) {
++			vbt_fake_complete(op);          /* vendor command: answered here */
++			return;
++		}
++		(void)vince_smd_send(&vbt_cmd, p + 1, n - 1);
++		break;
++	}
++	case 0x02:              /* ACL */
++		(void)vince_smd_send(&vbt_acl, p + 1, n - 1);
++		break;
++	default:
++		break;          /* SCO and anything else: not supported */
++	}
++}
++
++/* feed bytes from write(): split the stream into H4 packets */
++static void
++vbt_feed(const uint8_t *b, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t need = 0;
++
++		if (vbt_txn >= sizeof(vbt_tx)) {
++			vbt_txn = 0;
++		}
++		vbt_tx[vbt_txn++] = b[i];
++		switch (vbt_tx[0]) {
++		case 0x01:
++			need = vbt_txn >= 4 ? 4u + vbt_tx[3] : 0;
++			break;
++		case 0x02:
++			need = vbt_txn >= 5 ? 5u + (uint32_t)(vbt_tx[3] | vbt_tx[4] << 8) : 0;
++			break;
++		case 0x03:
++			need = vbt_txn >= 4 ? 4u + vbt_tx[3] : 0;
++			break;
++		default:
++			vbt_txn = 0;    /* out of sync: drop the byte */
++			continue;
++		}
++		if (need && vbt_txn == need) {
++			vbt_send_packet(vbt_tx, vbt_txn);
++			vbt_txn = 0;
++		}
++	}
++}
++
++/* ---- character device ---- */
++
++static int
++vbt_open(dev_t dev, int flags, int devtype, proc_t p)
++{
++#pragma unused(dev, flags, devtype, p)
++	vbt_opens++;
++	return 0;
++}
++
++static int
++vbt_close(dev_t dev, int flags, int mode, proc_t p)
++{
++#pragma unused(dev, flags, mode, p)
++	if (vbt_opens > 0) {
++		vbt_opens--;
++	}
++	return 0;
++}
++
++static int
++vbt_read(dev_t dev, struct uio *uio, int ioflag)
++{
++	int err = 0;
++
++	if (minor(dev) >= 2) {
++		return 0;               /* /dev/btwake, /dev/uart.log: nothing to read */
++	}
++	lck_mtx_lock(vbt_lock);
++	while (vbt_rx_avail() == 0) {
++		if (ioflag & IO_NDELAY) {
++			lck_mtx_unlock(vbt_lock);
++			return EWOULDBLOCK;
++		}
++		err = msleep(&vbt_head, vbt_lock, PCATCH | PRIBIO, "vbtread", NULL);
++		if (err) {
++			lck_mtx_unlock(vbt_lock);
++			return err;
++		}
++	}
++	while (vbt_rx_avail() > 0 && uio_resid(uio) > 0 && !err) {
++		uint8_t chunk[256];
++		uint32_t n = vbt_rx_avail();
++		uint32_t want = (uint32_t)uio_resid(uio);
++
++		if (n > sizeof(chunk)) {
++			n = sizeof(chunk);
++		}
++		if (n > want) {
++			n = want;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			chunk[i] = vbt_rx[(vbt_tail + i) & (RXSZ - 1)];
++		}
++		lck_mtx_unlock(vbt_lock);
++		err = uiomove((caddr_t)chunk, (int)n, uio);
++		lck_mtx_lock(vbt_lock);
++		if (!err) {
++			vbt_tail += n;
++		}
++	}
++	lck_mtx_unlock(vbt_lock);
++	return err;
++}
++
++static int
++vbt_write(dev_t dev, struct uio *uio, int ioflag)
++{
++#pragma unused(ioflag)
++	int err = 0;
++
++	while (uio_resid(uio) > 0 && !err) {
++		uint8_t chunk[512];
++		int n = (int)uio_resid(uio) > (int)sizeof(chunk) ? (int)sizeof(chunk) : (int)uio_resid(uio);
++
++		err = uiomove((caddr_t)chunk, n, uio);
++		if (!err && minor(dev) < 2) {
++			vbt_feed(chunk, (uint32_t)n);
++		}
++	}
++	return err;
++}
++
++static int
++vbt_select(dev_t dev, int which, void *wql, proc_t p)
++{
++	int ready = 0;
++
++	if (which == FWRITE) {
++		return 1;
++	}
++	if (which != FREAD || minor(dev) >= 2) {
++		return 0;
++	}
++	lck_mtx_lock(vbt_lock);
++	ready = vbt_rx_avail() > 0;
++	if (!ready) {
++		selrecord(p, &vbt_sel, wql);
++	}
++	lck_mtx_unlock(vbt_lock);
++	return ready;
++}
++
++static int
++vbt_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, proc_t p)
++{
++#pragma unused(dev, fflag, p)
++	static int unk;
++
++	switch (cmd) {
++	case TIOCGETA:
++		bcopy(&vbt_tios, data, sizeof(vbt_tios));
++		return 0;
++	case TIOCSETA:
++	case TIOCSETAW:
++	case TIOCSETAF:
++		bcopy(data, &vbt_tios, sizeof(vbt_tios));
++		return 0;
++	case FIONREAD:
++		*(int *)(void *)data = (int)vbt_rx_avail();
++		return 0;
++	case TIOCOUTQ:
++		*(int *)(void *)data = 0;
++		return 0;
++	case TIOCMGET:
++		*(int *)(void *)data = TIOCM_CAR | TIOCM_CTS | TIOCM_DSR | TIOCM_DTR | TIOCM_RTS;
++		return 0;
++	case TIOCMSET:
++	case TIOCMBIS:
++	case TIOCMBIC:
++	case TIOCSDTR:
++	case TIOCCDTR:
++	case TIOCSBRK:
++	case TIOCCBRK:
++	case TIOCEXCL:
++	case TIOCNXCL:
++	case TIOCSCTTY:
++	case TIOCDRAIN:
++	case TIOCFLUSH:
++	case FIONBIO:
++	case FIOASYNC:
++	case TIOCSETD:
++		return 0;
++	case TIOCGETD:
++		*(int *)(void *)data = 0;
++		return 0;
++	default:
++		if (IOCGROUP(cmd) == 'T') {
++			return 0;       /* IOSSIOSPEED and the other IOKit serial additions */
++		}
++		if (unk < 20) {
++			unk++;
++			printf("VINCE BT: ioctl %#lx not handled\n", cmd);
++		}
++		return ENOTTY;
++	}
++}
++
++static const struct cdevsw vbt_cdevsw = {
++	.d_open       = vbt_open,
++	.d_close      = vbt_close,
++	.d_read       = vbt_read,
++	.d_write      = vbt_write,
++	.d_ioctl      = vbt_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_select     = vbt_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++/* ---- the SMD side ---- */
++
++static void
++vbt_thread(void *arg, wait_result_t w)
++{
++#pragma unused(arg, w)
++	uint8_t buf[MAXH4];
++	int r = -1;
++
++	for (int i = 0; i < 480 && (!vince_smd_find("APPS_RIVA_BT_CMD", &vbt_cmd) || !vince_smd_find("APPS_RIVA_BT_ACL", &vbt_acl)); i++) {
++		vince_smd_sleep(250);
++	}
++	if (!vince_smd_find("APPS_RIVA_BT_CMD", &vbt_cmd) || !vince_smd_find("APPS_RIVA_BT_ACL", &vbt_acl)) {
++		printf("VINCE BT: no BT channels (Pronto not started by the shim?)\n");
++		goto out;
++	}
++	for (int i = 0; i < 20 && (r = vince_smd_open(&vbt_cmd)) != 0; i++) {
++		vince_smd_sleep(500);
++	}
++	if (r) {
++		printf("VINCE BT: BT_CMD open failed %d\n", r);
++		goto out;
++	}
++	r = -1;
++	for (int i = 0; i < 20 && (r = vince_smd_open(&vbt_acl)) != 0; i++) {
++		vince_smd_sleep(500);
++	}
++	if (r) {
++		printf("VINCE BT: BT_ACL open failed %d\n", r);
++		goto out;
++	}
++	vbt_up = true;
++	printf("VINCE BT: controller channels open\n");
++	for (;;) {
++		int n, busy = 0;
++
++		n = vince_smd_recv(&vbt_cmd, buf, sizeof(buf), 0);
++		if (n > 0) {
++			vbt_log("ctrl->host event", buf, (uint32_t)n);
++			vbt_rx_push(0x04, buf, (uint32_t)n);
++			busy = 1;
++		}
++		n = vince_smd_recv(&vbt_acl, buf, sizeof(buf), 0);
++		if (n > 0) {
++			vbt_rx_push(0x02, buf, (uint32_t)n);
++			busy = 1;
++		}
++		if (!busy) {
++			vince_smd_sleep(2);
++		}
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++vince_bt_start(void)
++{
++	static bool started;
++	int on = 0;
++	thread_t th;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	(void)PE_parse_boot_argn("vincebt", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	if (!vince_smd_map()) {
++		printf("VINCE BT: SMD mapping failed\n");
++		return;
++	}
++	vbt_grp = lck_grp_alloc_init("vince_bt", LCK_GRP_ATTR_NULL);
++	vbt_lock = lck_mtx_alloc_init(vbt_grp, LCK_ATTR_NULL);
++	bzero(&vbt_tios, sizeof(vbt_tios));
++	vbt_tios.c_cflag = CS8 | CREAD | CLOCAL;
++	vbt_tios.c_ispeed = vbt_tios.c_ospeed = 115200;
++	vbt_major = cdevsw_add(-1, &vbt_cdevsw);
++	if (vbt_major < 0) {
++		printf("VINCE BT: cdevsw_add failed\n");
++		return;
++	}
++	(void)devfs_make_node(makedev(vbt_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.bluetooth");
++	(void)devfs_make_node(makedev(vbt_major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "cu.bluetooth");
++	(void)devfs_make_node(makedev(vbt_major, 2), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "btwake");
++	(void)devfs_make_node(makedev(vbt_major, 3), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.log");
++	if (kernel_thread_start(vbt_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		printf("VINCE BT: /dev/uart.bluetooth and /dev/cu.bluetooth registered (major %d)\n", vbt_major);
++	} else {
++		printf("VINCE BT: thread not started\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 4c34b7e..1653ade 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -31,6 +31,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ void vince_smd_start(void);
+ extern void vince_wlan_start(void);
++extern void vince_bt_start(void);
+ 
+ #define SMEM_PA         0x86300000u
+ #define SMEM_SIZE       0x00100000u
+@@ -475,5 +476,6 @@ vince_smd_start(void)
+ 		}
+ 	}
+ 	vince_wlan_start();
++	vince_bt_start();
+ }
+ #endif /* ARM64_BOARD_CONFIG_VINCE */
