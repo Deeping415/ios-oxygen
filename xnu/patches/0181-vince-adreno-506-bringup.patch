@@ -12,7 +12,7 @@ index de8484d..4b430ef 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/vince_adreno.c b/bsd/dev/vince_adreno.c
 new file mode 100644
-index 0000000..0d38c60
+index 0000000..b5536c7
 --- /dev/null
 +++ b/bsd/dev/vince_adreno.c
 @@ -0,0 +1,542 @@
@@ -70,11 +70,12 @@ index 0000000..0d38c60
 +#define GCC_OXILI_GFX3D_CBCR    0x59020u
 +#define GCC_OXILI_AHB_CBCR      0x59028u
 +#define GCC_BIMC_GPU_CBCR       0x59030u
-+#define GCC_BIMC_GFX_CBCR       0x59034u
 +#define GCC_OXILI_TIMER_CBCR    0x59040u
 +#define GCC_OXILI_AON_CBCR      0x59044u
 +#define GCC_OXILI_CX_GDSCR      0x5904cu
 +#define GCC_CLAMP_IO_CTRL       0x5b00cu
++
++#define GCC_BIMC_GFX_CBCR       0x59034u
 +
 +/* Crypto Engine Clock Registers (Required by TrustZone PAS authentication) */
 +#define GCC_CRYPTO_CMD_RCGR     0x16004u
@@ -285,9 +286,9 @@ index 0000000..0d38c60
 +static bool
 +step5_enable_clocks(void)
 +{
-+	printf("adreno: step 5: enabling GCC OXILI, BIMC and Crypto branch clocks\n");
-+
 +	int i;
++
++	printf("adreno: step 5: enabling GCC OXILI, BIMC and Crypto branch clocks\n");
 +
 +	/* 1. Turn on GFX3D Core RCG root clock sourced from XO (19.2 MHz, div=1 -> 0x1) */
 +	reg_write(gcc_va, GCC_GFX3D_CFG_RCGR, 0x1u);
