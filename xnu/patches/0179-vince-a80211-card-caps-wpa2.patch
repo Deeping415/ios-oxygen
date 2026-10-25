@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index 877eb67..5158fdb 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -279,11 +279,28 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len, uint32_t *val)
+ 		}
+ 		return 0;
+ 	case A80211_CARD_CAPS:
+-		if (get && len >= 16) {
+-			a80211_put32(kb, 0, 1);
+-			kb[4] = 0x0f;                                   /* wep, tkip, aes, aes-ccm */
+-			kb[5] = 0xe0;                                   /* ibss.. (bits 5..7) */
+-			kb[6] = 0x7f;
++		if (get) {
++			bzero(kb, len);
++			if (len >= 13) {
++				/* iOS 16: raw 13-byte capability bitmask
++				 * caps[0]: bit 0=WEP, 1=TKIP, 2=AES, 3=AES_CCM -> 0x0f
++				 * caps[1]: bit 1=SHSLOT, 2=SHPREAMBLE, 4=TKIPMIC, 5=WPA1, 6=WPA2, 7=WPA -> 0xf6
++				 * caps[2]: bit 0=BURST, 1=WME, 2=SHORT_GI_40, 3=SHORT_GI_20, 4=WOW, 5=TSN -> 0xff
++				 */
++				kb[0] = 0x0f;
++				kb[1] = 0xf6;
++				kb[2] = 0xff;
++				kb[3] = 0x2b;
++				kb[4] = 0xad;
++				kb[5] = 0x8c;
++				kb[6] = 0x08;
++			}
++			if (len >= 16) {
++				a80211_put32(kb, 0, 1);
++				kb[4] = 0x0f;
++				kb[5] = 0xf6;
++				kb[6] = 0xff;
++			}
+ 		}
+ 		return 0;
+ 	case A80211_LOCALE:
