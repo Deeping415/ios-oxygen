@@ -1,0 +1,106 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 7fd9be1..e6758e6 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -44,6 +44,11 @@ extern void dtrace_systrace_syscall_return(unsigned short, int, int *);
+ extern void
+ unix_syscall(struct arm_saved_state * regs, thread_t thread_act, struct proc * proc);
+ 
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++extern int vince_trace_on;
++extern void vince_sc_trace(const char *comm, int code, uint64_t *arg, int error, int ret, int exit_entry);
++#endif
++
+ static int      arm_get_syscall_args(uthread_t, struct arm_saved_state *, const struct sysent *);
+ static int      arm_get_u32_syscall_args(uthread_t, arm_saved_state32_t *, const struct sysent *);
+ static void     arm_prepare_u32_syscall_return(const struct sysent *, arm_saved_state_t *, uthread_t, int);
+@@ -177,9 +182,19 @@ unix_syscall(
+ 	}
+ #endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
+ 
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	if (__improbable(vince_trace_on) && code == 1) {
++		vince_sc_trace(proc->p_comm, code, &uthread->uu_arg[0], 0, 0, 1);
++	}
++#endif
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	if (__improbable(vince_trace_on)) {
++		vince_sc_trace(proc->p_comm, code, &uthread->uu_arg[0], error, (int)uthread->uu_rval[0], 0);
++	}
++#endif
+ 
+ #if CONFIG_MACF
+ skip_syscall:
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+index ce00955..a7c82f3 100755
+--- a/bsd/dev/vince_bt.c
++++ b/bsd/dev/vince_bt.c
+@@ -395,6 +395,56 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * Syscall trace of one process (boot-arg vincetrace=<p_comm>, e.g. bluetoothd): every syscall's number, first argument,
++ * path for the path-taking ones, and the errno, called from bsd/dev/arm/systemcalls.c. Used to learn why a daemon quits.
++ */
++int vince_trace_on;
++static char vince_trace_name[MAXCOMLEN + 1];
++static int vince_trace_budget = 8000;
++
++void
++vince_sc_trace(const char *comm, int code, uint64_t *arg, int error, int ret, int exit_entry)
++{
++	char path[96];
++	size_t len = 0;
++	bool haspath = false;
++
++	if (strncmp(comm, vince_trace_name, MAXCOMLEN) != 0 || vince_trace_budget <= 0) {
++		return;
++	}
++	if (!exit_entry && (code == 1)) {
++		return;
++	}
++	vince_trace_budget--;
++	path[0] = 0;
++	switch (code) {
++	case 5: case 8: case 10: case 15: case 33: case 58: case 188: case 190: case 338: case 341: case 5000:
++		haspath = copyinstr((user_addr_t)arg[0], path, sizeof(path), &len) == 0;
++		break;
++	case 463:
++		haspath = copyinstr((user_addr_t)arg[1], path, sizeof(path), &len) == 0;
++		break;
++	default:
++		break;
++	}
++	if (exit_entry) {
++		printf("VINCE TRC: %s exit(%d)\n", comm, (int)arg[0]);
++	} else {
++		printf("VINCE TRC: %s sc %d a0 %llx%s%s%s err %d ret %d\n", comm, code, arg[0],
++		    haspath ? " \"" : "", haspath ? path : "", haspath ? "\"" : "", error, ret);
++	}
++}
++
++static void
++vince_trace_init(void)
++{
++	if (PE_parse_boot_argn("vincetrace", vince_trace_name, sizeof(vince_trace_name)) && vince_trace_name[0]) {
++		vince_trace_on = 1;
++		printf("VINCE TRC: tracing syscalls of \"%s\"\n", vince_trace_name);
++	}
++}
++
+ void
+ vince_bt_start(void)
+ {
+@@ -402,6 +452,8 @@ vince_bt_start(void)
+ 	int on = 0;
+ 	thread_t th;
+ 
++	vince_trace_init();
++
+ 	if (started) {
+ 		return;
+ 	}
