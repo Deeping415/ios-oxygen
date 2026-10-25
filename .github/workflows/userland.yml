@@ -1,0 +1,37 @@
+name: userland
+
+# iOS arm64 helper programs for the Redmi 5 Plus port (stand-ins and test tools). Each userland/src/NAME.c becomes an
+# ad-hoc signed Mach-O vince-NAME in the artifact "userland-bin".
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/**"
+      - ".github/workflows/userland.yml"
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p out
+          for f in userland/src/*.c; do
+            n=$(basename "$f" .c)
+            n=${n%_stub}
+            xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" -O2 -fblocks \
+              -Wall -o "out/vince-$n" "$f"
+            codesign -f -s - "out/vince-$n"
+            file "out/vince-$n"
+            ls -la "out/vince-$n"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userland-bin
+          path: out/
