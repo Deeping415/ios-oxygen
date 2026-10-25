@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+index 8ef4b6e..b82d741 100755
+--- a/bsd/dev/vince_bt.c
++++ b/bsd/dev/vince_bt.c
+@@ -513,6 +513,14 @@ vince_bt_hci_write(const uint8_t *d, uint32_t n, uint8_t *out)
+ 		}
+ 		vbt_put32(out + 8 * i, status);
+ 		out[8 * i + 4] = (uint8_t)written;
++		{
++			static unsigned wlog;
++
++			if (wlog < 400) {
++				wlog++;
++				printf("VINCE BT: write pipe %u count %u size %u -> status %#x written %u\n", dp[0], dp[1], size, status, written);
++			}
++		}
+ 	}
+ 	return 0;
+ }
+@@ -642,6 +650,22 @@ vince_bt_hci_read(const uint8_t *d, uint32_t n, uint8_t *out)
+ 		vbt_tail += (uint32_t)l;
+ 	}
+ 	lck_mtx_unlock(vbt_lock);
++	{
++		static unsigned rlog;
++		uint32_t any = 0;
++
++		for (uint32_t i = 0; i < n; i++) {
++			any += dd[i].cnt;
++		}
++		if ((any || ret) && rlog < 400) {
++			rlog++;
++			printf("VINCE BT: read ret %d items %u (", ret, any);
++			for (uint32_t i = 0; i < n; i++) {
++				printf("%s%u:%u", i ? " " : "", dd[i].pipe, dd[i].cnt);
++			}
++			printf(")\n");
++		}
++	}
+ 	for (uint32_t i = 0; i < n; i++) {
+ 		uint32_t status = 0;
+ 
+diff --git a/iokit/Kernel/arm/VinceBT.cpp b/iokit/Kernel/arm/VinceBT.cpp
+index 549feb2..30df16e 100755
+--- a/iokit/Kernel/arm/VinceBT.cpp
++++ b/iokit/Kernel/arm/VinceBT.cpp
+@@ -42,7 +42,7 @@ vbt_io_log(const char *what, uint32_t selector, IOExternalMethodArguments *args)
+ 	static unsigned n;
+ 	char name[32];
+ 
+-	if (n >= 200) {
++	if (n >= 600) {
+ 		return;
+ 	}
+ 	n++;
