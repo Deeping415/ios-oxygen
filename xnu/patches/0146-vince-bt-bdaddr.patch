@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+index 7b10bfe..8ef4b6e 100755
+--- a/bsd/dev/vince_bt.c
++++ b/bsd/dev/vince_bt.c
+@@ -123,6 +123,14 @@ vbt_send_packet(const uint8_t *p, uint32_t n)
+ 			vbt_fake_complete(op);          /* vendor command: answered here */
+ 			return;
+ 		}
++		if (op == 0x1009) {
++			/* Read_BD_ADDR: the controller has no persistent address (it answers 00:00:00:00:5a:ad); iOS expects the
++			 * one from the device tree ("local-mac-address", also given to BlueTool as btaddress) */
++			uint8_t ev[12] = { 0x0e, 0x0a, 0x01, 0x09, 0x10, 0x00, 0x02, 0x43, 0x4e, 0x49, 0x56, 0x02 };
++
++			vbt_rx_push(0x04, ev, sizeof(ev));
++			return;
++		}
+ 		(void)vince_smd_send(&vbt_cmd, p + 1, n - 1);
+ 		break;
+ 	}
