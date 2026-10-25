@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index fa66eef..85a4519 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -813,6 +813,36 @@ vif_config(const struct vn_cfg *c)
+ 
+ /* ---- the driver loop ---- */
+ 
++/* one line per frame for the first few hundred: who talks (DHCP, ARP, DNS...) once iOS owns the interface */
++static void
++vif_trace(const char *dir, const uint8_t *eth, uint32_t len, int r)
++{
++	static unsigned n;
++	uint16_t et;
++
++	if (n >= 300 || len < 14) {
++		return;
++	}
++	n++;
++	et = (uint16_t)(eth[12] << 8 | eth[13]);
++	printf("VINCE PKT: %s %u dst %02x:%02x:%02x:%02x:%02x:%02x src %02x:%02x:%02x:%02x:%02x:%02x type %04x", dir, len,
++	    eth[0], eth[1], eth[2], eth[3], eth[4], eth[5], eth[6], eth[7], eth[8], eth[9], eth[10], eth[11], et);
++	if (et == 0x0800 && len >= 14 + 20) {
++		const uint8_t *ip = eth + 14;
++		uint32_t hl = (uint32_t)(ip[0] & 0xf) * 4;
++
++		printf(" ip %u.%u.%u.%u > %u.%u.%u.%u proto %u", ip[12], ip[13], ip[14], ip[15], ip[16], ip[17], ip[18], ip[19], ip[9]);
++		if ((ip[9] == 17 || ip[9] == 6) && len >= 14 + hl + 4) {
++			printf(" ports %u > %u", ip[hl] << 8 | ip[hl + 1], ip[hl + 2] << 8 | ip[hl + 3]);
++		}
++	} else if (et == 0x0806 && len >= 14 + 28) {
++		const uint8_t *a = eth + 14;
++
++		printf(" arp op %u %u.%u.%u.%u > %u.%u.%u.%u", a[7], a[14], a[15], a[16], a[17], a[24], a[25], a[26], a[27]);
++	}
++	printf(" r %d\n", r);
++}
++
+ static void
+ vif_tx_drain(void)
+ {
+@@ -844,6 +874,7 @@ vif_tx_drain(void)
+ 					vince_smd_sleep(1);     /* DXE ring full */
+ 				}
+ 			}
++			vif_trace("tx", pkt, (uint32_t)len, r);
+ 			if (r) {
+ 				ifnet_stat_increment_out(vif_ifp, 0, 0, 1);
+ 			} else {
+@@ -883,6 +914,7 @@ vif_input(const uint8_t dst[6], const uint8_t src[6], uint16_t etype, const uint
+ 	mbuf_pkthdr_setheader(m, d);
+ 	mbuf_pkthdr_adjustlen(m, -(int)sizeof(struct ether_header));
+ 	mbuf_setdata(m, d + sizeof(struct ether_header), plen);
++	vif_trace("rx", d, len, 0);
+ 	bpf_tap_in(vif_ifp, DLT_EN10MB, m, d, sizeof(struct ether_header));
+ 	bzero(&stats, sizeof(stats));
+ 	stats.packets_in = 1;
