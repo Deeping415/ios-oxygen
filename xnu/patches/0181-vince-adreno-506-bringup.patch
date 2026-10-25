@@ -12,10 +12,10 @@ index de8484d..4b430ef 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/vince_adreno.c b/bsd/dev/vince_adreno.c
 new file mode 100644
-index 0000000..5dc2eaf
+index 0000000..7959519
 --- /dev/null
 +++ b/bsd/dev/vince_adreno.c
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,477 @@
 +/*
 + * Xiaomi Redmi 5 Plus (vince) Adreno 506 GPU bringup driver.
 + *
@@ -45,7 +45,10 @@ index 0000000..5dc2eaf
 +
 +#include "vince_gpu_firmware.h"
 +
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 +extern vm_offset_t kvtophys(vm_offset_t va);
++void vince_adreno_init(void);
 +
 +/* ---- Register Bases ---- */
 +#define GCC_BASE_PA             0x01800000u
