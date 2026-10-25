@@ -1,0 +1,39 @@
+diff --git a/bsd/kern/kern_mman.c b/bsd/kern/kern_mman.c
+index 56f3d58..2918dc7 100644
+--- a/bsd/kern/kern_mman.c
++++ b/bsd/kern/kern_mman.c
+@@ -78,6 +78,7 @@
+  */
+ 
+ #include <sys/param.h>
++#include <pexpert/pexpert.h>
+ #include <sys/systm.h>
+ #include <sys/filedesc.h>
+ #include <sys/proc_internal.h>
+@@ -329,6 +330,26 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
+ 	    vm_map_page_mask(user_map));                           /* hi end */
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	/*
++	 * The Cortex-A53 has none of the hardware iOS uses to switch a JIT region between writable and executable, and
++	 * the first write into one faults (Safari's WebContent died copying its first thunks). Refusing MAP_JIT makes
++	 * JavaScriptCore's executable allocator fail its reservation, and JSC then runs without the JIT (interpreter).
++	 * Boot-arg vincejit=1 lets it through again.
++	 */
++	if (flags & MAP_JIT) {
++		static int vince_jit = -1;
++
++		if (vince_jit < 0) {
++			int v = 0;
++
++			vince_jit = PE_parse_boot_argn("vincejit", &v, sizeof(v)) && v;
++		}
++		if (!vince_jit) {
++			return ENOMEM;
++		}
++	}
++#endif
+ 	if (flags & MAP_JIT) {
+ 		if ((flags & MAP_FIXED) ||
+ 		    (flags & MAP_SHARED) ||
