@@ -13,7 +13,9 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <mach/mach.h>
 #include <pthread.h>
+#include <string.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -77,11 +79,70 @@ wt_scan_done(void *dev, const void *results, const void *err, void *ctx)
 	}
 }
 
+static void
+wt_where(const char *tag, uintptr_t pc)
+{
+	Dl_info di;
+
+	if (dladdr((void *)pc, &di) && di.dli_fname) {
+		const char *base = strrchr(di.dli_fname, '/');
+		printf("vince-wifitest:   %s %#lx %s+%#lx (%s)\n", tag, (unsigned long)pc, di.dli_sname ? di.dli_sname : "?",
+		    di.dli_sname ? (unsigned long)(pc - (uintptr_t)di.dli_saddr) : 0ul, base ? base + 1 : di.dli_fname);
+	} else {
+		printf("vince-wifitest:   %s %#lx\n", tag, (unsigned long)pc);
+	}
+}
+
+/* stack of another thread, to see where a stuck MobileWiFi call waits */
+static void
+wt_stack(pthread_t t)
+{
+	mach_port_t mp = pthread_mach_thread_np(t);
+	arm_thread_state64_t st;
+	mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+
+	thread_suspend(mp);
+	if (thread_get_state(mp, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
+		wt_where("pc", (uintptr_t)st.__pc);
+		wt_where("lr", (uintptr_t)st.__lr);
+		uintptr_t fp = (uintptr_t)st.__fp;
+		for (int i = 0; i < 24 && fp && !(fp & 7); i++) {
+			uintptr_t next = ((uintptr_t *)fp)[0];
+			wt_where("fr", ((uintptr_t *)fp)[1]);
+			if (next <= fp || next - fp > (1u << 20)) {
+				break;
+			}
+			fp = next;
+		}
+	}
+	thread_resume(mp);
+}
+
+static volatile int wt_done;
+static pthread_t wt_worker;
+
+static void *wt_work(void *arg);
+
 static void *
 wt_thread(void *arg)
 {
 	(void)arg;
 	sleep(75);
+	pthread_create(&wt_worker, NULL, wt_work, NULL);
+	for (int i = 0; i < 12 && !wt_done; i++) {
+		sleep(20);
+		if (!wt_done && (i & 1)) {
+			printf("vince-wifitest: worker still busy, stack:\n");
+			wt_stack(wt_worker);
+		}
+	}
+	return NULL;
+}
+
+static void *
+wt_work(void *arg)
+{
+	(void)arg;
 	void *h = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi", RTLD_NOW);
 	printf("vince-wifitest: MobileWiFi handle %p\n", h);
 	if (!h) {
@@ -124,6 +185,7 @@ wt_thread(void *arg)
 		}
 		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 25, false);
 	}
+	wt_done = 1;
 	return NULL;
 }
 
