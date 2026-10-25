@@ -1,0 +1,194 @@
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index e703342..a208f61 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -916,6 +916,7 @@ vui_post_assoc(const struct vui_assoc *a)
+ 	lck_mtx_lock(vui_lk);
+ 	vui_a = *a;
+ 	vui_pending |= 2;
++	vui_i.assoc_result = 0;
+ 	lck_mtx_unlock(vui_lk);
+ 	vif_abort = 1;
+ }
+@@ -958,6 +959,14 @@ vui_set_state(int state)
+ 	lck_mtx_unlock(vui_lk);
+ }
+ 
++static void
++vui_set_result(uint32_t r)
++{
++	lck_mtx_lock(vui_lk);
++	vui_i.assoc_result = r;
++	lck_mtx_unlock(vui_lk);
++}
++
+ /* next request for the driver thread: 4 disassociate, 2 associate (copied to *a), 1 scan, 0 none */
+ static int
+ vui_take(struct vui_assoc *a)
+@@ -1101,6 +1110,7 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 	if (!hit) {
+ 		printf("VINCE UI: network not found\n");
+ 		vui_set_state(VUI_S_INIT);
++		vui_set_result(9);
+ 		res[0] = 9;                                     /* APPLE80211_RESULT_TIMEOUT */
+ 		vif_a80211_event(9, res, sizeof(res));
+ 		return 0;
+@@ -1116,6 +1126,7 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 		bool dead = vw_hal_dead(ar.step, ar.err) || vw_fw_crashed();
+ 
+ 		vui_set_state(VUI_S_INIT);
++		vui_set_result(dead ? 9 : 2);
+ 		if (dead) {
+ 			return 1;
+ 		}
+@@ -1137,6 +1148,7 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 			vwpa_stop();
+ 			lr = va_leave(&ap, 1);
+ 			vui_set_state(VUI_S_INIT);
++			vui_set_result(dead ? 9 : 2);
+ 			if (dead || (lr <= -2 && lr >= -5)) {
+ 				return 1;
+ 			}
+@@ -1152,6 +1164,7 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 	bcopy(ap.bssid, vui_i.bssid, 6);
+ 	vui_i.channel = ap.ch;
+ 	vui_i.rssi = ap.rssi;
++	vui_i.assoc_result = 1;
+ 	lck_mtx_unlock(vui_lk);
+ 	vif_ui_up();
+ 	res[0] = 1;                                             /* APPLE80211_RESULT_SUCCESS */
+@@ -1186,6 +1199,7 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 	lr = va_leave(&ap, 1);
+ 	vn_link_reset();
+ 	vui_set_state(VUI_S_INIT);
++	vui_set_result(0);
+ 	vui_link_event(true, 0, why == VIF_END_CMD, why == VIF_END_LOST ? 2 : 3);
+ 	vif_a80211_event(2, NULL, 0);
+ 	vif_a80211_event(3, NULL, 0);
+diff --git a/bsd/dev/vince_wlan.h b/bsd/dev/vince_wlan.h
+index 2b60c0c..f8a82be 100755
+--- a/bsd/dev/vince_wlan.h
++++ b/bsd/dev/vince_wlan.h
+@@ -186,6 +186,7 @@ struct vui_info {
+ 	uint8_t channel;
+ 	int rssi;
+ 	uint32_t scan_gen;              /* bumps with every finished scan */
++	uint32_t assoc_result;          /* ASSOCIATE_RESULT: 0 pending/none, 1 success, 2.. failure (Apple80211 table index) */
+ };
+ bool vui_enabled(void);
+ void vui_post_scan(void);
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index 004cc93..92142e2 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -146,7 +146,7 @@ a80211_channel(uint8_t *b, unsigned off, uint32_t ch)
+ {
+ 	a80211_put32(b, off, 1);
+ 	a80211_put32(b, off + 4, ch);
+-	a80211_put32(b, off + 8, 0x2 | 0x4);            /* 2 GHz, 20 MHz (macOS values; iOS may differ) */
++	a80211_put32(b, off + 8, 0x8 | 0x2 | 0x80);     /* APPLE80211_C_FLAG_2GHZ | 20MHZ | ACTIVE */
+ }
+ 
+ /* one scan table entry as struct apple80211_scan_result (macOS 12 layout, IEs inline); returns the length */
+@@ -227,7 +227,7 @@ a80211_scan_result(uint8_t *b, uint32_t room, const struct vd_bss *e)
+  * every new request type. With the UI layer (vui_enabled) scan / associate / state are real.
+  */
+ static int
+-a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len)
++a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len, uint32_t *val)
+ {
+ 	struct vui_info in;
+ 	bool ui = vui_enabled();
+@@ -320,13 +320,13 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len)
+ 			const struct vd_bss *e = vui_result(a80211_scan_cursor);
+ 
+ 			if (!e) {
+-				return ENOENT;
++				return EIO;                     /* end of the list: Apple80211Scan stops on errno 5 */
+ 			}
+ 			a80211_scan_cursor++;
+ 			(void)a80211_scan_result(kb, len, e);
+ 			return 0;
+ 		}
+-		return get ? ENOENT : 0;
++		return get ? EIO : 0;
+ 	case A80211_ASSOCIATE:
+ 		if (!get && ui) {
+ 			struct vui_assoc a;
+@@ -370,10 +370,13 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len)
+ 			vui_post_disassoc();
+ 		}
+ 		return 0;
+-	case 21:        /* ASSOCIATE_RESULT */
+-		if (get && len >= 8) {
+-			a80211_put32(kb, 0, 1);
+-			a80211_put32(kb, 4, in.state == VUI_S_RUN ? 1 : 0);
++	case 21:        /* ASSOCIATE_RESULT: Apple80211 polls req_val (0 = still joining, 1 = success, 2.. = failure) */
++		if (get) {
++			*val = ui ? in.assoc_result : (in.state == VUI_S_RUN ? 1 : 0);
++			if (len >= 8) {
++				a80211_put32(kb, 0, 1);
++				a80211_put32(kb, 4, *val);
++			}
+ 		}
+ 		return 0;
+ 	case 2:         /* AUTH_TYPE */
+@@ -457,14 +460,15 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len)
+ 			}
+ 		}
+ 		return 0;
+-	case 207:       /* CHANNELS_INFO (itlwm struct apple80211_channels_info, 128 entries per array) */
+-		if (get && len >= 0xa0c) {
++	case 207:       /* CHANNELS_INFO, iOS 16 layout read from IO80211.framework: u16 count at 12, u16 spec[400] at 14,
++	                 * u8 chan_num[400] at 814, five u8[400] flag arrays, u32 flags[400] at 0x12d0 */
++		if (get && len >= 0x12d0 + 4 * 13) {
+ 			a80211_put32(kb, 0, 1);
+-			a80211_put16(kb, 8, 13);
++			a80211_put16(kb, 12, 13);
+ 			for (uint32_t c = 1; c <= 13; c++) {
+-				a80211_put16(kb, 10 + 2 * (c - 1), (uint16_t)c);        /* chan_spec */
+-				kb[0x10a + (c - 1)] = (uint8_t)c;                       /* chan_num */
+-				a80211_put32(kb, 0x60c + 4 * (c - 1), 0);
++				a80211_put16(kb, 14 + 2 * (c - 1), (uint16_t)c);        /* chan_spec */
++				kb[814 + (c - 1)] = (uint8_t)c;                         /* chan_num */
++				a80211_put32(kb, 0x12d0 + 4 * (c - 1), 0x8 | 0x2 | 0x80);
+ 			}
+ 		}
+ 		return 0;
+@@ -505,7 +509,7 @@ a80211_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 		(void)copyin(ua, kb, len);      /* some requests carry parameters in a GET */
+ 	}
+ 	if (!err) {
+-		err = a80211_handle(rq->type, get, kb, len);
++		err = a80211_handle(rq->type, get, kb, len, &rq->val);
+ 	}
+ 	if (rq->type < 512) {
+ 		uint8_t *seen = &a80211_seen[get ? 1 : 0][rq->type / 8];
+@@ -1125,22 +1129,20 @@ void
+ vif_a80211_event(uint32_t code, const void *data, uint32_t len)
+ {
+ 	struct kev_msg ev;
+-	struct net_event_data nd;
++	char ifname[16];
+ 
+ 	if (!vif_ifp) {
+ 		return;
+ 	}
+ 	bzero(&ev, sizeof(ev));
+-	bzero(&nd, sizeof(nd));
+-	nd.if_family = IFNET_FAMILY_ETHERNET;
+-	nd.if_unit = 0;
+-	strlcpy(nd.if_name, "en", sizeof(nd.if_name));
++	bzero(ifname, sizeof(ifname));
++	strlcpy(ifname, "en0", sizeof(ifname));
+ 	ev.vendor_code = KEV_VENDOR_APPLE;
+ 	ev.kev_class = KEV_IEEE80211_CLASS;
+ 	ev.kev_subclass = 1;
+ 	ev.event_code = code;
+-	ev.dv[0].data_length = sizeof(nd);
+-	ev.dv[0].data_ptr = &nd;
++	ev.dv[0].data_length = sizeof(ifname);
++	ev.dv[0].data_ptr = ifname;
+ 	if (len) {
+ 		ev.dv[1].data_length = len;
+ 		ev.dv[1].data_ptr = (void *)(uintptr_t)data;
