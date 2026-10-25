@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/vince_rootfix.c b/bsd/dev/vince_rootfix.c
+index 5ff8aa4..514871c 100755
+--- a/bsd/dev/vince_rootfix.c
++++ b/bsd/dev/vince_rootfix.c
+@@ -58,7 +58,7 @@ vf_write(const char *path, const void *data, size_t len, int mode)
+ 	if (vf_same(path, data, len)) {
+ 		return 0;
+ 	}
+-	err = vnode_open(path, O_WRONLY | O_CREAT | O_TRUNC, mode, 0, &vp, ctx);
++	err = vnode_open(path, FWRITE | O_CREAT | O_TRUNC, mode, 0, &vp, ctx);
+ 	if (err) {
+ 		return err;
+ 	}
