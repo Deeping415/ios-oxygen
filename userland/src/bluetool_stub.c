@@ -194,9 +194,9 @@ static void *
 wt_thread(void *arg)
 {
 	(void)arg;
-	sleep(75);
+	sleep(240);
 	pthread_create(&wt_worker, NULL, wt_work, NULL);
-	for (int i = 0; i < 12 && !wt_done; i++) {
+	for (int i = 0; i < 40 && !wt_done; i++) {
 		sleep(20);
 		if (!wt_done && (i & 1)) {
 			printf("vince-wifitest: worker still busy, stack:\n");
@@ -233,7 +233,7 @@ wt_work(void *arg)
 	if (mgr_sched) {
 		mgr_sched(mgr, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
 	}
-	for (int round = 0; round < 4; round++) {
+	for (int round = 0; round < 8; round++) {
 		if (mgr_getpower) {
 			printf("vince-wifitest: power %d\n", mgr_getpower(mgr));
 		}
@@ -251,7 +251,7 @@ wt_work(void *arg)
 			int r = dev_scan((void *)CFArrayGetValueAtIndex(devs, 0), p, wt_scan_done, NULL);
 			printf("vince-wifitest: scan started -> %d\n", r);
 		}
-		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 25, false);
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 20, false);
 	}
 	wt_done = 1;
 	return NULL;
