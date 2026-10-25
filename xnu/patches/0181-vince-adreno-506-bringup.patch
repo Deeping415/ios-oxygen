@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..0d38c60
 --- /dev/null
 +++ b/bsd/dev/vince_adreno.c
-@@ -0,0 +1,504 @@
+@@ -0,0 +1,518 @@
 +/*
 + * Xiaomi Redmi 5 Plus (vince) Adreno 506 GPU bringup driver.
 + *
@@ -65,13 +65,18 @@ index 0000000..0d38c60
 +
 +/* GCC Registers */
 +#define GCC_GFX3D_CMD_RCGR      0x59000u
++#define GCC_GFX3D_CFG_RCGR      0x59004u
 +#define GCC_OXILI_GX_GDSCR      0x5901cu
 +#define GCC_OXILI_GFX3D_CBCR    0x59020u
 +#define GCC_OXILI_AHB_CBCR      0x59028u
++#define GCC_BIMC_GPU_CBCR       0x59030u
 +#define GCC_OXILI_TIMER_CBCR    0x59040u
 +#define GCC_OXILI_AON_CBCR      0x59044u
 +#define GCC_OXILI_CX_GDSCR      0x5904cu
 +#define GCC_CLAMP_IO_CTRL       0x5b00cu
++
++/* BIMC GFX Interface Clock (Required for GPU access to System DRAM) */
++#define GCC_BIMC_GFX_CBCR       0x31024u
 +
 +/* Crypto Engine Clock Registers (Required by TrustZone PAS authentication) */
 +#define GCC_CRYPTO_CMD_RCGR     0x16004u
@@ -282,16 +287,21 @@ index 0000000..0d38c60
 +static bool
 +step5_enable_clocks(void)
 +{
-+	printf("adreno: step 5: enabling GCC OXILI and Crypto branch clocks\n");
++	printf("adreno: step 5: enabling GCC OXILI, BIMC and Crypto branch clocks\n");
 +
-+	/* 1. Turn on GFX3D Core RCG root clock */
++	/* 1. Turn on GFX3D Core RCG root clock sourced from XO */
++	reg_write(gcc_va, GCC_GFX3D_CFG_RCGR, 0x0);
++	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (1u << 0));
++	delay(10);
 +	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (1u << 1));
 +
-+	/* 2. Turn on OXILI branch clocks */
++	/* 2. Turn on OXILI and BIMC GPU memory interface branch clocks */
 +	reg_write(gcc_va, GCC_OXILI_AHB_CBCR, reg_read(gcc_va, GCC_OXILI_AHB_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_OXILI_GFX3D_CBCR, reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_OXILI_AON_CBCR, reg_read(gcc_va, GCC_OXILI_AON_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_OXILI_TIMER_CBCR, reg_read(gcc_va, GCC_OXILI_TIMER_CBCR) | 1u);
++	reg_write(gcc_va, GCC_BIMC_GPU_CBCR, reg_read(gcc_va, GCC_BIMC_GPU_CBCR) | 1u);
++	reg_write(gcc_va, GCC_BIMC_GFX_CBCR, reg_read(gcc_va, GCC_BIMC_GFX_CBCR) | 1u);
 +
 +	/* 3. Turn on Crypto Engine Root and Branch clocks for TrustZone PAS */
 +	reg_write(gcc_va, GCC_CRYPTO_CMD_RCGR, reg_read(gcc_va, GCC_CRYPTO_CMD_RCGR) | (1u << 1));
@@ -300,9 +310,11 @@ index 0000000..0d38c60
 +	reg_write(gcc_va, GCC_CRYPTO_AXI_CBCR, reg_read(gcc_va, GCC_CRYPTO_AXI_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_CRYPTO_AHB_CBCR, reg_read(gcc_va, GCC_CRYPTO_AHB_CBCR) | 1u);
 +
-+	printf("adreno: step 5: clocks active (AHB=%#x GFX=%#x AON=%#x TIMER=%#x CRYPTO=%#x VOTE=%#x)\n",
++	printf("adreno: step 5: clocks active (AHB=%#x GFX=%#x BIMC_GPU=%#x BIMC_GFX=%#x AON=%#x TIMER=%#x CRYPTO=%#x VOTE=%#x)\n",
 +	    reg_read(gcc_va, GCC_OXILI_AHB_CBCR),
 +	    reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR),
++	    reg_read(gcc_va, GCC_BIMC_GPU_CBCR),
++	    reg_read(gcc_va, GCC_BIMC_GFX_CBCR),
 +	    reg_read(gcc_va, GCC_OXILI_AON_CBCR),
 +	    reg_read(gcc_va, GCC_OXILI_TIMER_CBCR),
 +	    reg_read(gcc_va, GCC_CRYPTO_CBCR),
@@ -416,10 +428,12 @@ index 0000000..0d38c60
 +	uint64_t ans = 0;
 +	int32_t ret;
 +
-+	/* Re-assert proxy votes for Crypto Engine and GFX3D root clock */
++	/* Re-assert proxy votes for Crypto Engine, GFX3D root clock, and BIMC memory clocks */
 +	reg_write(gcc_va, GCC_CRYPTO_CMD_RCGR, reg_read(gcc_va, GCC_CRYPTO_CMD_RCGR) | (1u << 1));
 +	reg_write(gcc_va, GCC_APCS_CLOCK_BRANCH_ENA_VOTE, reg_read(gcc_va, GCC_APCS_CLOCK_BRANCH_ENA_VOTE) | 0x7u);
 +	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (1u << 1));
++	reg_write(gcc_va, GCC_BIMC_GPU_CBCR, reg_read(gcc_va, GCC_BIMC_GPU_CBCR) | 1u);
++	reg_write(gcc_va, GCC_BIMC_GFX_CBCR, reg_read(gcc_va, GCC_BIMC_GFX_CBCR) | 1u);
 +
 +	printf("adreno: step 10: calling PAS_AUTH_AND_RESET(GPU)\n");
 +	ret = vince_scm_call("PAS_AUTH_AND_RESET(GPU)", SCM_PAS_AUTH_AND_RESET, ARGS_ONE_VALUE, PAS_GPU, 0, 0, &ans);
