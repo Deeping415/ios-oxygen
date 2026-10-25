@@ -1,0 +1,60 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index c096d64..b8917bf 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -374,6 +374,30 @@ static int execargs_alloc(struct image_params *imgp);
+ static int execargs_free(struct image_params *imgp);
+ static int exec_check_permissions(struct image_params *imgp);
+ static int exec_extract_strings(struct image_params *imgp);
++
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++/* boot-arg vinceenv=PROGRAM:KEY=VALUE adds one environment variable to every exec of PROGRAM (a vnode name), e.g.
++ * vinceenv=bluetoothd:OS_ACTIVITY_DT_MODE=YES makes its os_log output appear on stderr (sweetnull= tees it). */
++static char vince_env_name[32], vince_env_str[96];
++static int vince_env_parsed;
++
++static void
++vince_env_parse(void)
++{
++	char arg[140];
++
++	vince_env_parsed = 1;
++	if (PE_parse_boot_argn("vinceenv", arg, sizeof(arg))) {
++		char *c = strchr(arg, ':');
++
++		if (c) {
++			*c = '\0';
++			strlcpy(vince_env_name, arg, sizeof(vince_env_name));
++			strlcpy(vince_env_str, c + 1, sizeof(vince_env_str));
++		}
++	}
++}
++#endif
+ static int exec_add_apple_strings(struct image_params *imgp, const load_result_t *load_result);
+ static int exec_handle_sugid(struct image_params *imgp);
+ static int sugid_scripts = 0;
+@@ -5746,6 +5770,24 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	if (!vince_env_parsed) {
++		vince_env_parse();
++	}
++	if (vince_env_name[0] && imgp->ip_vp && imgp->ip_vp->v_name && strcmp(imgp->ip_vp->v_name, vince_env_name) == 0) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(vince_env_str), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
