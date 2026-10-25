@@ -1,0 +1,39 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index bfc495b..c096d64 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4055,6 +4055,11 @@ do_fork1:
+ 	 * as 0 and pretends the call succeeded.
+ 	 */
+ 	error = exec_activate_image(imgp);
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	if (error != 0) {
++		printf("VINCE exec failed %d for \"%.60s\"\n", error, imgp->ip_startargv ? imgp->ip_startargv : "?");
++	}
++#endif
+ #if defined(HAS_APPLE_PAC)
+ 	ml_task_set_jop_pid_from_shared_region(new_task);
+ 	ml_task_set_disable_user_jop(new_task, imgp->ip_flags & IMGPF_NOJOP ? TRUE : FALSE);
+@@ -7415,7 +7420,21 @@ process_signature(proc_t p, struct image_params *imgp)
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+-			printf("exec %s\n", p->p_name);
++			if (imgp->ip_argc > 1 && imgp->ip_startargv != NULL && imgp->ip_endargv > imgp->ip_startargv) {
++				/* xpcproxy's argv names the launchd job it starts */
++				char *a = imgp->ip_startargv;
++				char *e = imgp->ip_endargv;
++				int n = 0;
++				while (a < e && *a != '\0' && n < 1) {
++					a++;
++				}
++				if (a < e) {
++					a++;
++				}
++				printf("exec %s [%.60s]\n", p->p_name, (a < e) ? a : "");
++			} else {
++				printf("exec %s\n", p->p_name);
++			}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
