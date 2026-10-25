@@ -1,0 +1,27 @@
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+index b82d741..85b838c 100755
+--- a/bsd/dev/vince_bt.c
++++ b/bsd/dev/vince_bt.c
+@@ -123,6 +123,10 @@ vbt_send_packet(const uint8_t *p, uint32_t n)
+ 			vbt_fake_complete(op);          /* vendor command: answered here */
+ 			return;
+ 		}
++		if (op == 0x0c5b) {
++			vbt_fake_complete(op);          /* Write_Default_Erroneous_Data_Reporting: Pronto lacks it, bluetoothd insists */
++			return;
++		}
+ 		if (op == 0x1009) {
+ 			/* Read_BD_ADDR: the controller has no persistent address (it answers 00:00:00:00:5a:ad); iOS expects the
+ 			 * one from the device tree ("local-mac-address", also given to BlueTool as btaddress) */
+@@ -388,6 +392,11 @@ vbt_thread(void *arg, wait_result_t w)
+ 
+ 		n = vince_smd_recv(&vbt_cmd, buf, sizeof(buf), 0);
+ 		if (n > 0) {
++			if (n >= 6 + 19 && buf[0] == 0x0e && buf[3] == 0x02 && buf[4] == 0x10 && buf[5] == 0x00) {
++				/* Read_Local_Supported_Commands: octet 18 bits 2/3 = Read/Write Default Erroneous Data Reporting, which
++				 * bluetoothd's init chain treats as mandatory (a locally "unsupported" command fails the whole init) */
++				buf[6 + 18] |= 0x0c;
++			}
+ 			vbt_log("ctrl->host event", buf, (uint32_t)n);
+ 			vbt_rx_push(0x04, buf, (uint32_t)n);
+ 			busy = 1;
