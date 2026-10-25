@@ -1,0 +1,1008 @@
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index 3513764..e703342 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -858,6 +858,452 @@ vw_station(int stage)
+ 	printf("VINCE WLAN: station done after %d reconnect cycles, %d Pronto restarts\n", cycles, restarts);
+ }
+ 
++
++/* ---- Apple80211 UI mode (boot-arg vinceui=2) ---- */
++
++static lck_mtx_t *vui_lk;
++static int vui_pending;                 /* 1 scan, 2 associate, 4 disassociate */
++static struct vui_assoc vui_a;
++static struct vui_info vui_i;
++static bool vui_on;
++static bool vui_selftest;               /* vinceuitest=1: also run DHCP in the kernel and ping, no configd around */
++
++bool
++vui_enabled(void)
++{
++	return vui_on;
++}
++
++static void
++vui_init(void)
++{
++	lck_grp_t *g;
++
++	if (vui_lk) {
++		return;
++	}
++	g = lck_grp_alloc_init("vince_ui", LCK_GRP_ATTR_NULL);
++	vui_lk = lck_mtx_alloc_init(g, LCK_ATTR_NULL);
++	vui_i.power = 1;
++	vui_i.state = VUI_S_INIT;
++	vui_on = true;
++	vif_set_ui_mode(true);
++}
++
++void
++vui_get_info(struct vui_info *out)
++{
++	if (!vui_lk) {
++		bzero(out, sizeof(*out));
++		return;
++	}
++	lck_mtx_lock(vui_lk);
++	*out = vui_i;
++	lck_mtx_unlock(vui_lk);
++}
++
++void
++vui_post_scan(void)
++{
++	lck_mtx_lock(vui_lk);
++	vui_pending |= 1;
++	lck_mtx_unlock(vui_lk);
++}
++
++void
++vui_post_assoc(const struct vui_assoc *a)
++{
++	lck_mtx_lock(vui_lk);
++	vui_a = *a;
++	vui_pending |= 2;
++	lck_mtx_unlock(vui_lk);
++	vif_abort = 1;
++}
++
++void
++vui_post_disassoc(void)
++{
++	lck_mtx_lock(vui_lk);
++	vui_pending |= 4;
++	lck_mtx_unlock(vui_lk);
++	vif_abort = 1;
++}
++
++void
++vui_set_power(int on)
++{
++	lck_mtx_lock(vui_lk);
++	vui_i.power = on;
++	lck_mtx_unlock(vui_lk);
++	if (!on) {
++		vui_post_disassoc();
++	}
++	vif_a80211_event(1, NULL, 0);           /* APPLE80211_M_POWER_CHANGED */
++}
++
++const struct vd_bss *
++vui_result(uint32_t idx)
++{
++	uint32_t n;
++	const struct vd_bss *b = vd_bss_list(&n);
++
++	return idx < n ? &b[idx] : NULL;
++}
++
++static void
++vui_set_state(int state)
++{
++	lck_mtx_lock(vui_lk);
++	vui_i.state = state;
++	lck_mtx_unlock(vui_lk);
++}
++
++/* next request for the driver thread: 4 disassociate, 2 associate (copied to *a), 1 scan, 0 none */
++static int
++vui_take(struct vui_assoc *a)
++{
++	int c = 0;
++
++	lck_mtx_lock(vui_lk);
++	if (vui_pending & 4) {
++		vui_pending &= ~4;
++		c = 4;
++	} else if (vui_pending & 2) {
++		vui_pending &= ~2;
++		*a = vui_a;
++		c = 2;
++	} else if (vui_pending & 1) {
++		vui_pending &= ~1;
++		c = 1;
++	}
++	lck_mtx_unlock(vui_lk);
++	return c;
++}
++
++static bool
++vui_has_cmd(void)
++{
++	return vui_pending != 0;
++}
++
++/* a scan without the bring-up: the self station exists already */
++static int
++vw_scan_again(void)
++{
++	struct vd_tx_ctx ctx;
++	const uint8_t *self = vw_self_info();
++	uint8_t pr[64];
++	uint32_t prlen;
++	int r, probes = 2;
++
++	if (!self) {
++		return -1;
++	}
++	ctx.sta_index = self[0];
++	ctx.dpu_desc_idx = self[1];
++	ctx.dpu_sign = self[2];
++	ctx.band_5ghz = 0;
++	ctx.no_encrypt = 1;
++	prlen = vw_probe_req(pr, vw_mac);
++	vd_bss_clear();
++	r = vw_scan_init();
++	if (r) {
++		return r;
++	}
++	for (uint8_t ch = 1; ch <= 13; ch++) {
++		if (vw_scan_start(ch)) {
++			break;
++		}
++		for (int k = 0; k < probes; k++) {
++			if (vd_tx_mgmt(&ctx, pr, prlen, 1)) {
++				probes = 0;
++				break;
++			}
++			vd_poll(10);
++		}
++		vd_poll(100);
++		if (vw_scan_end(ch)) {
++			break;
++		}
++	}
++	r = vw_scan_finish(1);
++	vd_poll(30);
++	return r;
++}
++
++static void
++vui_scan(void)
++{
++	struct vui_info in;
++
++	vui_get_info(&in);
++	if (in.state != VUI_S_RUN) {            /* while associated the cached list is all we give */
++		vui_set_state(VUI_S_SCAN);
++		(void)vw_scan_again();
++		vui_set_state(VUI_S_INIT);
++	}
++	lck_mtx_lock(vui_lk);
++	vui_i.scan_gen++;
++	lck_mtx_unlock(vui_lk);
++	vif_a80211_event(10, NULL, 0);          /* APPLE80211_M_SCAN_DONE */
++}
++
++static void
++vui_link_event(bool down, uint32_t rssi, bool voluntary, uint32_t reason)
++{
++	uint8_t d[24];
++
++	bzero(d, sizeof(d));
++	d[0] = down;
++	d[4] = (uint8_t)rssi;
++	d[5] = (uint8_t)(rssi >> 8);
++	d[6] = (uint8_t)(rssi >> 16);
++	d[7] = (uint8_t)(rssi >> 24);
++	d[16] = voluntary;
++	d[20] = (uint8_t)reason;
++	vif_a80211_event(4, d, sizeof(d));      /* APPLE80211_M_LINK_CHANGED */
++}
++
++/* returns 1 when the firmware has to be restarted */
++static int
++vui_assoc(const struct vui_assoc *a, int stage)
++{
++	static struct va_result ar;
++	static struct vwpa_result wr;
++	uint32_t n;
++	const struct vd_bss *b, *hit = NULL;
++	struct vd_bss ap;
++	int r, why, lr;
++	uint8_t res[4] = { 0, 0, 0, 0 };
++
++	for (int pass = 0; pass < 2 && !hit; pass++) {
++		b = vd_bss_list(&n);
++		for (uint32_t i = 0; i < n; i++) {
++			bool same = true;
++
++			for (uint32_t k = 0; k < 32 && same; k++) {
++				char c = k < a->ssid_len ? (char)a->ssid[k] : 0;
++
++				same = b[i].ssid[k] == c;
++			}
++			if (a->has_bssid) {
++				same = same && bcmp(b[i].bssid, a->bssid, 6) == 0;
++			}
++			if (same && (!hit || b[i].rssi > hit->rssi)) {
++				hit = &b[i];
++			}
++		}
++		if (!hit && pass == 0) {
++			vui_set_state(VUI_S_SCAN);
++			(void)vw_scan_again();
++		}
++	}
++	if (!hit) {
++		printf("VINCE UI: network not found\n");
++		vui_set_state(VUI_S_INIT);
++		res[0] = 9;                                     /* APPLE80211_RESULT_TIMEOUT */
++		vif_a80211_event(9, res, sizeof(res));
++		return 0;
++	}
++	ap = *hit;
++	printf("VINCE UI: associating with \"%s\" ch %u (%s)\n", ap.ssid, ap.ch, a->open ? "open" : a->has_pmk ? "PMK" : "passphrase");
++	vui_set_state(VUI_S_ASSOC);
++	va_use_rsn(a->open ? 0 : 1);
++	r = va_connect(&ap, &ar);
++	va_use_rsn(0);
++	vw_log_assoc(&ar);
++	if (r) {
++		bool dead = vw_hal_dead(ar.step, ar.err) || vw_fw_crashed();
++
++		vui_set_state(VUI_S_INIT);
++		if (dead) {
++			return 1;
++		}
++		res[0] = 2;
++		vif_a80211_event(9, res, sizeof(res));
++		return 0;
++	}
++	if (!a->open) {
++		uint32_t pl = 0;
++
++		while (a->has_pass && a->pass[pl] && pl < sizeof(a->pass) - 1) {
++			pl++;
++		}
++		r = a->has_pmk ? vwpa_handshake_pmk(&ap, NULL, 0, a->pmk, &wr) : vwpa_handshake_pmk(&ap, a->pass, pl, NULL, &wr);
++		printf("VINCE UI: handshake %s at step %d (%s) err %d\n", r ? "FAILED" : "done", wr.step, vwpa_step_name(wr.step), wr.err);
++		if (r) {
++			bool dead = vw_hal_dead(wr.step, wr.err) || vw_fw_crashed();
++
++			vwpa_stop();
++			lr = va_leave(&ap, 1);
++			vui_set_state(VUI_S_INIT);
++			if (dead || (lr <= -2 && lr >= -5)) {
++				return 1;
++			}
++			res[0] = 22;                            /* supplicant timeout / wrong key */
++			vif_a80211_event(9, res, sizeof(res));
++			return 0;
++		}
++	}
++	lck_mtx_lock(vui_lk);
++	vui_i.state = VUI_S_RUN;
++	vui_i.ssid_len = a->ssid_len;
++	bcopy(a->ssid, vui_i.ssid, 32);
++	bcopy(ap.bssid, vui_i.bssid, 6);
++	vui_i.channel = ap.ch;
++	vui_i.rssi = ap.rssi;
++	lck_mtx_unlock(vui_lk);
++	vif_ui_up();
++	res[0] = 1;                                             /* APPLE80211_RESULT_SUCCESS */
++	vif_a80211_event(2, NULL, 0);                           /* SSID_CHANGED */
++	vif_a80211_event(3, NULL, 0);                           /* BSSID_CHANGED */
++	vif_a80211_event(9, res, sizeof(res));                  /* ASSOC_DONE */
++	vui_link_event(false, (uint32_t)(int)ap.rssi, true, 0);
++	if (vui_selftest) {
++		int d = vn_dhcp();
++
++		printf("VINCE UI: self-test DHCP %d\n", d);
++		if (!d) {
++			const struct vn_cfg *c = vn_get_cfg();
++
++			printf("VINCE UI: self-test lease ip %u.%u.%u.%u gw %u.%u.%u.%u\n", c->ip[0], c->ip[1], c->ip[2], c->ip[3],
++			    c->gw[0], c->gw[1], c->gw[2], c->gw[3]);
++			if (vif_up(c) == 0) {
++				vif_start_ping(12, 5000);
++			}
++		}
++	}
++	vif_abort = 0;
++	if (vui_has_cmd()) {
++		why = VIF_END_CMD;
++	} else {
++		why = vif_serve(3600ULL * 1000000ULL * 24, 0, 0);
++	}
++	printf("VINCE UI: link ended (%d)\n", why);
++	vif_link(false);
++	vif_down();
++	vwpa_stop();
++	lr = va_leave(&ap, 1);
++	vn_link_reset();
++	vui_set_state(VUI_S_INIT);
++	vui_link_event(true, 0, why == VIF_END_CMD, why == VIF_END_LOST ? 2 : 3);
++	vif_a80211_event(2, NULL, 0);
++	vif_a80211_event(3, NULL, 0);
++	return why == VIF_END_FWCRASH || (lr <= -2 && lr >= -5) || vw_fw_crashed();
++}
++
++static void
++vui_selftest_thread(void *arg, wait_result_t w)
++{
++#pragma unused(arg, w)
++	static char ssid[40], pass[72];
++	struct vui_assoc a;
++	struct vui_info in;
++	uint32_t gen;
++
++	vince_smd_sleep(4000);
++	vui_get_info(&in);
++	gen = in.scan_gen;
++	printf("VINCE UI TEST: requesting a scan\n");
++	vui_post_scan();
++	for (int i = 0; i < 100; i++) {
++		vince_smd_sleep(200);
++		vui_get_info(&in);
++		if (in.scan_gen != gen) {
++			break;
++		}
++	}
++	{
++		uint32_t cnt = 0;
++
++		while (vui_result(cnt)) {
++			cnt++;
++		}
++		printf("VINCE UI TEST: scan done, %u results\n", cnt);
++	}
++	if (PE_parse_boot_argn("vincessid", ssid, sizeof(ssid)) && PE_parse_boot_argn("vincepass", pass, sizeof(pass))) {
++		uint32_t l = 0;
++
++		vw_unscore(ssid);
++		bzero(&a, sizeof(a));
++		while (ssid[l] && l < 32) {
++			a.ssid[l] = (uint8_t)ssid[l];
++			l++;
++		}
++		a.ssid_len = l;
++		strlcpy(a.pass, pass, sizeof(a.pass));
++		a.has_pass = 1;
++		bzero(pass, sizeof(pass));
++		printf("VINCE UI TEST: associating\n");
++		vui_post_assoc(&a);
++		for (int i = 0; i < 150; i++) {
++			vince_smd_sleep(200);
++			vui_get_info(&in);
++			if (in.state == VUI_S_RUN) {
++				break;
++			}
++		}
++		printf("VINCE UI TEST: state %d ssid_len %u channel %u\n", in.state, in.ssid_len, in.channel);
++		vince_smd_sleep(70000);
++		printf("VINCE UI TEST: disassociating\n");
++		vui_post_disassoc();
++		vince_smd_sleep(6000);
++		vui_get_info(&in);
++		printf("VINCE UI TEST: state after disassociate %d\n", in.state);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++vui_loop(int stage)
++{
++	struct vui_assoc a;
++	thread_t th;
++	int test = 0;
++
++	(void)PE_parse_boot_argn("vinceuitest", &test, sizeof(test));
++	vui_selftest = test != 0;
++	if (vui_selftest && kernel_thread_start(vui_selftest_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++	printf("VINCE UI: driver loop running\n");
++	for (;;) {
++		int c = vui_take(&a);
++
++		if (c == 0) {
++			vd_poll(0);
++			if (vw_fw_crashed()) {
++				c = 8;
++			} else {
++				vince_smd_sleep(20);
++				continue;
++			}
++		}
++		if (c == 1) {
++			vui_scan();
++		} else if (c == 2) {
++			if (vui_assoc(&a, stage)) {
++				c = 8;
++			}
++		} else if (c == 4) {
++			/* already out of the serve loop: nothing to leave */
++			vif_a80211_event(4, NULL, 0);
++		}
++		if (c == 8) {
++			printf("VINCE UI: restarting Pronto\n");
++			vif_link(false);
++			vui_set_state(VUI_S_INIT);
++			if (vw_restart_pronto() || vw_bringup(stage) || vw_prepare(NULL)) {
++				printf("VINCE UI: Wi-Fi could not be brought back\n");
++				break;
++			}
++			vif_ui_up();
++			vif_a80211_event(55, NULL, 0);          /* APPLE80211_M_DRIVER_AVAILABLE */
++		}
++	}
++}
++
+ /* boot-arg vinceui=1: show the radio to iOS userland (en0 as a down interface, the IORegistry objects wifid waits for) */
+ static void
+ vw_publish_ui(void)
+@@ -882,7 +1328,18 @@ vw_thread(void *arg, wait_result_t w)
+ 	(void)PE_parse_boot_argn("vincewlan", &stage, sizeof(stage));
+ 	if (vw_bringup(stage) == 0 && stage >= 2 && vw_scan_all() == 0) {
+ 		printf("VINCE WLAN: X2 done\n");
+-		vw_publish_ui();
++		{
++			int ui = 0;
++
++			(void)PE_parse_boot_argn("vinceui", &ui, sizeof(ui));
++			if (ui >= 2) {
++				vui_init();
++			}
++			vw_publish_ui();
++			if (ui >= 2) {
++				vui_loop(stage);
++			}
++		}
+ 		if (stage >= 5) {
+ 			vw_station(stage);
+ 		} else if (stage >= 3) {
+diff --git a/bsd/dev/vince_wlan.h b/bsd/dev/vince_wlan.h
+index 9a56011..2b60c0c 100755
+--- a/bsd/dev/vince_wlan.h
++++ b/bsd/dev/vince_wlan.h
+@@ -152,12 +152,53 @@ void vif_stack_test(const struct vn_cfg *c);
+ #define VIF_END_CYCLE   4               /* the test asked for a forced reconnect */
+ #define VIF_END_RECFG   5               /* the lease changed: configure the interface again */
+ #define VIF_END_FWCRASH 6               /* the firmware reported a fatal error (SMEM crash reason changed) */
++#define VIF_END_CMD     7               /* a user request (scan / associate / disassociate) is waiting for the driver thread */
+ int vif_up(const struct vn_cfg *c);     /* attach (once), stack mode, address + default route from the lease */
+ void vif_down(void);                    /* not running, address removed */
+ int vif_serve(uint64_t us_total, uint32_t cycle_s, uint32_t t1_override_s);
+ void vif_start_ping(uint32_t count, uint32_t period_ms);
+ void vif_stop_ping(void);
+-const struct vn_cfg *vif_current_cfg(void);            /* attach en0, address + route from the lease, 75 s of traffic with a kernel ICMP test */
++const struct vn_cfg *vif_current_cfg(void);
++
++/* ---- Apple80211 UI mode (boot-arg vinceui=2): wifid drives scan / associate through ioctls, configd runs DHCP over BPF ---- */
++struct vui_assoc {
++	uint8_t ssid[32];
++	uint32_t ssid_len;
++	uint8_t bssid[6];
++	int has_bssid;
++	uint8_t pmk[32];
++	int has_pmk;
++	char pass[72];                  /* passphrase when iOS sends one instead of a PMK */
++	int has_pass;
++	int open;                       /* no key */
++};
++#define VUI_S_INIT      0               /* APPLE80211_S_* */
++#define VUI_S_SCAN      1
++#define VUI_S_AUTH      2
++#define VUI_S_ASSOC     3
++#define VUI_S_RUN       4
++struct vui_info {
++	int power;
++	int state;
++	uint8_t ssid[32];
++	uint32_t ssid_len;
++	uint8_t bssid[6];
++	uint8_t channel;
++	int rssi;
++	uint32_t scan_gen;              /* bumps with every finished scan */
++};
++bool vui_enabled(void);
++void vui_post_scan(void);
++void vui_post_assoc(const struct vui_assoc *a);
++void vui_post_disassoc(void);
++void vui_set_power(int on);
++void vui_get_info(struct vui_info *out);
++const struct vd_bss *vui_result(uint32_t idx);
++extern volatile int vif_abort;          /* set by the ioctl side: vif_serve returns VIF_END_CMD */
++void vif_set_ui_mode(bool on);
++void vif_ui_up(void);                   /* attach en0 if needed, stack mode on, link up (no address: configd's DHCP does that) */
++void vif_link(bool up);                 /* IFF_RUNNING and a KEV_DL_LINK_ON / OFF event */
++void vif_a80211_event(uint32_t code, const void *data, uint32_t len);   /* APPLE:IEEE80211:1 kernel event */            /* attach en0, address + route from the lease, 75 s of traffic with a kernel ICMP test */
+ 
+ /* WPA2-PSK supplicant (vince_wlan_wpa.c) */
+ struct vwpa_result {
+@@ -174,6 +215,8 @@ struct vwpa_link_stats {
+ };
+ const char *vwpa_step_name(int step);
+ int vwpa_handshake(const struct vd_bss *ap, const char *pass, uint32_t plen, struct vwpa_result *r);
++/* the same with a ready PMK (pmk_in != NULL: passphrase ignored): iOS hands the driver the PMK or the passphrase */
++int vwpa_handshake_pmk(const struct vd_bss *ap, const char *pass, uint32_t plen, const uint8_t *pmk_in, struct vwpa_result *r);
+ void vwpa_stop(void);
+ const struct vwpa_link_stats *vwpa_link_get_stats(void);
+ int vwpa_reinstall_gtk(void);
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index a8e0785..c449ff0 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -27,6 +27,8 @@
+ #include <net/if_types.h>
+ #include <net/if_dl.h>
+ #include <net/if_media.h>
++#include <net/net_kev.h>
++#include <sys/kern_event.h>
+ #include <net/bpf.h>
+ #include <net/ethernet.h>
+ #include <net/route.h>
+@@ -106,6 +108,8 @@ struct a80211_req {
+ #define A80211_COUNTRY_CODE     51
+ 
+ static bool vif_link_up;
++volatile int vif_abort;
++static bool vif_ui_mode;
+ static uint32_t a80211_power = 1;               /* APPLE80211_POWER_ON */
+ static uint8_t a80211_seen[2][512 / 8];
+ 
+@@ -118,29 +122,140 @@ a80211_put32(uint8_t *b, unsigned off, uint32_t v)
+ 	b[off + 3] = (uint8_t)(v >> 24);
+ }
+ 
++
++static void
++a80211_put16(uint8_t *b, unsigned off, uint32_t v)
++{
++	b[off] = (uint8_t)v;
++	b[off + 1] = (uint8_t)(v >> 8);
++}
++
++static uint32_t
++a80211_get32(const uint8_t *b, unsigned off)
++{
++	return b[off] | (uint32_t)b[off + 1] << 8 | (uint32_t)b[off + 2] << 16 | (uint32_t)b[off + 3] << 24;
++}
++
++static uint32_t a80211_scan_cursor;
++static bool a80211_assoc_dumped;
++
++/* channel word: version 1, channel number, flags (2.4 GHz 0x2? not sure: logged) */
++static void
++a80211_channel(uint8_t *b, unsigned off, uint32_t ch)
++{
++	a80211_put32(b, off, 1);
++	a80211_put32(b, off + 4, ch);
++	a80211_put32(b, off + 8, 0x2 | 0x4);            /* 2 GHz, 20 MHz (macOS values; iOS may differ) */
++}
++
++/* one scan table entry as struct apple80211_scan_result (macOS 12 layout, IEs inline); returns the length */
++static uint32_t
++a80211_scan_result(uint8_t *b, uint32_t room, const struct vd_bss *e)
++{
++	uint32_t total = 0x8c + 1024, n;
++
++	if (room < 0x8c) {
++		return 0;
++	}
++	bzero(b, room < total ? room : total);
++	a80211_put32(b, 0, 1);
++	a80211_channel(b, 4, e->ch);
++	a80211_put16(b, 0x12, (uint16_t)(int16_t)-90);          /* noise */
++	a80211_put16(b, 0x14, (uint16_t)(int16_t)(e->rssi + 90));       /* snr */
++	a80211_put16(b, 0x16, (uint16_t)(int16_t)e->rssi);
++	a80211_put16(b, 0x18, e->beacon_int);
++	a80211_put16(b, 0x1a, e->capab);
++	for (int i = 0; i < 6; i++) {
++		b[0x1c + i] = e->bssid[i];
++	}
++	n = e->nrates > 12 ? 12 : e->nrates;
++	b[0x22] = (uint8_t)n;
++	for (uint32_t i = 0; i < n; i++) {
++		a80211_put32(b, 0x24 + 4 * i, (e->rates[i] & 0x7f) / 2);       /* Mbit/s */
++	}
++	{
++		uint32_t l = 0;
++
++		while (e->ssid[l] && l < 32) {
++			l++;
++		}
++		b[0x60] = (uint8_t)l;
++		for (uint32_t i = 0; i < l; i++) {
++			b[0x61 + i] = (uint8_t)e->ssid[i];
++		}
++	}
++	a80211_put32(b, 0x84, 0);
++	/* information elements: SSID, rates, DS channel, RSN (what we kept from the beacon) */
++	{
++		uint8_t *ie = b + 0x8c;
++		uint32_t o = 0, l = 0;
++
++		while (e->ssid[l] && l < 32) {
++			l++;
++		}
++		ie[o++] = 0;
++		ie[o++] = (uint8_t)l;
++		for (uint32_t i = 0; i < l; i++) {
++			ie[o++] = (uint8_t)e->ssid[i];
++		}
++		if (e->nrates) {
++			ie[o++] = 1;
++			ie[o++] = (uint8_t)(e->nrates > 8 ? 8 : e->nrates);
++			for (uint32_t i = 0; i < e->nrates && i < 8; i++) {
++				ie[o++] = e->rates[i];
++			}
++		}
++		ie[o++] = 3;
++		ie[o++] = 1;
++		ie[o++] = e->ch;
++		if (e->rsn_len) {
++			ie[o++] = 48;
++			ie[o++] = e->rsn_len;
++			for (uint32_t i = 0; i < e->rsn_len; i++) {
++				ie[o++] = e->rsn[i];
++			}
++		}
++		a80211_put16(b, 0x8a, (uint16_t)o);
++	}
++	return room < total ? room : total;
++}
++
+ /*
+  * One request. kb holds the data (for a SET what userland sent, for a GET zeroes to fill); returns an errno. Structure
+- * layouts are the macOS ones (OpenIntelWireless/itlwm apple80211_var.h); iOS 16 may differ, hence the logging.
++ * layouts are the macOS ones (OpenIntelWireless/itlwm apple80211_ioctl.h); iOS 16 may differ, hence the logging of
++ * every new request type. With the UI layer (vui_enabled) scan / associate / state are real.
+  */
+ static int
+ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len)
+ {
++	struct vui_info in;
++	bool ui = vui_enabled();
++
++	if (ui) {
++		vui_get_info(&in);
++	} else {
++		bzero(&in, sizeof(in));
++		in.power = (int)a80211_power;
++	}
+ 	switch (type) {
+ 	case A80211_POWER:
+ 		if (get) {
+ 			if (len >= 12) {
+ 				a80211_put32(kb, 0, 1);                 /* version */
+ 				a80211_put32(kb, 4, 1);                 /* radios */
+-				a80211_put32(kb, 8, a80211_power);      /* power_state[0] */
++				a80211_put32(kb, 8, ui ? (uint32_t)in.power : a80211_power);    /* power_state[0] */
+ 			}
+ 		} else if (len >= 12) {
+ 			a80211_power = kb[8] | (uint32_t)kb[9] << 8;
++			if (ui) {
++				vui_set_power(a80211_power != 0);
++			}
+ 		}
+ 		return 0;
+ 	case A80211_STATE:
+ 		if (get && len >= 8) {
+ 			a80211_put32(kb, 0, 1);
+-			a80211_put32(kb, 4, 0);                         /* APPLE80211_S_INIT */
++			a80211_put32(kb, 4, (uint32_t)in.state);
+ 		}
+ 		return 0;
+ 	case A80211_OP_MODE:
+@@ -153,7 +268,7 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len)
+ 		if (get && len >= 12) {
+ 			a80211_put32(kb, 0, 1);
+ 			a80211_put32(kb, 4, 0x4 | 0x8 | 0x10);          /* 11b, 11g, 11n */
+-			a80211_put32(kb, 8, 0);
++			a80211_put32(kb, 8, in.state == VUI_S_RUN ? 0x8 : 0);
+ 		}
+ 		return 0;
+ 	case A80211_CARD_CAPS:
+@@ -184,17 +299,154 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len)
+ 			strlcpy((char *)kb + 4, "vince-wcn36xx 1.0", len - 4);
+ 		}
+ 		return 0;
++	case 27:        /* SUPPORTED_CHANNELS: version, count, channels 1..13 */
++		if (get && len >= 8 + 12 * 13) {
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, 13);
++			for (uint32_t c = 1; c <= 13; c++) {
++				a80211_channel(kb, 8 + 12 * (c - 1), c);
++			}
++		}
++		return 0;
+ 	case A80211_SCAN_REQ:
++		if (!get && ui) {
++			a80211_scan_cursor = 0;
++			vui_post_scan();
++		}
++		return 0;
++	case A80211_SCAN_RESULT:
++		if (get && ui) {
++			const struct vd_bss *e = vui_result(a80211_scan_cursor);
++
++			if (!e) {
++				return ENOENT;
++			}
++			a80211_scan_cursor++;
++			(void)a80211_scan_result(kb, len, e);
++			return 0;
++		}
++		return get ? ENOENT : 0;
++	case A80211_ASSOCIATE:
++		if (!get && ui) {
++			struct vui_assoc a;
++			uint32_t sl = len > 20 ? a80211_get32(kb, 12) : 0;
++			uint32_t kl = len > 68 ? a80211_get32(kb, 60) : 0;
++			uint32_t ct = len > 68 ? a80211_get32(kb, 64) : 0;
++
++			if (!a80211_assoc_dumped) {
++				a80211_assoc_dumped = true;
++				printf("VINCE A80211: ASSOCIATE data (%u bytes), first 96:", len);
++				for (uint32_t i = 0; i < len && i < 96; i++) {
++					printf("%s%02x", i % 16 ? " " : "\n  ", kb[i]);
++				}
++				printf("\n  ssid_len %u key_len %u cipher %u auth %u/%u\n", sl, kl, ct, kb[6] | kb[7] << 8, kb[8] | kb[9] << 8);
++			}
++			bzero(&a, sizeof(a));
++			if (sl == 0 || sl > 32) {
++				return EINVAL;
++			}
++			a.ssid_len = sl;
++			bcopy(kb + 16, a.ssid, sl);
++			for (int i = 0; i < 6; i++) {
++				a.bssid[i] = kb[48 + i];
++				a.has_bssid |= kb[48 + i] != 0;
++			}
++			if (kl == 32 && ct == 6) {                      /* APPLE80211_CIPHER_PMK */
++				bcopy(kb + 72, a.pmk, 32);
++				a.has_pmk = 1;
++			} else if (kl >= 8 && kl <= 63) {               /* a passphrase */
++				bcopy(kb + 72, a.pass, kl);
++				a.has_pass = 1;
++			} else {
++				a.open = 1;
++			}
++			vui_post_assoc(&a);
++			return 0;
++		}
++		return 0;
+ 	case A80211_DISASSOCIATE:
++		if (!get && ui) {
++			vui_post_disassoc();
++		}
+ 		return 0;
++	case 21:        /* ASSOCIATE_RESULT */
++		if (get && len >= 8) {
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, in.state == VUI_S_RUN ? 1 : 0);
++		}
++		return 0;
++	case 2:         /* AUTH_TYPE */
++		if (get && len >= 12) {
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, 1);                         /* open system */
++			a80211_put32(kb, 8, 8);                         /* WPA2 PSK */
++		}
++		return in.state == VUI_S_RUN || !get ? 0 : ENXIO;
+ 	case A80211_SSID:
++		if (get) {
++			if (in.state != VUI_S_RUN || len < 40) {
++				return ENXIO;
++			}
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, in.ssid_len);
++			bcopy(in.ssid, kb + 8, in.ssid_len);
++		}
++		return 0;
+ 	case A80211_BSSID:
++		if (get) {
++			if (in.state != VUI_S_RUN || len < 10) {
++				return ENXIO;
++			}
++			a80211_put32(kb, 0, 1);
++			bcopy(in.bssid, kb + 4, 6);
++		}
++		return 0;
+ 	case A80211_CHANNEL:
++		if (get) {
++			if (in.state != VUI_S_RUN || len < 16) {
++				return ENXIO;
++			}
++			a80211_put32(kb, 0, 1);
++			a80211_channel(kb, 4, in.channel);
++		}
++		return 0;
+ 	case A80211_RSSI:
+ 	case A80211_NOISE:
++		if (get) {
++			int v = type == A80211_RSSI ? in.rssi : -90;
++
++			if (in.state != VUI_S_RUN || len < 52) {
++				return ENXIO;
++			}
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, 1);                         /* radios */
++			a80211_put32(kb, 8, 0);                         /* dBm */
++			a80211_put32(kb, 12, (uint32_t)v);
++			a80211_put32(kb, 28, (uint32_t)v);              /* aggregate */
++			a80211_put32(kb, 32, (uint32_t)v);
++			a80211_put32(kb, 48, (uint32_t)v);
++		}
++		return 0;
+ 	case A80211_RATE:
++		if (get) {
++			if (in.state != VUI_S_RUN || len < 12) {
++				return ENXIO;
++			}
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, 1);
++			a80211_put32(kb, 8, 54);
++		}
++		return 0;
+ 	case A80211_TXPOWER:
+-		return get ? ENXIO : 0;                                 /* not associated */
++		if (get) {
++			if (in.state != VUI_S_RUN || len < 12) {
++				return ENXIO;
++			}
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, 0);
++			a80211_put32(kb, 8, 15);
++		}
++		return 0;
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}
+@@ -590,10 +842,14 @@ vif_serve(uint64_t us_total, uint32_t cycle_s, uint32_t t1_override_s)
+ 		if (vw_fw_crashed()) {
+ 			return VIF_END_FWCRASH;
+ 		}
++		if (vif_abort) {
++			vif_abort = 0;
++			return VIF_END_CMD;
++		}
+ 		if (cycle_s && now - t0 >= (uint64_t)cycle_s * 1000000ULL) {
+ 			return VIF_END_CYCLE;
+ 		}
+-		if (now >= t1) {
++		if (!vif_ui_mode && now >= t1) {
+ 			struct vn_cfg old = vif_cfg;
+ 			int r = vn_dhcp();
+ 
+@@ -620,7 +876,7 @@ vif_serve(uint64_t us_total, uint32_t cycle_s, uint32_t t1_override_s)
+ 				}
+ 			}
+ 		}
+-		if (now - vif_last_rx_us > 20000000ULL && now - last_ka > 20000000ULL) {
++		if (!vif_ui_mode && now - vif_last_rx_us > 20000000ULL && now - last_ka > 20000000ULL) {
+ 			last_ka = now;
+ 			if (vn_arp(vif_cfg.gw, gwmac) == 0) {
+ 				ka_fail = 0;
+@@ -824,6 +1080,67 @@ vif_up(const struct vn_cfg *c)
+ 	return vif_config(c);
+ }
+ 
++
++void
++vif_set_ui_mode(bool on)
++{
++	vif_ui_mode = on;
++}
++
++/* APPLE:IEEE80211:1 kernel event: net_event_data (interface) followed by the event's own data */
++void
++vif_a80211_event(uint32_t code, const void *data, uint32_t len)
++{
++	struct kev_msg ev;
++	struct net_event_data nd;
++
++	if (!vif_ifp) {
++		return;
++	}
++	bzero(&ev, sizeof(ev));
++	bzero(&nd, sizeof(nd));
++	nd.if_family = IFNET_FAMILY_ETHERNET;
++	nd.if_unit = 0;
++	strlcpy(nd.if_name, "en", sizeof(nd.if_name));
++	ev.vendor_code = KEV_VENDOR_APPLE;
++	ev.kev_class = KEV_IEEE80211_CLASS;
++	ev.kev_subclass = 1;
++	ev.event_code = code;
++	ev.dv[0].data_length = sizeof(nd);
++	ev.dv[0].data_ptr = &nd;
++	if (len) {
++		ev.dv[1].data_length = len;
++		ev.dv[1].data_ptr = (void *)(uintptr_t)data;
++	}
++	(void)kev_post_msg(&ev);
++}
++
++/* link up / down for the stack and for configd (IPConfiguration starts DHCP on link-on) */
++void
++vif_link(bool up)
++{
++	if (!vif_ifp) {
++		return;
++	}
++	vif_link_up = up;
++	ifnet_set_flags(vif_ifp, up ? IFF_RUNNING : 0, IFF_RUNNING);
++	(void)dlil_post_msg(vif_ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++}
++
++void
++vif_ui_up(void)
++{
++	vn_set_stack_mode(1);
++	if (!vif_ifp && vif_attach(vw_mac)) {
++		return;
++	}
++	if (bcmp(vif_mac, vw_mac, 6) != 0) {
++		ifnet_set_lladdr(vif_ifp, vw_mac, ETHER_ADDR_LEN);
++		bcopy(vw_mac, vif_mac, 6);
++	}
++	vif_link(true);
++}
++
+ void
+ vif_down(void)
+ {
+diff --git a/bsd/dev/vince_wlan_wpa.c b/bsd/dev/vince_wlan_wpa.c
+index a102c08..e1d61fb 100644
+--- a/bsd/dev/vince_wlan_wpa.c
++++ b/bsd/dev/vince_wlan_wpa.c
+@@ -252,7 +252,7 @@ static int vwpa_rx(const uint8_t *src, uint16_t et, const uint8_t *p, uint32_t n
+ 	return 1;
+ }
+ 
+-int vwpa_handshake(const struct vd_bss *ap, const char *pass, uint32_t plen, struct vwpa_result *r)
++int vwpa_handshake_pmk(const struct vd_bss *ap, const char *pass, uint32_t plen, const uint8_t *pmk_in, struct vwpa_result *r)
+ {
+ 	static uint8_t rx[300], tx[300], rsn[32], ptk[48], pmk[32];
+ 	uint8_t snonce[32], anonce[32], replay[8], kdata[64], pdata[76];
+@@ -272,7 +272,12 @@ int vwpa_handshake(const struct vd_bss *ap, const char *pass, uint32_t plen, str
+ 	while (ap->ssid[ssidlen] && ssidlen < 32)
+ 		ssidlen++;
+ 	uint64_t t0 = vd_now_us();
+-	vc_pmk(pass, plen, (const uint8_t *)ap->ssid, ssidlen, pmk);
++	if (pmk_in) {
++		for (int i = 0; i < 32; i++)
++			pmk[i] = pmk_in[i];
++	} else {
++		vc_pmk(pass, plen, (const uint8_t *)ap->ssid, ssidlen, pmk);
++	}
+ 	r->pmk_ms = (uint32_t)((vd_now_us() - t0) / 1000);
+ 
+ 	/* message 1: ANonce */
+@@ -399,6 +404,11 @@ int vwpa_handshake(const struct vd_bss *ap, const char *pass, uint32_t plen, str
+ 	return 0;
+ }
+ 
++int vwpa_handshake(const struct vd_bss *ap, const char *pass, uint32_t plen, struct vwpa_result *r)
++{
++	return vwpa_handshake_pmk(ap, pass, plen, NULL, r);
++}
++
+ void vwpa_stop(void)
+ {
+ 	s_active = 0;
