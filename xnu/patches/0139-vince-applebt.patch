@@ -1,0 +1,577 @@
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+index 47a48ab..30d6f12 100755
+--- a/bsd/dev/vince_bt.c
++++ b/bsd/dev/vince_bt.c
+@@ -29,10 +29,12 @@
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
++#include <kern/kalloc.h>
+ #include "vince_smd.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ void vince_bt_start(void);
++extern int vince_bt_iokit_publish(void);
+ 
+ #define RXSZ            0x8000u         /* H4 byte ring towards bluetoothd, power of two */
+ #define MAXH4           (4 + 1024 + 64)
+@@ -372,6 +374,7 @@ vbt_thread(void *arg, wait_result_t w)
+ 	}
+ 	vbt_up = true;
+ 	printf("VINCE BT: controller channels open\n");
++	printf("VINCE BT: IOKit services: %d\n", vince_bt_iokit_publish());
+ 	for (;;) {
+ 		int n, busy = 0;
+ 
+@@ -395,6 +398,259 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * AppleBT interface for iokit/Kernel/arm/VinceBT.cpp (bluetoothd's "APPLEBT" HCI transport). A pipe item is
++ * {u16 length, u8 sequence, u8 0} + one H4 packet; pipes 0..4 go to the controller (0 commands, 1/3/4 ACL, 2 SCO),
++ * pipes 5.. come back (5 events, 6 ACL, 7 SCO).
++ */
++#define VBT_NPIPES      11
++static const struct {
++	uint32_t size, count;
++} vbt_pipe_cfg[VBT_NPIPES] = {
++	{ 264, 8 }, { 1100, 8 }, { 264, 8 }, { 1100, 8 }, { 1100, 8 },
++	{ 264, 16 }, { 1104, 8 }, { 264, 4 }, { 264, 4 }, { 264, 4 }, { 1024, 1 },
++};
++static uint8_t vbt_seq[VBT_NPIPES];
++
++uint32_t
++vince_bt_pipe_size(int p)
++{
++	return p >= 0 && p < VBT_NPIPES ? vbt_pipe_cfg[p].size : 0;
++}
++
++uint32_t
++vince_bt_pipe_count(int p)
++{
++	return p >= 0 && p < VBT_NPIPES ? vbt_pipe_cfg[p].count : 0;
++}
++
++int
++vince_bt_hci_open(void)
++{
++	for (int i = 0; i < 200 && !vbt_up; i++) {
++		vince_smd_sleep(50);
++	}
++	if (!vbt_up) {
++		return -1;
++	}
++	lck_mtx_lock(vbt_lock);
++	vbt_tail = vbt_head;
++	bzero(vbt_seq, sizeof(vbt_seq));
++	lck_mtx_unlock(vbt_lock);
++	printf("VINCE BT: AppleBTHci opened\n");
++	return 0;
++}
++
++void
++vince_bt_hci_close(void)
++{
++	printf("VINCE BT: AppleBTHci closed\n");
++}
++
++void
++vince_bt_hci_reset(void)
++{
++	lck_mtx_lock(vbt_lock);
++	vbt_tail = vbt_head;
++	bzero(vbt_seq, sizeof(vbt_seq));
++	lck_mtx_unlock(vbt_lock);
++}
++
++static void
++vbt_put32(uint8_t *b, uint32_t v)
++{
++	b[0] = (uint8_t)v;
++	b[1] = (uint8_t)(v >> 8);
++	b[2] = (uint8_t)(v >> 16);
++	b[3] = (uint8_t)(v >> 24);
++}
++
++static uint32_t
++vbt_get32(const uint8_t *b)
++{
++	return b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++}
++
++int
++vince_bt_hci_write(const uint8_t *d, uint32_t n, uint8_t *out)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		const uint8_t *dp = d + 16 * i;
++		uint32_t size = vbt_get32(dp + 4), status = 0, written = 0;
++		uint64_t ptr = (uint64_t)vbt_get32(dp + 8) | (uint64_t)vbt_get32(dp + 12) << 32;
++		uint8_t *buf;
++
++		if (size < 4 || size > 8192) {
++			status = 0xe00002c2;
++		} else if ((buf = kalloc_data(size, Z_WAITOK)) == NULL) {
++			status = 0xe00002bd;
++		} else {
++			if (copyin((user_addr_t)ptr, buf, size) != 0) {
++				status = 0xe00002c2;
++			} else {
++				uint32_t off = 0;
++
++				while (off + 4 <= size && written < dp[1]) {
++					uint32_t len = buf[off] | (uint32_t)buf[off + 1] << 8;
++
++					if (off + 4 + len > size) {
++						break;
++					}
++					vbt_send_packet(buf + off + 4, len);
++					off += 4 + len;
++					written++;
++				}
++			}
++			kfree_data(buf, size);
++		}
++		vbt_put32(out + 8 * i, status);
++		out[8 * i + 4] = (uint8_t)written;
++	}
++	return 0;
++}
++
++/* length of the H4 packet at the ring's tail (0 when it is not complete yet, -1 for a byte that is no packet type) */
++static int
++vbt_peek_len(void)
++{
++	uint32_t avail = vbt_rx_avail(), len;
++	const uint32_t m = RXSZ - 1;
++
++	if (avail < 1) {
++		return 0;
++	}
++	switch (vbt_rx[vbt_tail & m]) {
++	case 0x04:
++		if (avail < 3) {
++			return 0;
++		}
++		len = 3u + vbt_rx[(vbt_tail + 2) & m];
++		break;
++	case 0x02:
++		if (avail < 5) {
++			return 0;
++		}
++		len = 5u + (vbt_rx[(vbt_tail + 3) & m] | (uint32_t)vbt_rx[(vbt_tail + 4) & m] << 8);
++		break;
++	case 0x03:
++		if (avail < 4) {
++			return 0;
++		}
++		len = 4u + vbt_rx[(vbt_tail + 3) & m];
++		break;
++	default:
++		return -1;
++	}
++	return avail >= len ? (int)len : 0;
++}
++
++/* returns 0, or 4 when a signal interrupted the wait (the caller reports kIOReturnAborted and bluetoothd reads again) */
++int
++vince_bt_hci_read(const uint8_t *d, uint32_t n, uint8_t *out)
++{
++	struct {
++		uint8_t pipe;
++		uint32_t size, used;
++		uint8_t cnt;
++		uint64_t ptr;
++		uint8_t *buf;
++	} dd[8];
++	int ret = 0;
++	const uint32_t m = RXSZ - 1;
++
++	if (n == 0 || n > 8) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		const uint8_t *dp = d + 16 * i;
++
++		dd[i].pipe = dp[0];
++		dd[i].size = vbt_get32(dp + 4);
++		dd[i].ptr = (uint64_t)vbt_get32(dp + 8) | (uint64_t)vbt_get32(dp + 12) << 32;
++		dd[i].used = 0;
++		dd[i].cnt = 0;
++		if (dd[i].size > 16384) {
++			dd[i].size = 16384;
++		}
++		dd[i].buf = dd[i].size ? kalloc_data(dd[i].size, Z_WAITOK | Z_ZERO) : NULL;
++	}
++	lck_mtx_lock(vbt_lock);
++	for (;;) {
++		int l = vbt_peek_len();
++
++		if (l < 0) {
++			vbt_tail++;             /* out of sync: drop the byte */
++			continue;
++		}
++		if (l > 0) {
++			break;
++		}
++		{
++			struct timespec ts = { 1, 0 };
++			int err = msleep(&vbt_head, vbt_lock, PCATCH | PRIBIO, "vbthci", &ts);
++
++			if (err == EWOULDBLOCK) {
++				break;
++			}
++			if (err) {
++				ret = 4;
++				break;
++			}
++		}
++	}
++	while (ret == 0) {
++		int l = vbt_peek_len();
++		uint8_t type;
++		uint8_t pipe;
++		uint32_t k;
++
++		if (l < 0) {
++			vbt_tail++;
++			continue;
++		}
++		if (l == 0) {
++			break;
++		}
++		type = vbt_rx[vbt_tail & m];
++		pipe = type == 0x04 ? 5 : (type == 0x02 ? 6 : 7);
++		for (k = 0; k < n && dd[k].pipe != pipe; k++) {
++		}
++		if (k == n || dd[k].buf == NULL) {
++			vbt_tail += (uint32_t)l;        /* nobody reads that pipe */
++			continue;
++		}
++		if (dd[k].used + 4 + (uint32_t)l > dd[k].size || dd[k].cnt >= 200) {
++			break;                          /* does not fit: stays queued for the next call */
++		}
++		dd[k].buf[dd[k].used] = (uint8_t)l;
++		dd[k].buf[dd[k].used + 1] = (uint8_t)((uint32_t)l >> 8);
++		dd[k].buf[dd[k].used + 2] = vbt_seq[pipe]++;
++		dd[k].buf[dd[k].used + 3] = 0;
++		for (int j = 0; j < l; j++) {
++			dd[k].buf[dd[k].used + 4 + (uint32_t)j] = vbt_rx[(vbt_tail + (uint32_t)j) & m];
++		}
++		vbt_log("ctrl->host (AppleBT)", dd[k].buf + dd[k].used + 4, (uint32_t)l);
++		dd[k].used += 4 + (uint32_t)l;
++		dd[k].cnt++;
++		vbt_tail += (uint32_t)l;
++	}
++	lck_mtx_unlock(vbt_lock);
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t status = 0;
++
++		if (dd[i].buf) {
++			if (dd[i].used && copyout(dd[i].buf, (user_addr_t)dd[i].ptr, dd[i].used) != 0) {
++				status = 0xe00002c2;
++				dd[i].cnt = 0;
++			}
++			kfree_data(dd[i].buf, dd[i].size);
++		}
++		vbt_put32(out + 8 * i, status);
++		out[8 * i + 4] = dd[i].cnt;
++	}
++	return ret;
++}
++
+ /*
+  * Syscall trace of one process (boot-arg vincetrace=<p_comm>, e.g. bluetoothd): every syscall's number, first argument,
+  * path for the path-taking ones, and the errno, called from bsd/dev/arm/systemcalls.c. Used to learn why a daemon quits.
+diff --git a/iokit/Kernel/arm/VinceBT.cpp b/iokit/Kernel/arm/VinceBT.cpp
+new file mode 100755
+index 0000000..c6986d2
+--- /dev/null
++++ b/iokit/Kernel/arm/VinceBT.cpp
+@@ -0,0 +1,274 @@
++/*
++ * VINCE Bluetooth in the IORegistry: the "AppleBT" HCI driver interface of bluetoothd (HCI Transport "APPLEBT",
++ * transport-encoding 6 in the device tree).
++ *
++ * iOS 16's bluetoothd does not talk to a serial port: it opens the IOKit services AppleBTMgmt (trace / crash
++ * handling, unused here) and AppleBTHci (the HCI pipes) and moves HCI packets with IOConnectCallMethod. The shapes
++ * below were read from bluetoothd (applebt_transport.c, applebt_hci_*): selector 0 open, 1 close, 2 write, 3 read,
++ * 4 transport reset; write and read take n 16-byte descriptors {u8 pipe, u8 count, u16 pad, u32 size, u64 user
++ * pointer}, return n 8-byte results {u32 IOReturn, u8 item count}; an item in a pipe buffer is {u16 length,
++ * u8 sequence, u8 0} followed by one H4 packet. The "pipes" property of the service gives each pipe's item size and
++ * item count. The packets themselves go to the Pronto controller through bsd/dev/vince_bt.c.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSString.h>
++#include <sys/proc.h>
++
++extern "C" {
++int vince_bt_hci_open(void);
++void vince_bt_hci_close(void);
++int vince_bt_hci_write(const uint8_t *desc, uint32_t n, uint8_t *out);
++int vince_bt_hci_read(const uint8_t *desc, uint32_t n, uint8_t *out);
++void vince_bt_hci_reset(void);
++uint32_t vince_bt_pipe_size(int pipe);
++uint32_t vince_bt_pipe_count(int pipe);
++}
++
++#define VBT_NPIPES 11
++
++static void
++vbt_io_log(const char *what, uint32_t selector, IOExternalMethodArguments *args)
++{
++	static unsigned n;
++	char name[32];
++
++	if (n >= 200) {
++		return;
++	}
++	n++;
++	proc_selfname(name, sizeof(name));
++	IOLog("VINCE BT IO: %s selector %u by %s, in %u/%u out %u/%u\n", what, selector, name,
++	    args->scalarInputCount, (unsigned)args->structureInputSize, args->scalarOutputCount,
++	    (unsigned)args->structureOutputSize);
++}
++
++/* ---- AppleBTMgmt: trace and crash information; everything succeeds, crash information is empty ---- */
++
++class AppleBTMgmt : public IOService {
++	OSDeclareDefaultStructors(AppleBTMgmt);
++};
++OSDefineMetaClassAndStructors(AppleBTMgmt, IOService);
++
++class AppleBTMgmtUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleBTMgmtUserClient);
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleBTMgmtUserClient, IOUserClient);
++
++IOReturn
++AppleBTMgmtUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleBTMgmtUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	vbt_io_log("AppleBTMgmt", selector, args);
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++
++/* ---- AppleBluetoothModule: power / reset of the module; nothing to do here ---- */
++
++class AppleBluetoothModule : public IOService {
++	OSDeclareDefaultStructors(AppleBluetoothModule);
++};
++OSDefineMetaClassAndStructors(AppleBluetoothModule, IOService);
++
++class AppleBluetoothModuleUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleBluetoothModuleUserClient);
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleBluetoothModuleUserClient, IOUserClient);
++
++IOReturn
++AppleBluetoothModuleUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleBluetoothModuleUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	vbt_io_log("AppleBluetoothModule", selector, args);
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++
++/* ---- AppleBTHci: the HCI pipes ---- */
++
++class AppleBTHci : public IOService {
++	OSDeclareDefaultStructors(AppleBTHci);
++};
++OSDefineMetaClassAndStructors(AppleBTHci, IOService);
++
++class AppleBTHciUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleBTHciUserClient);
++public:
++	bool opened;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleBTHciUserClient, IOUserClient);
++
++IOReturn
++AppleBTHciUserClient::clientClose(void)
++{
++	if (opened) {
++		opened = false;
++		vince_bt_hci_close();
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleBTHciUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	switch (selector) {
++	case 0:         /* open */
++		vbt_io_log("AppleBTHci open", selector, args);
++		if (vince_bt_hci_open() != 0) {
++			return kIOReturnNotReady;
++		}
++		opened = true;
++		return kIOReturnSuccess;
++	case 1:         /* close */
++		vbt_io_log("AppleBTHci close", selector, args);
++		if (opened) {
++			opened = false;
++			vince_bt_hci_close();
++		}
++		return kIOReturnSuccess;
++	case 4:         /* transport reset */
++		vbt_io_log("AppleBTHci reset", selector, args);
++		vince_bt_hci_reset();
++		return kIOReturnSuccess;
++	case 2:         /* write */
++	case 3:         /* read */
++		if (!opened) {
++			return kIOReturnNotOpen;
++		}
++		if (args->structureInput == NULL || args->structureOutput == NULL || (args->structureInputSize % 16) != 0 ||
++		    args->structureOutputSize < (args->structureInputSize / 16) * 8) {
++			vbt_io_log("AppleBTHci bad shape", selector, args);
++			return kIOReturnBadArgument;
++		}
++		{
++			uint32_t n = (uint32_t)(args->structureInputSize / 16);
++			int r;
++
++			bzero(args->structureOutput, args->structureOutputSize);
++			if (selector == 2) {
++				r = vince_bt_hci_write((const uint8_t *)args->structureInput, n, (uint8_t *)args->structureOutput);
++			} else {
++				r = vince_bt_hci_read((const uint8_t *)args->structureInput, n, (uint8_t *)args->structureOutput);
++			}
++			args->structureOutputSize = n * 8;
++			return r == 0 ? kIOReturnSuccess : (r == 4 ? (IOReturn)0xe00002eb : kIOReturnError);
++		}
++	default:
++		vbt_io_log("AppleBTHci unknown", selector, args);
++		return kIOReturnUnsupported;
++	}
++}
++
++/* ---- publishing, called from vince_bt.c once the controller's SMD channels are open ---- */
++
++static AppleBTMgmt *vbt_mgmt;
++static AppleBTHci *vbt_hci;
++static AppleBluetoothModule *vbt_mod;
++
++static OSDictionary *
++vbt_pipes_dict(void)
++{
++	OSDictionary *d = OSDictionary::withCapacity(VBT_NPIPES);
++
++	for (int p = 0; d && p < VBT_NPIPES; p++) {
++		OSDictionary *e = OSDictionary::withCapacity(2);
++		OSNumber *sz = OSNumber::withNumber((unsigned long long)vince_bt_pipe_size(p), 32);
++		OSNumber *ct = OSNumber::withNumber((unsigned long long)vince_bt_pipe_count(p), 32);
++		char key[16];
++
++		snprintf(key, sizeof(key), "pipe%d", p);
++		if (e && sz && ct) {
++			e->setObject("item_size", sz);
++			e->setObject("item_count", ct);
++			d->setObject(key, e);
++		}
++		OSSafeReleaseNULL(sz);
++		OSSafeReleaseNULL(ct);
++		OSSafeReleaseNULL(e);
++	}
++	return d;
++}
++
++extern "C" int
++vince_bt_iokit_publish(void)
++{
++	OSDictionary *pipes;
++
++	if (vbt_hci) {
++		return 0;
++	}
++	vbt_mgmt = new AppleBTMgmt;
++	vbt_hci = new AppleBTHci;
++	vbt_mod = new AppleBluetoothModule;
++	if (!vbt_mgmt || !vbt_hci || !vbt_mod || !vbt_mgmt->init() || !vbt_hci->init() || !vbt_mod->init()) {
++		return -1;
++	}
++	vbt_mgmt->setName("AppleBTMgmt");
++	vbt_mgmt->setProperty(kIOUserClientClassKey, "AppleBTMgmtUserClient");
++	vbt_mod->setName("AppleBluetoothModule");
++	vbt_mod->setProperty(kIOUserClientClassKey, "AppleBluetoothModuleUserClient");
++	vbt_hci->setName("AppleBTHci");
++	vbt_hci->setProperty(kIOUserClientClassKey, "AppleBTHciUserClient");
++	pipes = vbt_pipes_dict();
++	if (pipes) {
++		vbt_hci->setProperty("pipes", pipes);
++		pipes->release();
++	}
++	if (!vbt_mod->attach(IOService::getPlatform()) || !vbt_mgmt->attach(IOService::getPlatform()) ||
++	    !vbt_hci->attach(IOService::getPlatform())) {
++		return -2;
++	}
++	vbt_mod->registerService();
++	vbt_mgmt->registerService();
++	vbt_hci->registerService();
++	IOLog("VINCE BT IO: AppleBTMgmt, AppleBTHci and AppleBluetoothModule registered\n");
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_VINCE */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 974cf31..c2b0f74 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/VinceWiFi.cpp                                   optional iokitcpp
++iokit/Kernel/arm/VinceBT.cpp                                     optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
