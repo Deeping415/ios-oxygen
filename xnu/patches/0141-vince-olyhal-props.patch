@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index 92142e2..d612810 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -585,6 +585,11 @@ vif_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 		ifmr->ifm_count = 0;
+ 		return 0;
+ 	}
++	case SIOCGIFDEVMTU:
++		ifr->ifr_devmtu.ifdm_current = VIF_MTU;
++		ifr->ifr_devmtu.ifdm_min = IF_MINMTU;
++		ifr->ifr_devmtu.ifdm_max = VIF_MTU;
++		return 0;
+ 	case SIOCADDMULTI:
+ 	case SIOCDELMULTI:
+ 		return 0;
+diff --git a/iokit/Kernel/arm/VinceBT.cpp b/iokit/Kernel/arm/VinceBT.cpp
+index 25be65d..549feb2 100755
+--- a/iokit/Kernel/arm/VinceBT.cpp
++++ b/iokit/Kernel/arm/VinceBT.cpp
+@@ -283,6 +283,13 @@ vince_bt_iokit_publish(void)
+ 
+ 		vbt_oly->setProperty("local-mac-address", (void *)addr, 6);
+ 		vbt_oly->setProperty("BluetoothAddress", (void *)addr, 6);
++		static const uint32_t vendor = 0x14e4, device = 0x4488, zero = 0;
++
++		vbt_oly->setProperty("vendor-id", (void *)&vendor, 4);          /* Broadcom (what MobileGestalt polls for) */
++		vbt_oly->setProperty("device-id", (void *)&device, 4);
++		vbt_oly->setProperty("revision-id", (void *)&zero, 4);
++		vbt_oly->setProperty("subsystem-vendor-id", (void *)&vendor, 4);
++		vbt_oly->setProperty("subsystem-id", (void *)&zero, 4);
+ 		vbt_oly->setProperty("IOBuiltin", true);
+ 		if (vbt_oly->attach(IOService::getPlatform())) {
+ 			vbt_oly->registerService();
