@@ -10,7 +10,11 @@
  * Reply keys come from bluetoothd's reply handler: "result" (int64, 0 = success), "firmware" (string),
  * "manufacturer" (int64, the HCI company id of the controller), "output" (string, for RunCommand).
  */
+#include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +42,86 @@ extern void xpc_release(xpc_object_t object);
 
 #define LISTENER 1u
 
+/*
+ * Wi-Fi self test. Nobody sits in front of the phone during bring-up, so this process (already running as root, with its
+ * stdout on the kernel console) also acts as a MobileWiFi client, the same way Settings does: it asks wifid for the
+ * device list and a scan, and prints what comes back. Every symbol is looked up at run time, so a missing one is reported
+ * instead of killing the Bluetooth stand-in.
+ */
+typedef const void *CFTypeRef_;
+typedef void (*scan_cb_t)(void *dev, const void *results, const void *err, void *ctx);
+
+static void
+wt_scan_done(void *dev, const void *results, const void *err, void *ctx)
+{
+	(void)dev;
+	(void)ctx;
+	printf("vince-wifitest: scan callback results=%p error=%p\n", results, err);
+	if (results) {
+		CFStringRef d = CFCopyDescription(results);
+		if (d) {
+			char buf[2048];
+			if (CFStringGetCString(d, buf, sizeof buf, kCFStringEncodingUTF8)) {
+				printf("vince-wifitest: %s\n", buf);
+			}
+			CFRelease(d);
+		}
+		printf("vince-wifitest: %ld networks\n", (long)CFArrayGetCount(results));
+	}
+	if (err) {
+		CFStringRef d = CFCopyDescription(err);
+		char buf[512];
+		if (d && CFStringGetCString(d, buf, sizeof buf, kCFStringEncodingUTF8)) {
+			printf("vince-wifitest: error %s\n", buf);
+		}
+	}
+}
+
+static void *
+wt_thread(void *arg)
+{
+	(void)arg;
+	sleep(75);
+	void *h = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi", RTLD_NOW);
+	printf("vince-wifitest: MobileWiFi handle %p\n", h);
+	if (!h) {
+		return NULL;
+	}
+	void *(*mgr_create)(CFAllocatorRef, long) = dlsym(h, "WiFiManagerClientCreate");
+	void (*mgr_sched)(void *, CFRunLoopRef, CFStringRef) = dlsym(h, "WiFiManagerClientScheduleWithRunLoop");
+	CFArrayRef (*mgr_devs)(void *) = dlsym(h, "WiFiManagerClientCopyDevices");
+	int (*dev_scan)(void *, CFDictionaryRef, scan_cb_t, void *) = dlsym(h, "WiFiDeviceClientScanAsync");
+	int (*mgr_getpower)(void *) = dlsym(h, "WiFiManagerClientGetPower");
+	printf("vince-wifitest: create=%p sched=%p devs=%p scan=%p getpower=%p\n", mgr_create, mgr_sched, mgr_devs, dev_scan, mgr_getpower);
+	if (!mgr_create || !mgr_devs || !dev_scan) {
+		return NULL;
+	}
+	void *mgr = mgr_create(kCFAllocatorDefault, 0);
+	printf("vince-wifitest: manager %p\n", mgr);
+	if (!mgr) {
+		return NULL;
+	}
+	if (mgr_sched) {
+		mgr_sched(mgr, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+	}
+	for (int round = 0; round < 4; round++) {
+		if (mgr_getpower) {
+			printf("vince-wifitest: power %d\n", mgr_getpower(mgr));
+		}
+		CFArrayRef devs = mgr_devs(mgr);
+		long n = devs ? CFArrayGetCount(devs) : -1;
+		printf("vince-wifitest: round %d devices %ld\n", round, n);
+		if (n > 0) {
+			CFDictionaryRef p = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+			    &kCFTypeDictionaryValueCallBacks);
+			int r = dev_scan((void *)CFArrayGetValueAtIndex(devs, 0), p, wt_scan_done, NULL);
+			printf("vince-wifitest: scan started -> %d\n", r);
+		}
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 25, false);
+	}
+	return NULL;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -45,6 +129,8 @@ main(int argc, char **argv)
 	(void)argv;
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	printf("vince-bluetool: stand-in for com.apple.BlueTool starting\n");
+	pthread_t wt;
+	pthread_create(&wt, NULL, wt_thread, NULL);
 	xpc_connection_t listener = xpc_connection_create_mach_service("com.apple.BlueTool", dispatch_get_main_queue(), LISTENER);
 	if (!listener) {
 		printf("vince-bluetool: cannot create the service\n");
