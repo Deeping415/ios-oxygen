@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index a6aab96..fa66eef 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -254,12 +254,18 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len, uint32_t *val)
+ 		}
+ 		return 0;
+ 	case A80211_STATE:
++		if (get && len < 8) {
++			*val = (uint32_t)in.state;
++		}
+ 		if (get && len >= 8) {
+ 			a80211_put32(kb, 0, 1);
+ 			a80211_put32(kb, 4, (uint32_t)in.state);
+ 		}
+ 		return 0;
+ 	case A80211_OP_MODE:
++		if (get && len < 8) {
++			*val = 1;
++		}
+ 		if (get && len >= 8) {
+ 			a80211_put32(kb, 0, 1);
+ 			a80211_put32(kb, 4, 1);                         /* APPLE80211_M_STA */
+@@ -406,21 +412,29 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len, uint32_t *val)
+ 		return in.state == VUI_S_RUN || !get ? 0 : ENXIO;
+ 	case A80211_SSID:
+ 		if (get) {
+-			if (in.state != VUI_S_RUN || len < 40) {
++			if (in.state != VUI_S_RUN || len < 32) {
+ 				return ENXIO;
+ 			}
+-			a80211_put32(kb, 0, 1);
+-			a80211_put32(kb, 4, in.ssid_len);
+-			bcopy(in.ssid, kb + 8, in.ssid_len);
++			if (len < 40) {         /* iOS 16: the bare SSID bytes, zero padded */
++				bcopy(in.ssid, kb, in.ssid_len);
++			} else {
++				a80211_put32(kb, 0, 1);
++				a80211_put32(kb, 4, in.ssid_len);
++				bcopy(in.ssid, kb + 8, in.ssid_len);
++			}
+ 		}
+ 		return 0;
+ 	case A80211_BSSID:
+ 		if (get) {
+-			if (in.state != VUI_S_RUN || len < 10) {
++			if (in.state != VUI_S_RUN || len < 6) {
+ 				return ENXIO;
+ 			}
+-			a80211_put32(kb, 0, 1);
+-			bcopy(in.bssid, kb + 4, 6);
++			if (len < 10) {         /* iOS 16: the bare address */
++				bcopy(in.bssid, kb, 6);
++			} else {
++				a80211_put32(kb, 0, 1);
++				bcopy(in.bssid, kb + 4, 6);
++			}
+ 		}
+ 		return 0;
+ 	case A80211_CHANNEL:
+@@ -451,9 +465,13 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len, uint32_t *val)
+ 		return 0;
+ 	case A80211_RATE:
+ 		if (get) {
+-			if (in.state != VUI_S_RUN || len < 12) {
++			if (in.state != VUI_S_RUN) {
+ 				return ENXIO;
+ 			}
++			if (len < 12) {
++				*val = 54;      /* iOS 16 asks with no buffer: Mbit/s in req_val */
++				return 0;
++			}
+ 			a80211_put32(kb, 0, 1);
+ 			a80211_put32(kb, 4, 1);
+ 			a80211_put32(kb, 8, 54);

@@ -1,0 +1,86 @@
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index c0b526b..54b5845 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -119,6 +119,70 @@ sweet_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t
+ 	return kIOReturnSuccess;
+ }
+ 
++/* Copy the caller's input structure (inband or descriptor) into buf; returns its length or 0. */
++static uint32_t
++sweet_aks_struct_in(IOExternalMethodArguments *args, void *buf, uint32_t max)
++{
++	if (args->structureInputDescriptor != NULL) {
++		uint32_t n = (uint32_t)args->structureInputDescriptor->getLength();
++
++		if (n == 0 || n > max) {
++			return 0;
++		}
++		args->structureInputDescriptor->readBytes(0, buf, n);
++		return n;
++	}
++	if (args->structureInput == NULL || args->structureInputSize == 0 || args->structureInputSize > max) {
++		return 0;
++	}
++	memcpy(buf, args->structureInput, args->structureInputSize);
++	return args->structureInputSize;
++}
++
++/*
++ * Class-key wrapping (aks_wrap_key / aks_unwrap_key, selectors 10 / 11). There is no Secure Enclave here, so a wrapped
++ * key is the key masked with a fixed pad plus an 8 byte tag: the same size growth (+8) as the real AES key wrap, which
++ * is all securityd (the Keychain: Wi-Fi passwords, Bluetooth link keys) looks at. NOT secure; it only lets the Keychain
++ * work at all.
++ */
++static const uint8_t sweet_aks_tag[8] = { 'V', 'I', 'N', 'C', 'E', 'A', 'K', 'S' };
++
++static uint8_t
++sweet_aks_pad(uint32_t i)
++{
++	return (uint8_t)(0x5a ^ (i * 29u) ^ (i >> 3));
++}
++
++static IOReturn
++sweet_aks_wrap(IOExternalMethodArguments *args, bool wrap)
++{
++	uint8_t in[96], out[96];
++	uint32_t n = sweet_aks_struct_in(args, in, sizeof(in));
++
++	if (n == 0) {
++		return kIOReturnBadArgument;
++	}
++	if (wrap) {
++		for (uint32_t i = 0; i < n; i++) {
++			out[i] = in[i] ^ sweet_aks_pad(i);
++		}
++		memcpy(out + n, sweet_aks_tag, sizeof(sweet_aks_tag));
++		n += sizeof(sweet_aks_tag);
++	} else {
++		if (n <= sizeof(sweet_aks_tag) || memcmp(in + n - sizeof(sweet_aks_tag), sweet_aks_tag, sizeof(sweet_aks_tag)) != 0) {
++			return kIOReturnNotPermitted;
++		}
++		n -= sizeof(sweet_aks_tag);
++		for (uint32_t i = 0; i < n; i++) {
++			out[i] = in[i] ^ sweet_aks_pad(i);
++		}
++	}
++	if (args->scalarOutputCount >= 1) {
++		args->scalarOutput[0] = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;     /* the class the key is bound to */
++	}
++	return sweet_aks_struct_out(args, out, n);
++}
++
+ /* Append SEQUENCE { UTF8String key, INTEGER value } (short forms only). */
+ static uint32_t
+ sweet_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
+@@ -222,6 +286,10 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutput[0] = 0;
+ 		args->scalarOutputCount = 1;
+ 		break;
++	case kAKSWrapKey:
++	case kAKSUnwrapKey:
++		ret = sweet_aks_wrap(args, selector == kAKSWrapKey);
++		break;
+ 	case kAKSGetDeviceState:
+ 	case kAKSGetExtDeviceState:
+ 		args->scalarOutputCount = 0;
