@@ -411,7 +411,19 @@ wlog_thread(void *arg)
 		DIR *d = opendir(WLOG_DIR);
 		char best[256] = "";
 		time_t bt = 0;
+		static const char *fixed[] = {
+			"/var/mobile/Library/Logs/wifimanager.log", "/Library/Logs/wifimanager.log",
+			"/private/var/root/Library/Logs/wifimanager.log", "/var/mobile/Library/Logs/CrashReporter/WiFi/wifimanager.log",
+		};
 
+		for (unsigned k = 0; k < sizeof(fixed) / sizeof(fixed[0]); k++) {
+			struct stat st;
+
+			if (stat(fixed[k], &st) == 0 && st.st_mtime >= bt) {
+				bt = st.st_mtime;
+				strlcpy(best, fixed[k], sizeof best);
+			}
+		}
 		if (d) {
 			struct dirent *e;
 
@@ -548,6 +560,69 @@ pb_reset(void)
 	closedir(d);
 }
 
+/* where does PosterBoard keep its data store ("PRDataStore_%lu" directories)? Print what matches; move PRDataStore_*
+ * aside once (marker v2) so the store is built again */
+static int pb_hits;
+
+static void
+pb_walk(const char *dir, int depth, bool move)
+{
+	DIR *d = opendir(dir);
+	struct dirent *e;
+
+	if (!d) {
+		return;
+	}
+	while ((e = readdir(d)) && pb_hits < 60) {
+		char p[1024];
+		struct stat st;
+
+		if (e->d_name[0] == '.' && (e->d_name[1] == '\0' || (e->d_name[1] == '.' && e->d_name[2] == '\0'))) {
+			continue;
+		}
+		snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+		if (lstat(p, &st) != 0 || !S_ISDIR(st.st_mode)) {
+			continue;
+		}
+		if (strstr(e->d_name, "PRDataStore") || strstr(e->d_name, "PosterBoard") || strstr(e->d_name, "Poster")) {
+			pb_hits++;
+			printf("vince-pb: found %s\n", p);
+			if (move && strncmp(e->d_name, "PRDataStore", 11) == 0 && !strstr(e->d_name, ".vince-bak")) {
+				char r[1100];
+
+				snprintf(r, sizeof r, "%s.vince-bak", p);
+				printf("vince-pb:   moved aside -> %d\n", rename(p, r));
+				continue;
+			}
+		}
+		if (depth > 0) {
+			pb_walk(p, depth - 1, move);
+		}
+	}
+	closedir(d);
+}
+
+static void *
+pb_thread(void *arg)
+{
+	const char *marker = "/private/var/tmp/vince-pbreset2-done";
+	bool move = access(marker, F_OK) != 0;
+
+	(void)arg;
+	pb_walk("/var/mobile/Containers/Data", 5, move);
+	pb_walk("/var/mobile/Containers/Shared/AppGroup", 4, move);
+	pb_walk("/var/mobile/Library", 4, move);
+	printf("vince-pb: search done, %d hits\n", pb_hits);
+	if (move) {
+		FILE *m = fopen(marker, "w");
+
+		if (m) {
+			fclose(m);
+		}
+	}
+	return NULL;
+}
+
 static void *
 sc_thread(void *arg)
 {
@@ -572,6 +647,8 @@ main(int argc, char **argv)
 	wlog_enable();
 	pthread_create(&wlt, NULL, wlog_thread, NULL);
 	pb_reset();
+	pthread_t pbt;
+	pthread_create(&pbt, NULL, pb_thread, NULL);
 	xpc_connection_t listener = xpc_connection_create_mach_service("com.apple.BlueTool", dispatch_get_main_queue(), LISTENER);
 	if (!listener) {
 		printf("vince-bluetool: cannot create the service\n");
