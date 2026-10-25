@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/vince_wlan_net.c b/bsd/dev/vince_wlan_net.c
+index e5fca2f..35f6f46 100644
+--- a/bsd/dev/vince_wlan_net.c
++++ b/bsd/dev/vince_wlan_net.c
+@@ -197,8 +197,17 @@ int vn_recv_eth(uint8_t *src, uint16_t *etype, uint8_t *payload, uint32_t max, u
+ 		while (vd_pop_frame(&fr)) {
+ 			if (fr.len >= 26 && (fr.data[0] == 0xc0 || fr.data[0] == 0xa0) && va_bssid() &&
+ 			    eq(fr.data + 10, va_bssid(), 6)) {
+-				s_ls.deauths++;		/* the AP dropped us */
+-				s_lost = 1 + (fr.data[24] | fr.data[25] << 8);
++				static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++				int ours = eq(fr.data + 4, vw_mac, 6) || eq(fr.data + 4, bcast, 6);
++
++				/* a deauth / disassoc the AP sends to another station of the same BSS is not ours */
++				printf("VINCE WLAN: %s from the AP to %02x:%02x:%02x:%02x:%02x:%02x reason %u%s\n",
++				    fr.data[0] == 0xc0 ? "deauth" : "disassoc", fr.data[4], fr.data[5], fr.data[6], fr.data[7],
++				    fr.data[8], fr.data[9], fr.data[24] | fr.data[25] << 8, ours ? "" : " (another station: ignored)");
++				if (ours) {
++					s_ls.deauths++;		/* the AP dropped us */
++					s_lost = 1 + (fr.data[24] | fr.data[25] << 8);
++				}
+ 				continue;
+ 			}
+ 			if (fr.len < 24 + 8 || (fr.data[0] & 0x0c) != 0x08 || !(fr.data[1] & 0x02))
+diff --git a/bsd/skywalk/core/skywalk.c b/bsd/skywalk/core/skywalk.c
+index bdf6a98..45fe950 100644
+--- a/bsd/skywalk/core/skywalk.c
++++ b/bsd/skywalk/core/skywalk.c
+@@ -202,7 +202,16 @@ SYSCTL_UINT(_kern_skywalk, OID_AUTO, debug, CTLFLAG_RW | CTLFLAG_LOCKED,
+     &sk_debug, 0, "Skywalk debug mode");
+ SYSCTL_LONG(_kern_skywalk, OID_AUTO, sk_copy_thres, CTLFLAG_RW | CTLFLAG_LOCKED,
+     &sk_copy_thres, "Skywalk copy threshold");
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++/*
++ * VINCE: the stand-in AMFI does not turn com.apple.private.skywalk.* entitlements into privileges, so every
++ * nexus registration failed with EPERM (bluetoothd's A2DP audio channel then crashed it on a NULL channel).
++ * Missing privileges are still logged, but allowed (sysctl kern.skywalk.priv_check=1 restores the check).
++ */
++static int __priv_check = 0;
++#else
+ static int __priv_check = 1;
++#endif
+ SYSCTL_INT(_kern_skywalk, OID_AUTO, priv_check, CTLFLAG_RW | CTLFLAG_LOCKED,
+     &__priv_check, 0, "Skywalk privilege check");
+ SYSCTL_UINT(_kern_skywalk, OID_AUTO, sk_opp_defunct, CTLFLAG_RW | CTLFLAG_LOCKED,
