@@ -1,0 +1,17 @@
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index d612810..e8188ea 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -515,7 +515,11 @@ a80211_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 		uint8_t *seen = &a80211_seen[get ? 1 : 0][rq->type / 8];
+ 		uint8_t bit = (uint8_t)(1u << (rq->type % 8));
+ 
+-		if (!(*seen & bit)) {
++		static int nlog;
++
++		/* first sight of every request type, then everything but the scan-result reads up to a cap: after a join
++		 * wifid's follow-up requests decide whether the association is accepted */
++		if (!(*seen & bit) || (nlog < 600 && rq->type != 11 && rq->type != 21 && nlog++ >= 0)) {
+ 			char nm[32];
+ 
+ 			*seen |= bit;
