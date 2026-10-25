@@ -149,6 +149,12 @@ wt_remote(const char *name)
 
 	printf("vince-wifitest: %s pid %d task_for_pid %d (%s)\n", name, pid, kr, tfp ? "sym" : "nosym");
 	if (kr != KERN_SUCCESS) {
+		static int aborted;
+
+		if (pid && !aborted++) {
+			printf("vince-wifitest: aborting %s to get a kernel crash backtrace\n", name);
+			kill(pid, SIGABRT);
+		}
 		return;
 	}
 	thread_act_array_t th;
@@ -194,7 +200,7 @@ static void *
 wt_thread(void *arg)
 {
 	(void)arg;
-	sleep(240);
+	sleep(90);
 	pthread_create(&wt_worker, NULL, wt_work, NULL);
 	for (int i = 0; i < 40 && !wt_done; i++) {
 		sleep(20);
