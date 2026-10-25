@@ -266,6 +266,97 @@ wt_work(void *arg)
 	return NULL;
 }
 
+/*
+ * Network configuration dump: which SystemConfiguration keys exist for en0 (is there a service, what IPv4 method, did
+ * IPConfiguration publish anything). configd logs only to os_log, which nothing reads here.
+ */
+static void
+sc_print(const char *tag, CFTypeRef obj)
+{
+	CFStringRef d = obj ? CFCopyDescription(obj) : NULL;
+	static char buf[24576];
+
+	if (!d || !CFStringGetCString(d, buf, sizeof buf, kCFStringEncodingUTF8)) {
+		printf("vince-sc: %s: (none or too long)\n", tag);
+	} else {
+		char *line = buf;
+
+		printf("vince-sc: %s:\n", tag);
+		for (char *p = buf; ; p++) {
+			if (*p == '\n' || *p == '\0') {
+				char c = *p;
+
+				*p = '\0';
+				printf("vince-sc:   %s\n", line);
+				if (c == '\0') {
+					break;
+				}
+				line = p + 1;
+			}
+		}
+	}
+	if (d) {
+		CFRelease(d);
+	}
+}
+
+static void
+sc_dump(void)
+{
+	void *h = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOW);
+	CFTypeRef (*create)(CFAllocatorRef, CFStringRef, void *, void *) = h ? dlsym(h, "SCDynamicStoreCreate") : NULL;
+	CFDictionaryRef (*multi)(CFTypeRef, CFArrayRef, CFArrayRef) = h ? dlsym(h, "SCDynamicStoreCopyMultiple") : NULL;
+
+	if (!create || !multi) {
+		printf("vince-sc: no SystemConfiguration\n");
+		return;
+	}
+	CFTypeRef st = create(NULL, CFSTR("vince-sc"), NULL, NULL);
+	CFStringRef pats[] = {
+		CFSTR("State:/Network/Interface/en0/.*"), CFSTR("State:/Network/Service/.*"), CFSTR("State:/Network/Global/.*"),
+		CFSTR("Setup:/Network/Service/.*/Interface"), CFSTR("Setup:/Network/Service/.*/IPv4"), CFSTR("Setup:/Network/Global/.*"),
+	};
+	CFArrayRef pa = CFArrayCreate(NULL, (const void **)pats, sizeof(pats) / sizeof(pats[0]), &kCFTypeArrayCallBacks);
+	CFDictionaryRef r = st ? multi(st, NULL, pa) : NULL;
+
+	sc_print("dynamic store", r);
+	if (r) {
+		CFRelease(r);
+	}
+	CFRelease(pa);
+	CFURLRef u = CFURLCreateWithFileSystemPath(NULL, CFSTR("/private/var/preferences/SystemConfiguration/preferences.plist"),
+	    kCFURLPOSIXPathStyle, false);
+	CFReadStreamRef rs = CFReadStreamCreateWithFile(NULL, u);
+
+	if (rs && CFReadStreamOpen(rs)) {
+		CFPropertyListRef pl = CFPropertyListCreateWithStream(NULL, rs, 0, kCFPropertyListImmutable, NULL, NULL);
+		CFTypeRef ns = pl ? CFDictionaryGetValue(pl, CFSTR("NetworkServices")) : NULL;
+
+		sc_print("preferences.plist NetworkServices", ns);
+		if (pl) {
+			CFRelease(pl);
+		}
+		CFReadStreamClose(rs);
+	} else {
+		printf("vince-sc: preferences.plist not readable\n");
+	}
+	if (rs) {
+		CFRelease(rs);
+	}
+	CFRelease(u);
+}
+
+static void *
+sc_thread(void *arg)
+{
+	(void)arg;
+	sleep(330);
+	sc_dump();
+	sleep(240);
+	sc_dump();
+	return NULL;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -273,8 +364,9 @@ main(int argc, char **argv)
 	(void)argv;
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	printf("vince-bluetool: stand-in for com.apple.BlueTool starting\n");
-	pthread_t wt;
+	pthread_t wt, sct;
 	pthread_create(&wt, NULL, wt_thread, NULL);
+	pthread_create(&sct, NULL, sc_thread, NULL);
 	xpc_connection_t listener = xpc_connection_create_mach_service("com.apple.BlueTool", dispatch_get_main_queue(), LISTENER);
 	if (!listener) {
 		printf("vince-bluetool: cannot create the service\n");
