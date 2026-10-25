@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+index 67a3edb..ce00955 100755
+--- a/bsd/dev/vince_bt.c
++++ b/bsd/dev/vince_bt.c
+@@ -169,8 +169,9 @@ vbt_feed(const uint8_t *b, uint32_t n)
+ static int
+ vbt_open(dev_t dev, int flags, int devtype, proc_t p)
+ {
+-#pragma unused(dev, flags, devtype, p)
++#pragma unused(flags, devtype)
+ 	vbt_opens++;
++	printf("VINCE BT: open minor %d by %s\n", minor(dev), p ? proc_best_name(p) : "?");
+ 	return 0;
+ }
+ 
+@@ -423,10 +424,13 @@ vince_bt_start(void)
+ 		printf("VINCE BT: cdevsw_add failed\n");
+ 		return;
+ 	}
+-	(void)devfs_make_node(makedev(vbt_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.bluetooth");
+-	(void)devfs_make_node(makedev(vbt_major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "cu.bluetooth");
+-	(void)devfs_make_node(makedev(vbt_major, 2), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "btwake");
+-	(void)devfs_make_node(makedev(vbt_major, 3), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.log");
++	{
++		void *n0 = devfs_make_node(makedev(vbt_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.bluetooth");
++		void *n1 = devfs_make_node(makedev(vbt_major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "cu.bluetooth");
++		void *n2 = devfs_make_node(makedev(vbt_major, 2), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "btwake");
++		void *n3 = devfs_make_node(makedev(vbt_major, 3), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.log");
++		printf("VINCE BT: devfs nodes %p %p %p %p\n", n0, n1, n2, n3);
++	}
+ 	if (kernel_thread_start(vbt_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+ 		printf("VINCE BT: /dev/uart.bluetooth and /dev/cu.bluetooth registered (major %d)\n", vbt_major);
