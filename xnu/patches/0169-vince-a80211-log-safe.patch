@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index d255316..ddba943 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -358,14 +358,9 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len, uint32_t *val)
+ 			uint32_t kl = len > 68 ? a80211_get32(kb, 60) : 0;
+ 			uint32_t ct = len > 68 ? a80211_get32(kb, 64) : 0;
+ 
+-			if (!a80211_assoc_dumped) {
+-				a80211_assoc_dumped = true;
+-				printf("VINCE A80211: ASSOCIATE data (%u bytes), first 96:", len);
+-				for (uint32_t i = 0; i < len && i < 96; i++) {
+-					printf("%s%02x", i % 16 ? " " : "\n  ", kb[i]);
+-				}
+-				printf("\n  ssid_len %u key_len %u cipher %u auth %u/%u\n", sl, kl, ct, kb[6] | kb[7] << 8, kb[8] | kb[9] << 8);
+-			}
++			a80211_assoc_dumped = true;
++			printf("VINCE A80211: ASSOCIATE %u bytes: ssid_len %u key_len %u cipher %u auth %u/%u\n", len, sl, kl, ct,
++			    kb[6] | kb[7] << 8, kb[8] | kb[9] << 8);
+ 			bzero(&a, sizeof(a));
+ 			if (sl == 0 || sl > 32) {
+ 				return EINVAL;
+@@ -555,7 +550,10 @@ a80211_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 
+ 		/* first sight of every request type, then everything but the scan-result reads up to a cap: after a join
+ 		 * wifid's follow-up requests decide whether the association is accepted */
+-		if (!(*seen & bit) || (nlog < 600 && rq->type != 11 && rq->type != 21 && nlog++ >= 0)) {
++		bool noisy = rq->type == 11 || rq->type == 21 || rq->type == 103 || rq->type == 19 || rq->type == 254 ||
++		    rq->type == 27 || rq->type == 51 || rq->type == 10 || rq->type == 383 || rq->type == 12;
++
++		if (!(*seen & bit) || (nlog < 4000 && !noisy && nlog++ >= 0)) {
+ 			char nm[32];
+ 
+ 			*seen |= bit;
