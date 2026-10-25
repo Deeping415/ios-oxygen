@@ -27,7 +27,7 @@ jobs:
             n=${n%_stub}
             xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" -O2 -fblocks \
               -framework CoreFoundation -Wall -o "out/vince-$n" "$f"
-            codesign -f -s - "out/vince-$n"
+            codesign -f -s - --entitlements userland/ent.plist "out/vince-$n"
             file "out/vince-$n"
             ls -la "out/vince-$n"
           done

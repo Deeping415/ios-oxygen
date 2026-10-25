@@ -108,6 +108,11 @@ wt_thread(void *arg)
 		if (mgr_getpower) {
 			printf("vince-wifitest: power %d\n", mgr_getpower(mgr));
 		}
+		void (*mgr_setpower)(void *, int) = dlsym(h, "WiFiManagerClientSetPower");
+		if (round == 1 && mgr_setpower) {
+			mgr_setpower(mgr, 1);
+			printf("vince-wifitest: requested power on\n");
+		}
 		CFArrayRef devs = mgr_devs(mgr);
 		long n = devs ? CFArrayGetCount(devs) : -1;
 		printf("vince-wifitest: round %d devices %ld\n", round, n);
