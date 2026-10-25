@@ -1,0 +1,108 @@
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index a208f61..74616ca 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -1057,20 +1057,34 @@ vui_scan(void)
+ 	vif_a80211_event(10, NULL, 0);          /* APPLE80211_M_SCAN_DONE */
+ }
+ 
++/* the link event's data (at least 32 bytes, or the framework drops the event) */
++struct apple80211_link_changed {
++	uint8_t down, unused_0[3];
++	int32_t rssi;
++	uint16_t snr, noise;
++	uint8_t unused_1[4];
++	uint8_t involuntary, unused_2[3];
++	uint32_t reason, subreason;
++	uint8_t unused_3[4];
++};
++
+ static void
+-vui_link_event(bool down, uint32_t rssi, bool voluntary, uint32_t reason)
++vui_link_event(bool down, int32_t rssi, bool voluntary, uint32_t reason)
+ {
+-	uint8_t d[24];
+-
+-	bzero(d, sizeof(d));
+-	d[0] = down;
+-	d[4] = (uint8_t)rssi;
+-	d[5] = (uint8_t)(rssi >> 8);
+-	d[6] = (uint8_t)(rssi >> 16);
+-	d[7] = (uint8_t)(rssi >> 24);
+-	d[16] = voluntary;
+-	d[20] = (uint8_t)reason;
+-	vif_a80211_event(4, d, sizeof(d));      /* APPLE80211_M_LINK_CHANGED */
++	struct apple80211_link_changed link;
++
++	bzero(&link, sizeof(link));
++	link.down = down ? 1 : 0;
++	link.rssi = rssi;
++	if (!down) {
++		link.snr = 30;
++		link.noise = (uint16_t)-95;
++	} else {
++		link.involuntary = voluntary ? 0 : 1;
++		link.reason = reason;
++		link.subreason = 0;
++	}
++	vif_a80211_event(4, &link, sizeof(link));      /* APPLE80211_M_LINK_CHANGED */
+ }
+ 
+ /* returns 1 when the firmware has to be restarted */
+@@ -1083,7 +1097,6 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 	const struct vd_bss *b, *hit = NULL;
+ 	struct vd_bss ap;
+ 	int r, why, lr;
+-	uint8_t res[4] = { 0, 0, 0, 0 };
+ 
+ 	for (int pass = 0; pass < 2 && !hit; pass++) {
+ 		b = vd_bss_list(&n);
+@@ -1111,8 +1124,7 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 		printf("VINCE UI: network not found\n");
+ 		vui_set_state(VUI_S_INIT);
+ 		vui_set_result(9);
+-		res[0] = 9;                                     /* APPLE80211_RESULT_TIMEOUT */
+-		vif_a80211_event(9, res, sizeof(res));
++		vif_a80211_event(9, NULL, 0);
+ 		return 0;
+ 	}
+ 	ap = *hit;
+@@ -1130,8 +1142,7 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 		if (dead) {
+ 			return 1;
+ 		}
+-		res[0] = 2;
+-		vif_a80211_event(9, res, sizeof(res));
++		vif_a80211_event(9, NULL, 0);
+ 		return 0;
+ 	}
+ 	if (!a->open) {
+@@ -1148,12 +1159,11 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 			vwpa_stop();
+ 			lr = va_leave(&ap, 1);
+ 			vui_set_state(VUI_S_INIT);
+-			vui_set_result(dead ? 9 : 2);
++			vui_set_result(dead ? 9 : 21);
+ 			if (dead || (lr <= -2 && lr >= -5)) {
+ 				return 1;
+ 			}
+-			res[0] = 22;                            /* supplicant timeout / wrong key */
+-			vif_a80211_event(9, res, sizeof(res));
++			vif_a80211_event(9, NULL, 0);
+ 			return 0;
+ 		}
+ 	}
+@@ -1167,11 +1177,10 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 	vui_i.assoc_result = 1;
+ 	lck_mtx_unlock(vui_lk);
+ 	vif_ui_up();
+-	res[0] = 1;                                             /* APPLE80211_RESULT_SUCCESS */
+ 	vif_a80211_event(2, NULL, 0);                           /* SSID_CHANGED */
+ 	vif_a80211_event(3, NULL, 0);                           /* BSSID_CHANGED */
+-	vif_a80211_event(9, res, sizeof(res));                  /* ASSOC_DONE */
+-	vui_link_event(false, (uint32_t)(int)ap.rssi, true, 0);
++	vif_a80211_event(9, NULL, 0);                           /* ASSOC_DONE */
++	vui_link_event(false, ap.rssi, true, 0);
+ 	if (vui_selftest) {
+ 		int d = vn_dhcp();
+ 
