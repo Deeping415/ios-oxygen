@@ -370,16 +370,20 @@ wlog_enable(void)
 	mkdir("/private/var/Managed Preferences", 0755);
 	mkdir(dir, 0755);
 	snprintf(path, sizeof path, "%s/com.apple.MobileWiFi.debug.plist", dir);
-	if (access(path, F_OK) != 0) {
-		FILE *f = fopen(path, "w");
+	/*
+	 * The diagnostic profile turned out to move wifid's log from /Library/Logs/wifimanager.log into an in-memory ring
+	 * that is only written out on demand. The plain file log is verbose enough: remove the profile again (once).
+	 */
+	(void)plist;
+	if (access(path, F_OK) == 0) {
+		FILE *f = stdout;
 
+		unlink(path);
 		if (f) {
 			int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
 			size_t sz = 0;
 
-			fputs(plist, f);
-			fclose(f);
-			printf("vince-wlog: wifid debug log enabled; restarting wifid once so it reads it\n");
+			printf("vince-wlog: wifid diagnostic profile removed; restarting wifid once so it logs to the file again\n");
 			if (sysctl(mib, 3, NULL, &sz, NULL, 0) == 0) {
 				struct kinfo_proc *kp = malloc(sz + 4096);
 
