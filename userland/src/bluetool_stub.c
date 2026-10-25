@@ -464,6 +464,90 @@ wlog_thread(void *arg)
 	return NULL;
 }
 
+/*
+ * PosterBoard (wallpapers) aborts on every start with "Invalid condition not satisfying: !_stateLock_switcherConfiguration"
+ * in -[PBFPosterExtensionDataStore _stateLock_setupSwitcherConfigurationForFirstTime]: its data store holds a
+ * half-written configuration from an early boot, so lock and home screen stay black. Once (marker file), move the
+ * data store aside inside PosterBoard's data container so it is created again; nothing is deleted.
+ */
+static void
+pb_reset(void)
+{
+	const char *base = "/var/mobile/Containers/Data/Application";
+	const char *marker = "/private/var/tmp/vince-pbreset-done";
+	DIR *d = opendir(base);
+	struct dirent *e;
+
+	if (!d) {
+		printf("vince-pb: no %s\n", base);
+		return;
+	}
+	while ((e = readdir(d))) {
+		char p[512];
+
+		if (e->d_name[0] == '.') {
+			continue;
+		}
+		snprintf(p, sizeof p, "%s/%s/.com.apple.mobile_container_manager.metadata.plist", base, e->d_name);
+		CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)p, (CFIndex)strlen(p), false);
+		CFReadStreamRef rs = u ? CFReadStreamCreateWithFile(NULL, u) : NULL;
+		CFPropertyListRef pl = NULL;
+
+		if (rs && CFReadStreamOpen(rs)) {
+			pl = CFPropertyListCreateWithStream(NULL, rs, 0, kCFPropertyListImmutable, NULL, NULL);
+			CFReadStreamClose(rs);
+		}
+		if (rs) {
+			CFRelease(rs);
+		}
+		if (u) {
+			CFRelease(u);
+		}
+		CFStringRef id = pl && CFGetTypeID(pl) == CFDictionaryGetTypeID() ?
+		    CFDictionaryGetValue(pl, CFSTR("MCMMetadataIdentifier")) : NULL;
+		bool hit = id && CFGetTypeID(id) == CFStringGetTypeID() && CFStringFind(id, CFSTR("PosterBoard"), 0).location != kCFNotFound;
+
+		if (pl) {
+			CFRelease(pl);
+		}
+		if (!hit) {
+			continue;
+		}
+		char as[512];
+
+		snprintf(as, sizeof as, "%s/%s/Library/Application Support", base, e->d_name);
+		printf("vince-pb: PosterBoard container %s\n", e->d_name);
+		DIR *d2 = opendir(as);
+		struct dirent *f;
+		bool done = access(marker, F_OK) == 0;
+
+		while (d2 && (f = readdir(d2))) {
+			char q[600], r[640];
+
+			if (f->d_name[0] == '.') {
+				continue;
+			}
+			snprintf(q, sizeof q, "%s/%s", as, f->d_name);
+			printf("vince-pb:   Application Support/%s\n", f->d_name);
+			if (!done && !strstr(f->d_name, ".vince-bak")) {
+				snprintf(r, sizeof r, "%s.vince-bak", q);
+				printf("vince-pb:   moved aside -> %d\n", rename(q, r));
+			}
+		}
+		if (d2) {
+			closedir(d2);
+		}
+		if (!done) {
+			FILE *m = fopen(marker, "w");
+
+			if (m) {
+				fclose(m);
+			}
+		}
+	}
+	closedir(d);
+}
+
 static void *
 sc_thread(void *arg)
 {
@@ -487,6 +571,7 @@ main(int argc, char **argv)
 	pthread_create(&sct, NULL, sc_thread, NULL);
 	wlog_enable();
 	pthread_create(&wlt, NULL, wlog_thread, NULL);
+	pb_reset();
 	xpc_connection_t listener = xpc_connection_create_mach_service("com.apple.BlueTool", dispatch_get_main_queue(), LISTENER);
 	if (!listener) {
 		printf("vince-bluetool: cannot create the service\n");
