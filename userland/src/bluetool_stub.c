@@ -13,6 +13,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <libproc.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <string.h>
@@ -118,6 +119,66 @@ wt_stack(pthread_t t)
 	thread_resume(mp);
 }
 
+/* every thread of another process (wifid): where does it wait? Shared cache images sit at the same address in all
+ * processes, so dladdr() names those frames */
+static void
+wt_remote(const char *name)
+{
+	int n = proc_listallpids(NULL, 0);
+	pid_t *pids = calloc((size_t)n + 16, sizeof(pid_t));
+	pid_t pid = 0;
+
+	n = proc_listallpids(pids, (int)(((size_t)n + 16) * sizeof(pid_t)));
+	for (int i = 0; i < n; i++) {
+		char nm[64];
+
+		if (proc_name(pids[i], nm, sizeof nm) > 0 && !strcmp(nm, name)) {
+			pid = pids[i];
+		}
+	}
+	free(pids);
+	mach_port_t task = MACH_PORT_NULL;
+	kern_return_t (*tfp)(mach_port_t, int, mach_port_t *) = dlsym(RTLD_DEFAULT, "task_for_pid");
+	kern_return_t kr = pid && tfp ? tfp(mach_task_self(), pid, &task) : KERN_FAILURE;
+
+	printf("vince-wifitest: %s pid %d task_for_pid %d\n", name, pid, kr);
+	if (kr != KERN_SUCCESS) {
+		return;
+	}
+	thread_act_array_t th;
+	mach_msg_type_number_t nth = 0;
+
+	if (task_threads(task, &th, &nth) != KERN_SUCCESS) {
+		return;
+	}
+	for (mach_msg_type_number_t t = 0; t < nth; t++) {
+		arm_thread_state64_t st;
+		mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+
+		thread_suspend(th[t]);
+		if (thread_get_state(th[t], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
+			printf("vince-wifitest: %s thread %u\n", name, t);
+			wt_where("pc", (uintptr_t)st.__pc);
+			wt_where("lr", (uintptr_t)st.__lr);
+			uintptr_t fp = (uintptr_t)st.__fp;
+			for (int i = 0; i < 20 && fp && !(fp & 7); i++) {
+				uintptr_t fr[2] = { 0, 0 };
+				vm_size_t got = 0;
+
+				if (vm_read_overwrite(task, fp, 16, (vm_address_t)fr, &got) != KERN_SUCCESS || got != 16) {
+					break;
+				}
+				wt_where("fr", fr[1]);
+				if (fr[0] <= fp || fr[0] - fp > (1u << 20)) {
+					break;
+				}
+				fp = fr[0];
+			}
+		}
+		thread_resume(th[t]);
+	}
+}
+
 static volatile int wt_done;
 static pthread_t wt_worker;
 
@@ -134,6 +195,7 @@ wt_thread(void *arg)
 		if (!wt_done && (i & 1)) {
 			printf("vince-wifitest: worker still busy, stack:\n");
 			wt_stack(wt_worker);
+			wt_remote("wifid");
 		}
 	}
 	return NULL;
