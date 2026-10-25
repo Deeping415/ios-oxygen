@@ -12,10 +12,10 @@ index de8484d..4b430ef 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/vince_adreno.c b/bsd/dev/vince_adreno.c
 new file mode 100644
-index 0000000..11f3a86
+index 0000000..c0a06f1
 --- /dev/null
 +++ b/bsd/dev/vince_adreno.c
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,365 @@
 +/*
 + * Xiaomi Redmi 5 Plus (vince) Adreno 506 GPU bringup driver.
 + *
@@ -25,17 +25,11 @@ index 0000000..11f3a86
 + *   3  writes  OXILI_CX_GDSC power on
 + *   4  writes  OXILI_GX_GDSC power on (and clamp deassert)
 + *   5  writes  GCC OXILI branch clocks on (AHB, GFX3D, AON, TIMER)
-+ *   6  reads   GPU SMMU registers (0x01c48000)
++ *   6  skips   SMMU probe (MSM-IOMMU V2 secure-id 18 is TZ managed)
 + *   7  asks    TrustZone SCM if PAS_GPU (13) authentication is supported
 + *   8  asks    TrustZone to initialize Zap shader image header (SCM_PAS_INIT_IMAGE)
 + *   9  asks    TrustZone to authenticate & reset GPU (SCM_PAS_AUTH_AND_RESET)
 + *  10  reads   Adreno 506 3D core hardware registers (0x01c0024c, 0x01c013d4)
-+ *  11  writes  Adreno 506 hardware config (a5xx_hw_init: thresholds, 64-bit mode, ECO cntl)
-+ *  12  writes  PM4 & PFP microcode memory
-+ *  13  writes  Command Processor (CP) ringbuffer setup
-+ *  14  writes  CP_ME_INIT command and verify micro engine runs
-+ *  15  writes  CP_SET_SECURE_MODE out of secure mode
-+ *  16  draws   first hardware-accelerated test rectangle
 + */
 +
 +#if defined(ARM64_BOARD_CONFIG_VINCE)
@@ -60,9 +54,6 @@ index 0000000..11f3a86
 +
 +#define QFPROM_BASE_PA          0x00078000u
 +#define QFPROM_SIZE             0x8000u
-+
-+#define GPU_SMMU_BASE_PA        0x01c48000u
-+#define GPU_SMMU_SIZE           0x8000u
 +
 +#define GPU_CORE_BASE_PA        0x01c00000u
 +#define GPU_CORE_SIZE           0x40000u
@@ -96,13 +87,13 @@ index 0000000..11f3a86
 +#define SCM_INTERRUPTED         1
 +#define PAS_GPU                 13
 +
-+#define STEPS 16
++#define STEPS 10
 +
 +static uint32_t last_step = 0;
++static uint32_t skip_steps = 0;
 +static uint32_t pause_ms = 0;
 +static vm_offset_t gcc_va = 0;
 +static vm_offset_t qfprom_va = 0;
-+static vm_offset_t smmu_va = 0;
 +static vm_offset_t gpu_va = 0;
 +
 +static inline uint32_t
@@ -259,21 +250,11 @@ index 0000000..11f3a86
 +	return true;
 +}
 +
-+/* Step 6: Probe SMMU */
++/* Step 6: SMMU check (MSM-IOMMU V2 is managed by TrustZone via sec-id 18) */
 +static bool
-+step6_probe_smmu(void)
++step6_smmu_status(void)
 +{
-+	printf("adreno: step 6: probing GPU SMMU at 0x01c48000\n");
-+	if (!smmu_va) {
-+		smmu_va = ml_io_map(GPU_SMMU_BASE_PA, GPU_SMMU_SIZE);
-+		if (!smmu_va) {
-+			printf("adreno: step 6: FAILED to map GPU SMMU\n");
-+			return false;
-+		}
-+	}
-+	uint32_t scr0 = reg_read(smmu_va, 0x0000);
-+	uint32_t sidr0 = reg_read(smmu_va, 0x0020);
-+	printf("adreno: step 6: SMMU sCR0=%#x sIDR0=%#x\n", scr0, sidr0);
++	printf("adreno: step 6: MSM-IOMMU V2 (sec-id 18) managed by TrustZone, bypassing MMIO\n");
 +	return true;
 +}
 +
@@ -297,7 +278,6 @@ index 0000000..11f3a86
 +step8_zap_header(void)
 +{
 +	printf("adreno: step 8: authenticating Zap shader header (%u bytes)\n", a506_zap_mdt_size);
-+	/* Zap header needs to be passed as physical memory */
 +	vm_offset_t pa = kvtophys((vm_offset_t)&a506_zap_mdt[0]);
 +	printf("adreno: step 8: Zap header PA=%#lx\n", pa);
 +
@@ -351,7 +331,7 @@ index 0000000..11f3a86
 +	step3_power_cx,
 +	step4_power_gx,
 +	step5_enable_clocks,
-+	step6_probe_smmu,
++	step6_smmu_status,
 +	step7_scm_check,
 +	step8_zap_header,
 +	step9_zap_auth_reset,
@@ -375,13 +355,19 @@ index 0000000..11f3a86
 +	if (last_step > 10) {
 +		last_step = 10;
 +	}
++	PE_parse_boot_argn("adreno_skip", &skip_steps, sizeof(skip_steps));
 +	PE_parse_boot_argn("adreno_pause", &pause_ms, sizeof(pause_ms));
 +
 +	printf("==================================================\n");
-+	printf("VINCE ADRENO 506: starting steps 1 to %u (pause %u ms)\n", last_step, pause_ms);
++	printf("VINCE ADRENO 506: starting steps 1 to %u (skip mask %#x, pause %u ms)\n",
++	    last_step, skip_steps, pause_ms);
 +	printf("==================================================\n");
 +
 +	for (uint32_t i = 1; i <= last_step; i++) {
++		if (skip_steps & (1u << i)) {
++			printf("VINCE ADRENO: step %u SKIPPED by boot-arg\n", i);
++			continue;
++		}
 +		if (!steps[i - 1]()) {
 +			printf("VINCE ADRENO: step %u FAILED!\n", i);
 +			break;
