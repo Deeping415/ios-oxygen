@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index 36b76d2..004cc93 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -18,7 +18,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
+-#include <sys/malloc.h>
++#include <kern/kalloc.h>
+ #include <sys/mbuf.h>
+ #include <sys/socket.h>
+ #include <sys/sockio.h>
+@@ -485,6 +485,7 @@ a80211_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 	struct a80211_req *rq = data;
+ 	bool get = cmd == SIOCGA80211_A || cmd == SIOCGA80211_B;
+ 	uint8_t *kb;
++	uint32_t kbsz;
+ 	uint32_t len = rq->len;
+ 	user_addr_t ua = (user_addr_t)rq->data;
+ 	int err = 0;
+@@ -493,7 +494,8 @@ a80211_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 	if (len > 16384) {
+ 		len = 16384;
+ 	}
+-	kb = _MALLOC(len < 1536 ? 1536 : len, M_TEMP, M_WAITOK | M_ZERO);
++	kbsz = len < 1536 ? 1536 : len;
++	kb = kalloc_data(kbsz, Z_WAITOK | Z_ZERO);
+ 	if (kb == NULL) {
+ 		return ENOMEM;
+ 	}
+@@ -521,7 +523,7 @@ a80211_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 	if (get && !err && len && ua) {
+ 		err = copyout(kb, ua, len);
+ 	}
+-	_FREE(kb, M_TEMP);
++	kfree_data(kb, kbsz);
+ 	return err;
+ }
+ 
