@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index e8188ea..a6aab96 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -327,6 +327,24 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len, uint32_t *val)
+ 			return 0;
+ 		}
+ 		return get ? EIO : 0;
++	case 103:       /* CURRENT_NETWORK: wifid polls it while joining and right after; same record as a scan result */
++		if (get) {
++			if (!ui || in.state != VUI_S_RUN) {
++				return ENXIO;
++			}
++			for (uint32_t i = 0;; i++) {
++				const struct vd_bss *e = vui_result(i);
++
++				if (!e) {
++					return ENXIO;
++				}
++				if (bcmp(e->bssid, in.bssid, 6) == 0) {
++					(void)a80211_scan_result(kb, len, e);
++					return 0;
++				}
++			}
++		}
++		return 0;
+ 	case A80211_ASSOCIATE:
+ 		if (!get && ui) {
+ 			struct vui_assoc a;
