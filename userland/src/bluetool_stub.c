@@ -13,7 +13,6 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
-extern int proc_listallpids(void *buffer, int buffersize);
 extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 #include <mach/mach.h>
 #include <pthread.h>
@@ -125,24 +124,20 @@ wt_stack(pthread_t t)
 static void
 wt_remote(const char *name)
 {
-	int n = proc_listallpids(NULL, 0);
-	pid_t *pids = calloc((size_t)n + 16, sizeof(pid_t));
 	pid_t pid = 0;
 
-	n = proc_listallpids(pids, (int)(((size_t)n + 16) * sizeof(pid_t)));
-	for (int i = 0; i < n; i++) {
-		char nm[64];
+	for (int p = 1; p < 2048; p++) {
+		char nm[64] = "";
 
-		if (proc_name(pids[i], nm, sizeof nm) > 0 && !strcmp(nm, name)) {
-			pid = pids[i];
+		if (proc_name(p, nm, sizeof nm) > 0 && !strcmp(nm, name)) {
+			pid = p;
 		}
 	}
-	free(pids);
 	mach_port_t task = MACH_PORT_NULL;
 	kern_return_t (*tfp)(mach_port_t, int, mach_port_t *) = dlsym(RTLD_DEFAULT, "task_for_pid");
 	kern_return_t kr = pid && tfp ? tfp(mach_task_self(), pid, &task) : KERN_FAILURE;
 
-	printf("vince-wifitest: %s pid %d task_for_pid %d\n", name, pid, kr);
+	printf("vince-wifitest: %s pid %d task_for_pid %d (%s)\n", name, pid, kr, tfp ? "sym" : "nosym");
 	if (kr != KERN_SUCCESS) {
 		return;
 	}
