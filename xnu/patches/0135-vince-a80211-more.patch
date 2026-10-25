@@ -1,0 +1,81 @@
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index c449ff0..36b76d2 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -18,6 +18,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <sys/malloc.h>
+ #include <sys/mbuf.h>
+ #include <sys/socket.h>
+ #include <sys/sockio.h>
+@@ -444,9 +445,35 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len)
+ 			}
+ 			a80211_put32(kb, 0, 1);
+ 			a80211_put32(kb, 4, 0);
+-			a80211_put32(kb, 8, 15);
++				a80211_put32(kb, 8, 15);
+ 		}
+ 		return 0;
++	case 254:       /* HW_SUPPORTED_CHANNELS: version, count, then {version, channel, flags} per channel */
++		if (get && len >= 8 + 12 * 13) {
++			a80211_put32(kb, 0, 1);
++			a80211_put32(kb, 4, 13);
++			for (uint32_t c = 1; c <= 13; c++) {
++				a80211_channel(kb, 8 + 12 * (c - 1), c);
++			}
++		}
++		return 0;
++	case 207:       /* CHANNELS_INFO (itlwm struct apple80211_channels_info, 128 entries per array) */
++		if (get && len >= 0xa0c) {
++			a80211_put32(kb, 0, 1);
++			a80211_put16(kb, 8, 13);
++			for (uint32_t c = 1; c <= 13; c++) {
++				a80211_put16(kb, 10 + 2 * (c - 1), (uint16_t)c);        /* chan_spec */
++				kb[0x10a + (c - 1)] = (uint8_t)c;                       /* chan_num */
++				a80211_put32(kb, 0x60c + 4 * (c - 1), 0);
++			}
++		}
++		return 0;
++	case 106:       /* RSSI_BOUNDS: nothing to report */
++	case 96:        /* VIRTUAL_IF_ROLE: this is the primary interface */
++		if (get && len >= 8) {
++			a80211_put32(kb, 0, 1);
++		}
++		return type == 106 ? 0 : EOPNOTSUPP;
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}
+@@ -457,16 +484,19 @@ a80211_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ {
+ 	struct a80211_req *rq = data;
+ 	bool get = cmd == SIOCGA80211_A || cmd == SIOCGA80211_B;
+-	uint8_t kb[1536];
++	uint8_t *kb;
+ 	uint32_t len = rq->len;
+ 	user_addr_t ua = (user_addr_t)rq->data;
+ 	int err = 0;
+ 
+ #pragma unused(ifp)
+-	if (len > sizeof(kb)) {
+-		len = sizeof(kb);
++	if (len > 16384) {
++		len = 16384;
++	}
++	kb = _MALLOC(len < 1536 ? 1536 : len, M_TEMP, M_WAITOK | M_ZERO);
++	if (kb == NULL) {
++		return ENOMEM;
+ 	}
+-	bzero(kb, sizeof(kb));
+ 	if (len && ua && !get) {
+ 		err = copyin(ua, kb, len);
+ 	} else if (len && ua && get) {
+@@ -491,6 +521,7 @@ a80211_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 	if (get && !err && len && ua) {
+ 		err = copyout(kb, ua, len);
+ 	}
++	_FREE(kb, M_TEMP);
+ 	return err;
+ }
+ 
