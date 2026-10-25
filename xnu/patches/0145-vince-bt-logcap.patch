@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+index 30d6f12..7b10bfe 100755
+--- a/bsd/dev/vince_bt.c
++++ b/bsd/dev/vince_bt.c
+@@ -38,7 +38,7 @@ extern int vince_bt_iokit_publish(void);
+ 
+ #define RXSZ            0x8000u         /* H4 byte ring towards bluetoothd, power of two */
+ #define MAXH4           (4 + 1024 + 64)
+-#define LOGMAX          160
++#define LOGMAX          1500
+ 
+ static lck_grp_t *vbt_grp;
+ static lck_mtx_t *vbt_lock;
+@@ -629,7 +629,6 @@ vince_bt_hci_read(const uint8_t *d, uint32_t n, uint8_t *out)
+ 		for (int j = 0; j < l; j++) {
+ 			dd[k].buf[dd[k].used + 4 + (uint32_t)j] = vbt_rx[(vbt_tail + (uint32_t)j) & m];
+ 		}
+-		vbt_log("ctrl->host (AppleBT)", dd[k].buf + dd[k].used + 4, (uint32_t)l);
+ 		dd[k].used += 4 + (uint32_t)l;
+ 		dd[k].cnt++;
+ 		vbt_tail += (uint32_t)l;
