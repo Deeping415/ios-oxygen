@@ -1,0 +1,56 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 806bbfa..b870f73 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2620,7 +2620,7 @@ sweet_iolog(char *name, size_t len)
+ 		}
+ 		sweet_iolog_parsed = 1;
+ 	}
+-	if (sweet_iolog_lines >= 400) {
++	if (sweet_iolog_lines >= 1200) {
+ 		return false;
+ 	}
+ 	proc_selfname(name, (int)len);
+@@ -2652,6 +2652,18 @@ sweet_iolog_dict(const char *name, const char *what, OSObject *dict, const char
+ 	IOLog("IOK %s: %s %.240s -> %s\n", name, what, text, result);
+ 	OSSafeReleaseNULL(ser);
+ }
++
++/* Registry property reads: "IOK name: get Entry.property -> found/none". */
++static void
++sweet_iolog_prop(const char *how, IORegistryEntry *entry, const char *prop, bool found)
++{
++	char sname[32];
++	if (sweet_iolog(sname, sizeof(sname))) {
++		IOLog("IOK %s: %s %s.%.60s -> %s\n", sname, how, entry ? entry->getName() : "?", prop, found ? "found" : "none");
++	}
++}
++#else
++#define sweet_iolog_prop(how, entry, prop, found) do { } while (0)
+ #endif
+ 
+ kern_return_t
+@@ -3658,6 +3670,7 @@ is_io_registry_entry_get_property_bytes(
+ #endif
+ 
+ 	obj = IOCopyPropertyCompatible(entry, property_name);
++	sweet_iolog_prop("getb", entry, property_name, obj != NULL);
+ 	if (!obj) {
+ 		return kIOReturnNoResources;
+ 	}
+@@ -3726,6 +3739,7 @@ is_io_registry_entry_get_property(
+ #endif
+ 
+ 	obj = IOCopyPropertyCompatible(entry, property_name);
++	sweet_iolog_prop("get", entry, property_name, obj != NULL);
+ 	if (!obj) {
+ 		return kIOReturnNotFound;
+ 	}
+@@ -4000,6 +4014,7 @@ is_io_registry_entry_get_property_bin_buf(
+ 	}
+ 
+ 	sym->release();
++	sweet_iolog_prop("getbin", entry, property_name, obj != NULL);
+ 	if (!obj) {
+ 		return err;
+ 	}
