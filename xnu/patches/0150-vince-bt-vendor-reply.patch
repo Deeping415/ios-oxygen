@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/vince_bt.c b/bsd/dev/vince_bt.c
+index 85b838c..0f48af9 100755
+--- a/bsd/dev/vince_bt.c
++++ b/bsd/dev/vince_bt.c
+@@ -107,6 +107,17 @@ vbt_fake_complete(uint16_t opcode)
+ 	vbt_rx_push(0x04, ev, sizeof(ev));
+ }
+ 
++/* a vendor command (OGF 0x3f): bluetoothd's Broadcom parsers read status, then the echoed sub-opcode, then more
++ * (e.g. the multi-advertising instance); status 0, sub-opcode echo and zero padding satisfies all of them */
++static void
++vbt_fake_vendor(uint16_t opcode, const uint8_t *params, uint32_t plen)
++{
++	uint8_t ev[14] = { 0x0e, 0x0c, 0x01, (uint8_t)opcode, (uint8_t)(opcode >> 8), 0x00 };
++
++	ev[6] = plen ? params[0] : 0;
++	vbt_rx_push(0x04, ev, sizeof(ev));
++}
++
+ /* one complete H4 packet from bluetoothd */
+ static void
+ vbt_send_packet(const uint8_t *p, uint32_t n)
+@@ -120,7 +131,7 @@ vbt_send_packet(const uint8_t *p, uint32_t n)
+ 		uint16_t op = (uint16_t)(p[1] | p[2] << 8);
+ 
+ 		if ((op >> 10) == 0x3f) {
+-			vbt_fake_complete(op);          /* vendor command: answered here */
++			vbt_fake_vendor(op, p + 4, p[3]);       /* vendor command: answered here */
+ 			return;
+ 		}
+ 		if (op == 0x0c5b) {
