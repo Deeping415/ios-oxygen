@@ -3,10 +3,10 @@
 # dxb runs patches/*.sh from the XNU source root before applying *.patch.
 set -euo pipefail
 
-# VINCE builds the same HFS in (xnu/patches/0091-vince-hfs-emmc-root.patch).
-[[ "${MACHINE_CONFIG:-}" == SWEET || "${MACHINE_CONFIG:-}" == VINCE ]] || exit 0
+# VINCE and OXYGEN build the same HFS in (xnu/patches/0091-vince-hfs-emmc-root.patch).
+[[ "${MACHINE_CONFIG:-}" == SWEET || "${MACHINE_CONFIG:-}" == VINCE || "${MACHINE_CONFIG:-}" == OXYGEN ]] || exit 0
 [[ "${MACOS_VERSION:-}" == 13.5 ]] || {
-    echo 'SWEET/VINCE HFS integration requires xnu-8796.141.3 (macOS 13.5)' >&2
+    echo 'SWEET/VINCE/OXYGEN HFS integration requires xnu-8796.141.3 (macOS 13.5)' >&2
     exit 1
 }
 [[ -f bsd/kern/bsd_init.c ]] || exit 1

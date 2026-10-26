@@ -1,4 +1,4 @@
-name: xnu-vince
+name: xnu-msm8953
 
 on:
   workflow_dispatch:
@@ -10,8 +10,8 @@ on:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
       machine_config:
-        description: xnu MACHINE_CONFIG
-        default: VINCE
+        description: xnu MACHINE_CONFIG (VINCE or OXYGEN)
+        default: OXYGEN
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -23,7 +23,7 @@ on:
       - ".github/workflows/xnu-vince.yml"
 
 concurrency:
-  group: xnu-${{ github.ref }}
+  group: xnu-${{ github.ref }}-${{ inputs.machine_config || 'OXYGEN' }}
   cancel-in-progress: true
 
 env:
@@ -31,7 +31,7 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'VINCE' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'OXYGEN' }}
 
 jobs:
   build:
@@ -66,7 +66,7 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
-      - name: Build XNU Kernel for Vince
+      - name: Build XNU Kernel for MSM8953 device
         working-directory: dxb
         env:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
@@ -103,6 +103,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel-vince
+          name: xnu-kernel-${{ inputs.machine_config || 'OXYGEN' }}
           path: out/
           if-no-files-found: warn

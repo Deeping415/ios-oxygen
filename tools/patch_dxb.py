@@ -15,7 +15,7 @@ def main():
         'sed -i \'\' \'s|$(SDKROOT)/usr/local/include|$(FAKEROOT_DIR)/usr/local/include|g\' "${SRCROOT}/xcodeconfig/libfirehose_kernel.xcconfig"\n        sed -i \'\' \'s/-Wno-packed/-Wno-packed -march=armv8-a -mcpu=cortex-a53/g\' "${SRCROOT}/libdispatch.xcodeproj/project.pbxproj"'
     )
 
-    # 2. Target-aware patch application loop (fail on critical Vince patches, warn on optional)
+    # 2. Target-aware patch application loop (fail on critical MSM8953 patches, warn on optional)
     old_loop = """        for PATCH in "${PATCH_DIR}"/*.patch; do
             if APPLY_CHECK=$(git apply --check "$PATCH" 2>&1); then
                 running "Applying patch: ${PATCH}"
@@ -32,8 +32,8 @@ def main():
             else
                 PATCH_NAME=$(basename "${PATCH}")
                 case "${PATCH_NAME}" in
-                    *0004*|*0090*|*vince*)
-                        error "CRITICAL VINCE PATCH FAILED: ${PATCH}: ${APPLY_CHECK}"
+                    *0004*|*0090*|*vince*|*oxygen*)
+                        error "CRITICAL MSM8953 PATCH FAILED: ${PATCH}: ${APPLY_CHECK}"
                         exit 1
                         ;;
                     *)
@@ -45,7 +45,7 @@ def main():
 
     if old_loop in content:
         content = content.replace(old_loop, new_loop)
-        print("[OK] Replaced patch loop with target-aware Vince check")
+        print("[OK] Replaced patch loop with target-aware MSM8953 check")
     else:
         print("[WARN] old_loop not found directly in content")
 
