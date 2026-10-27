@@ -12,10 +12,10 @@ index de8484d..4b430ef 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/vince_adreno.c b/bsd/dev/vince_adreno.c
 new file mode 100644
-index 0000000..ed52278
+index 0000000..83cd8d9
 --- /dev/null
 +++ b/bsd/dev/vince_adreno.c
-@@ -0,0 +1,575 @@
+@@ -0,0 +1,919 @@
 +/*
 + * Xiaomi Redmi 5 Plus (vince) Adreno 506 GPU bringup driver.
 + *
@@ -23,14 +23,14 @@ index 0000000..ed52278
 + *   1  reads   GCC clocks & GDSC status
 + *   2  reads   QFPROM speed bin & chip ID fuses
 + *   3  writes  OXILI_CX_GDSC power on
-+ *   4  writes  OXILI_GX_GDSC power on (and clamp deassert)
-+ *   5  writes  GCC OXILI branch clocks on (AHB, GFX3D, AON, TIMER)
-+ *   6  skips   SMMU probe (MSM-IOMMU V2 secure-id 18 is TZ managed)
-+ *   7  asks    TrustZone SCM if PAS_GPU (13) authentication is supported
-+ *   8  asks    TrustZone to initialize Zap shader image header (SCM_PAS_INIT_IMAGE)
-+ *   9  sets    TrustZone zap memory region & loads zap shader segment b02 (SCM_PAS_MEM_SETUP)
-+ *  10  asks    TrustZone to authenticate & reset GPU (SCM_PAS_AUTH_AND_RESET)
-+ *  11  reads   Adreno 506 3D core hardware registers (0x01c0024c, 0x01c013d4)
++ *   4  writes  OXILI_GX_GDSC power on, GMEM clamp off (the GFX LDO block is left as LK set it)
++ *   5  writes  GCC OXILI branch clocks on (AHB, GFX3D, BIMC, AON, TIMER), crypto clocks for TZ
++ *   6  asks    TZ restore_sec_cfg(GPU IOMMU 18), then reads the GPU registers
++ *   7  writes  a5xx_hw_init registers (mainline drm/msm)
++ *   8  loads   PM4/PFP microcode, sets up the ring buffer and starts the micro engine
++ *   9  runs    CP_ME_INIT and the first command (CP_MEM_WRITE to RAM)
++ *  10  loads   the zap shader: TZ secure page table, PIL 13 init/mem_setup/auth, CP_SET_SECURE_MODE 0
++ *  11  runs    a command after leaving secure mode
 + */
 +
 +#if defined(ARM64_BOARD_CONFIG_VINCE)
@@ -60,22 +60,23 @@ index 0000000..ed52278
 +#define GPU_CORE_BASE_PA        0x01c00000u
 +#define GPU_CORE_SIZE           0x40000u
 +
-+#define ZAP_SHADER_BASE_PA      0x81800000u
-+#define ZAP_SHADER_SIZE         0x2000u
-+
 +/* GCC Registers */
 +#define GCC_GFX3D_CMD_RCGR      0x59000u
 +#define GCC_GFX3D_CFG_RCGR      0x59004u
 +#define GCC_OXILI_GX_GDSCR      0x5901cu
 +#define GCC_OXILI_GFX3D_CBCR    0x59020u
++#define GCC_OXILI_GMEM_CBCR     0x59024u
 +#define GCC_OXILI_AHB_CBCR      0x59028u
 +#define GCC_BIMC_GPU_CBCR       0x59030u
++#define GCC_BIMC_GFX_CBCR       0x59034u
 +#define GCC_OXILI_TIMER_CBCR    0x59040u
 +#define GCC_OXILI_AON_CBCR      0x59044u
 +#define GCC_OXILI_CX_GDSCR      0x5904cu
 +#define GCC_CLAMP_IO_CTRL       0x5b00cu
 +
-+#define GCC_BIMC_GFX_CBCR       0x59034u
++/* GFX LDO & Power Switch Registers (0x0185f000 per Qualcomm msm_gfx_ldo driver) */
++#define GCC_GFX_PWRSWITCH_CTRL      0x5f01cu
++#define GCC_GFX_PWRSWITCH_STATUS    0x5f028u
 +
 +/* Crypto Engine Clock Registers (Required by TrustZone PAS authentication) */
 +#define GCC_CRYPTO_CMD_RCGR     0x16004u
@@ -83,28 +84,130 @@ index 0000000..ed52278
 +#define GCC_CRYPTO_CBCR         0x1601cu
 +#define GCC_CRYPTO_AXI_CBCR     0x16020u
 +#define GCC_CRYPTO_AHB_CBCR     0x16024u
++#define GCC_APCS_GPLL_ENA_VOTE  0x45000u
 +#define GCC_APCS_CLOCK_BRANCH_ENA_VOTE 0x45004u
 +
 +/* GDSC bitmasks */
 +#define GDSC_PWR_ON             (1u << 31)
 +#define GDSC_SW_COLLAPSE        (1u << 0)
 +
++/* Adreno 506 Core Hardware Registers */
++#define REG_A5XX_RBBM_INT_0_STATUS        0x00f8u
++#define REG_A5XX_RBBM_SW_RESET_CMD        0x010cu
++#define REG_A5XX_RBBM_AHB_CNTL0           0x024cu
++#define REG_A5XX_RBBM_STATUS              0x13d4u
++#define REG_A5XX_RBBM_STATUS3             0x14c0u
++#define REG_A5XX_VBIF_VERSION             0xc000u
++#define REG_A5XX_VBIF_CLKON               0xc004u
++#define REG_A5XX_VBIF_ROUND_ROBIN_QOS_ARB 0xc124u
++#define REG_A5XX_RBBM_SECVID_TRUST_CNTL   0x3d000u
++
 +/* SCM Definitions */
-+#define SCM_FAST                (1ull << 31)
-+#define SCM_64                  (1ull << 30)
-+#define SCM_SIP                 (2ull << 24)
-+#define SCM_CALL(svc, cmd)      (((uint64_t)(svc) << 8) | (cmd))
-+#define SCM_IS_CALL_AVAILABLE   SCM_CALL(6, 1)
-+#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
-+#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
-+#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
-+#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
-+#define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
 +#define ARGS_ONE_VALUE          0x01ull
 +#define ARGS_TWO_VALUES         0x82ull /* (2 | (2 << 6)): 1 val + 1 RW buffer */
 +#define ARGS_THREE_VALUES       0x03ull /* 3 plain values */
 +#define SCM_INTERRUPTED         1
 +#define PAS_GPU                 13
++
++/*
++ * TZ MP service restore_sec_cfg (svc 0x0C cmd 2), in the plain FNID form the shim proved on this phone.
++ * Without it every access to the GPU's register space is a synchronous external abort; mainline makes the same
++ * call for the GPU IOMMU (qcom,iommu-secure-id = 18) whenever OXILI_CX_GDSC comes up (qcom_iommu.c).
++ */
++#define SCM_MP_RESTORE_SEC_CFG  0x02000C02ull
++#define ARGS_TWO_PLAIN          0x02ull
++#define GPU_IOMMU_SEC_ID        18
++
++/*
++ * The rest of the bring-up (steps 7-11) follows mainline a5xx_hw_init and was proven step by step on this phone
++ * through the shim (tools/gpu/a5xx_shim_init.py, 2026-10-26). All SCM calls use the plain FNID form that works here.
++ */
++#define SCM_MP_PTBL_SIZE        0x02000C03ull   /* iommu_secure_ptbl_size(spare) -> x1 = size */
++#define SCM_MP_PTBL_INIT        0x02000C04ull   /* iommu_secure_ptbl_init(addr, size, spare) */
++#define ARGS_PTBL_INIT          0x23ull         /* 3 args, first one a RW buffer */
++#define SCM_PIL_INIT_IMAGE      0x02000201ull
++#define SCM_PIL_MEM_SETUP       0x02000202ull
++#define SCM_PIL_AUTH_AND_RESET  0x02000205ull
++#define SCM_PIL_IS_SUPPORTED    0x02000207ull
++
++/*
++ * GPU memory: RAM below XNU's DRAM (which starts at 0xa0000000), mapped uncached so the GPU sees every CPU write.
++ * The GPU SMMU stays in the bypass TZ leaves after restore_sec_cfg, so GPU addresses are physical addresses.
++ */
++#define GPU_MEM_PA              0x47800000u
++#define GPU_MEM_SIZE            0x00200000u
++#define GPU_PM4_OFF             0x00000000u
++#define GPU_PFP_OFF             0x00010000u
++#define GPU_RB_OFF              0x00020000u     /* 32 KiB ring */
++#define GPU_SCRATCH_OFF         0x00030000u
++#define GPU_ZAP_MDT_OFF         0x00040000u
++#define GPU_SEC_PTBL_OFF        0x00100000u     /* given to TZ, never touched by the CPU afterwards */
++#define GPU_SEC_PTBL_MAX        0x00080000u
++#define ZAP_MEM_PA              0x95000000u     /* mainline's zap@95000000 reserved region */
++#define ZAP_MEM_SIZE            0x2000u
++
++/* a5xx registers, dword offsets (generated a5xx.xml.h) */
++#define A5_RBBM_INTERFACE_HANG_INT_CNTL 0x002f
++#define A5_RBBM_INT_CLEAR_CMD           0x0037
++#define A5_RBBM_INT_0_MASK              0x0038
++#define A5_RBBM_AHB_CNTL0               0x0093
++#define A5_RBBM_AHB_CNTL1               0x0094
++#define A5_RBBM_AHB_CNTL2               0x0095
++#define A5_RBBM_PERFCTR_CNTL            0x0464
++#define A5_RBBM_PERFCTR_RBBM_SEL_0      0x046b
++#define A5_RBBM_PERFCTR_GPU_BUSY_MASKED 0x046f
++#define A5_RBBM_INT_0_STATUS            0x04e1
++#define A5_RBBM_STATUS                  0x04f5
++#define A5_CP_RB_BASE                   0x0800
++#define A5_CP_RB_BASE_HI                0x0801
++#define A5_CP_RB_CNTL                   0x0802
++#define A5_CP_RB_RPTR                   0x0806
++#define A5_CP_RB_WPTR                   0x0807
++#define A5_CP_ROQ_THRESHOLDS_1          0x081f
++#define A5_CP_ROQ_THRESHOLDS_2          0x0820
++#define A5_CP_MEQ_THRESHOLDS            0x0825
++#define A5_CP_MERCIU_SIZE               0x0826
++#define A5_CP_PFP_ME_CNTL               0x0832
++#define A5_CP_CHICKEN_DBG               0x0833
++#define A5_CP_PFP_INSTR_BASE_LO         0x0835
++#define A5_CP_PFP_INSTR_BASE_HI         0x0836
++#define A5_CP_ME_INSTR_BASE_LO          0x0838
++#define A5_CP_ME_INSTR_BASE_HI          0x0839
++#define A5_CP_PROTECT0                  0x0880
++#define A5_CP_PROTECT_CNTL              0x08a0
++#define A5_CP_INTERRUPT_STATUS          0x0b18
++#define A5_CP_HW_FAULT                  0x0b1a
++#define A5_CP_PROTECT_STATUS            0x0b1c
++#define A5_CP_PERFCTR_CP_SEL_0          0x0bb0
++#define A5_RB_DBG_ECO_CNTL              0x0cc4
++#define A5_RB_MODE_CNTL                 0x0cc6
++#define A5_PC_DBG_ECO_CNTL              0x0d00
++#define A5_HLSQ_DBG_ECO_CNTL            0x0e04
++#define A5_VPC_DBG_ECO_CNTL             0x0e60
++#define A5_UCHE_MODE_CNTL               0x0e81
++#define A5_UCHE_WRITE_THRU_BASE_LO      0x0e87
++#define A5_UCHE_WRITE_THRU_BASE_HI      0x0e88
++#define A5_UCHE_TRAP_BASE_LO            0x0e89
++#define A5_UCHE_TRAP_BASE_HI            0x0e8a
++#define A5_UCHE_GMEM_RANGE_MIN_LO       0x0e8b
++#define A5_UCHE_GMEM_RANGE_MIN_HI       0x0e8c
++#define A5_UCHE_GMEM_RANGE_MAX_LO       0x0e8d
++#define A5_UCHE_GMEM_RANGE_MAX_HI       0x0e8e
++#define A5_UCHE_CACHE_WAYS              0x0e96
++#define A5_TPL1_MODE_CNTL               0x0f02
++#define A5_RBBM_SECVID_TRUST_CNTL       0xf400
++#define A5_RBBM_SECVID_TSB_TRUSTED_BASE_LO 0xf800
++#define A5_RBBM_SECVID_TSB_TRUSTED_BASE_HI 0xf801
++#define A5_RBBM_SECVID_TSB_TRUSTED_SIZE 0xf802
++#define A5_RBBM_SECVID_TSB_CNTL         0xf803
++
++/* PM4 type-7 opcodes */
++#define CP_NOP                  16
++#define CP_MEM_WRITE            61
++#define CP_ME_INIT              72
++#define CP_SET_SECURE_MODE      102
++
++#define A5XX_INT_MASK           0x1190037eu     /* a5xx_gpu.c A5XX_INT_MASK */
 +
 +#define STEPS 11
 +
@@ -136,19 +239,7 @@ index 0000000..ed52278
 +	}
 +}
 +
-+static void
-+clean_range(vm_offset_t va, uint64_t len)
-+{
-+	vm_offset_t a = va & ~63UL;
-+	vm_offset_t e = va + len;
-+
-+	for (; a < e; a += 64) {
-+		__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
-+	}
-+	__asm__ volatile("dsb sy" ::: "memory");
-+}
-+
-+/* SCM ARM SMC primitive */
++/* SCM ARM SMC primitive (the legacy "x1 = argument info" form; an interrupted call resumes with x0 = 1) */
 +static int32_t
 +vince_scm_invoke(const char *desc, uint64_t fnid, uint64_t args, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t *out_answer)
 +{
@@ -166,64 +257,41 @@ index 0000000..ed52278
 +		register uint64_t x6 __asm__("x6") = session;
 +		register uint64_t x7 __asm__("x7") = 0;
 +
-+		__asm__ volatile("smc #0"
-+		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
-+		    :
-+		    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		__asm__ volatile(
++			"smc #0\n"
++			: "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
++			  "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++			:
++			: "memory", "cc"
++		);
 +
-+		session = x6 ? x6 : 1;
-+		if (x0 != SCM_INTERRUPTED) {
-+			if (out_answer) {
-+				*out_answer = x1;
-+			}
-+			printf("VINCE SCM: %s [%#llx] returns %d, ans=%#llx (%d resumes)\n",
-+			    desc, fnid, (int32_t)x0, x1, resumes);
-+			return (int32_t)x0;
++		if ((int32_t)x0 == SCM_INTERRUPTED) {
++			session = x6 ? x6 : 1;  /* as the shim's pas.c, which Pronto's PIL calls proved */
++			resumes++;
++			delay(100);
++			continue;
 +		}
-+		resumes++;
++
++		if (out_answer) {
++			*out_answer = x1;
++		}
++		if (resumes > 0) {
++			printf("adreno: %s resumed %d times, ret=%d ans=%#llx\n",
++			    desc, resumes, (int32_t)x0, x1);
++		}
++		return (int32_t)x0;
 +	}
-+	printf("VINCE SCM: %s [%#llx] timed out after 400 iterations\n", desc, fnid);
++
++	printf("adreno: %s SMC yield loop timed out after 400 iterations\n", desc);
 +	return -1;
 +}
 +
-+/* SCM caller trying legacy yielding (pas.c), SMC64 yielding, and SMC64 fast */
-+static int32_t
-+vince_scm_call(const char *desc, uint64_t function, uint64_t args, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t *out_answer)
-+{
-+	int32_t ret;
-+	uint64_t ans = 0;
-+
-+	/* 1. Try legacy yielding SMC (0x02000000 | function) - device-verified convention for PAS */
-+	ret = vince_scm_invoke(desc, SCM_SIP | function, args, arg0, arg1, arg2, &ans);
-+	if (ret == 0) {
-+		if (out_answer) {
-+			*out_answer = ans;
-+		}
-+		return 0;
-+	}
-+
-+	/* 2. Try SMC64 yielding (0x42000000 | function) */
-+	ret = vince_scm_invoke(desc, SCM_SIP | SCM_64 | function, args, arg0, arg1, arg2, &ans);
-+	if (ret == 0) {
-+		if (out_answer) {
-+			*out_answer = ans;
-+		}
-+		return 0;
-+	}
-+
-+	/* 3. Try SMC64 fast call (0xC2000000 | function) */
-+	ret = vince_scm_invoke(desc, SCM_SIP | SCM_64 | SCM_FAST | function, args, arg0, arg1, arg2, &ans);
-+	if (out_answer) {
-+		*out_answer = ans;
-+	}
-+	return ret;
-+}
 +
 +/* Step 1: Read GCC Clocks */
 +static bool
 +step1_read_clocks(void)
 +{
-+	uint32_t cx, gx, ahb, gfx;
++	uint32_t cx, gx, ahb, gfx, cmd, cfg, gpll;
 +
 +	printf("adreno: step 1: reading GCC clock controller\n");
 +	if (!gcc_va) {
@@ -237,7 +305,11 @@ index 0000000..ed52278
 +	gx = reg_read(gcc_va, GCC_OXILI_GX_GDSCR);
 +	ahb = reg_read(gcc_va, GCC_OXILI_AHB_CBCR);
 +	gfx = reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR);
-+	printf("adreno: step 1: CX_GDSC=%#x GX_GDSC=%#x AHB_CLK=%#x GFX_CLK=%#x\n", cx, gx, ahb, gfx);
++	cmd = reg_read(gcc_va, GCC_GFX3D_CMD_RCGR);
++	cfg = reg_read(gcc_va, GCC_GFX3D_CFG_RCGR);
++	gpll = reg_read(gcc_va, GCC_APCS_GPLL_ENA_VOTE);
++	printf("adreno: step 1: CX_GDSC=%#x GX_GDSC=%#x AHB_CLK=%#x GFX_CLK=%#x (CMD=%#x CFG=%#x GPLL_VOTE=%#x)\n",
++	    cx, gx, ahb, gfx, cmd, cfg, gpll);
 +	return true;
 +}
 +
@@ -287,32 +359,50 @@ index 0000000..ed52278
 +	return false;
 +}
 +
-+/* Step 4: Power OXILI_GX_GDSC & Deassert Clamp */
++/* Step 4: Power OXILI_GX_GDSC, Configure GFX LDO & Deassert All Clamps */
 +static bool
 +step4_power_gx(void)
 +{
-+	uint32_t val;
++	uint32_t val, pwr_ctl, pwr_stat;
 +	int i;
 +
-+	printf("adreno: step 4: powering OXILI_GX_GDSC & deasserting clamp\n");
++	printf("adreno: step 4: powering OXILI_GX_GDSC & deasserting IO clamps\n");
++
++	/* 1. Deassert GMEM / GX domain clamp */
 +	reg_write(gcc_va, GCC_CLAMP_IO_CTRL, reg_read(gcc_va, GCC_CLAMP_IO_CTRL) & ~1u);
 +
++	/* 2. Power on OXILI_GX_GDSC */
 +	val = reg_read(gcc_va, GCC_OXILI_GX_GDSCR);
-+	if (val & GDSC_PWR_ON) {
-+		printf("adreno: step 4: OXILI_GX_GDSC already on (%#x)\n", val);
-+		return true;
-+	}
-+	reg_write(gcc_va, GCC_OXILI_GX_GDSCR, val & ~GDSC_SW_COLLAPSE);
-+	for (i = 0; i < 1000; i++) {
-+		val = reg_read(gcc_va, GCC_OXILI_GX_GDSCR);
-+		if (val & GDSC_PWR_ON) {
-+			printf("adreno: step 4: OXILI_GX_GDSC powered on (%#x)\n", val);
-+			return true;
++	if (!(val & GDSC_PWR_ON)) {
++		reg_write(gcc_va, GCC_OXILI_GX_GDSCR, val & ~GDSC_SW_COLLAPSE);
++		for (i = 0; i < 1000; i++) {
++			val = reg_read(gcc_va, GCC_OXILI_GX_GDSCR);
++			if (val & GDSC_PWR_ON) {
++				break;
++			}
++			delay(10);
 +		}
-+		delay(10);
 +	}
-+	printf("adreno: step 4: OXILI_GX_GDSC timed out (%#x)\n", val);
-+	return false;
++	if (!(val & GDSC_PWR_ON)) {
++		printf("adreno: step 4: OXILI_GX_GDSC timed out (%#x)\n", val);
++		return false;
++	}
++
++	/* 3. Retain GMEM memory and peripheral logic across power switches (gdsc_force_mem_on) */
++	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (3u << 13));
++
++	/*
++	 * The GFX LDO block (0x0185f000) is left as LK set it: mainline never touches it and the GPU registers
++	 * read fine there with PWRSWITCH_CTRL still 0x80000038 (ground truth, 2026-10-26).
++	 */
++	pwr_ctl = reg_read(gcc_va, GCC_GFX_PWRSWITCH_CTRL);
++	pwr_stat = reg_read(gcc_va, GCC_GFX_PWRSWITCH_STATUS);
++
++	printf("adreno: step 4: OXILI_GX_GDSC on (%#x), PWRSWITCH_CTRL=%#x, PWRSWITCH_STATUS=%#x\n",
++	    val, pwr_ctl, pwr_stat);
++
++	delay(50);
++	return true;
 +}
 +
 +/* Step 5: Turn on GCC Branch Clocks */
@@ -320,21 +410,38 @@ index 0000000..ed52278
 +step5_enable_clocks(void)
 +{
 +	int i;
++	uint32_t gfx_cbcr, ahb_cbcr;
 +
 +	printf("adreno: step 5: enabling GCC OXILI, BIMC and Crypto branch clocks\n");
 +
-+	/* 1. Turn on GFX3D Core RCG root clock sourced from XO (19.2 MHz, div=1 -> 0x1) */
-+	reg_write(gcc_va, GCC_GFX3D_CFG_RCGR, 0x1u);
++	/* 1. Ensure GPLL0 active vote */
++	reg_write(gcc_va, GCC_APCS_GPLL_ENA_VOTE, reg_read(gcc_va, GCC_APCS_GPLL_ENA_VOTE) | 1u);
++
++	/* 2. Configure GFX3D Core RCG: 100 MHz via GPLL0_DIV2 (0x507) */
++	reg_write(gcc_va, GCC_GFX3D_CFG_RCGR, 0x507u);
 +	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (1u << 0));
-+	for (i = 0; i < 500; i++) {
++	for (i = 0; i < 1000; i++) {
 +		if (!(reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) & (1u << 0))) {
 +			break;
 +		}
-+		delay(5);
++		delay(2);
 +	}
++	/* Fallback to XO (0x1) if 100MHz didn't update */
++	if (reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) & (1u << 0)) {
++		printf("adreno: step 5: GFX3D GPLL0_DIV2 update timed out, trying XO (0x1)\n");
++		reg_write(gcc_va, GCC_GFX3D_CFG_RCGR, 0x1u);
++		reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (1u << 0));
++		for (i = 0; i < 1000; i++) {
++			if (!(reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) & (1u << 0))) {
++				break;
++			}
++			delay(2);
++		}
++	}
++	/* Enable Root */
 +	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (1u << 1));
 +
-+	/* 2. Turn on OXILI and BIMC GPU memory interface branch clocks */
++	/* 3. Turn on OXILI and BIMC GPU branch clocks */
 +	reg_write(gcc_va, GCC_OXILI_AHB_CBCR, reg_read(gcc_va, GCC_OXILI_AHB_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_OXILI_GFX3D_CBCR, reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_BIMC_GPU_CBCR, reg_read(gcc_va, GCC_BIMC_GPU_CBCR) | 1u);
@@ -342,7 +449,21 @@ index 0000000..ed52278
 +	reg_write(gcc_va, GCC_OXILI_AON_CBCR, reg_read(gcc_va, GCC_OXILI_AON_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_OXILI_TIMER_CBCR, reg_read(gcc_va, GCC_OXILI_TIMER_CBCR) | 1u);
 +
-+	/* 3. Configure Crypto Engine to 80 MHz (GPLL0 / 10 -> 0x113) for TrustZone PAS */
++	/* Wait for branch clocks CLK_OFF (bit 31) to clear */
++	for (i = 0; i < 1000; i++) {
++		if (!(reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR) & (1u << 31))) {
++			break;
++		}
++		delay(2);
++	}
++	for (i = 0; i < 1000; i++) {
++		if (!(reg_read(gcc_va, GCC_OXILI_AHB_CBCR) & (1u << 31))) {
++			break;
++		}
++		delay(2);
++	}
++
++	/* 4. Configure Crypto Engine to 80 MHz (GPLL0 / 10 -> 0x113) */
 +	reg_write(gcc_va, GCC_CRYPTO_CFG_RCGR, 0x113u);
 +	reg_write(gcc_va, GCC_CRYPTO_CMD_RCGR, reg_read(gcc_va, GCC_CRYPTO_CMD_RCGR) | (1u << 0));
 +	for (i = 0; i < 500; i++) {
@@ -353,182 +474,405 @@ index 0000000..ed52278
 +	}
 +	reg_write(gcc_va, GCC_CRYPTO_CMD_RCGR, reg_read(gcc_va, GCC_CRYPTO_CMD_RCGR) | (1u << 1));
 +
-+	/* 4. Turn on Crypto Branch clocks and vote */
++	/* 5. Turn on Crypto Branch clocks and vote */
 +	reg_write(gcc_va, GCC_APCS_CLOCK_BRANCH_ENA_VOTE, reg_read(gcc_va, GCC_APCS_CLOCK_BRANCH_ENA_VOTE) | 0x7u);
 +	reg_write(gcc_va, GCC_CRYPTO_CBCR, reg_read(gcc_va, GCC_CRYPTO_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_CRYPTO_AXI_CBCR, reg_read(gcc_va, GCC_CRYPTO_AXI_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_CRYPTO_AHB_CBCR, reg_read(gcc_va, GCC_CRYPTO_AHB_CBCR) | 1u);
 +
-+	printf("adreno: step 5: clocks active (AHB=%#x GFX=%#x BIMC_GPU=%#x BIMC_GFX=%#x AON=%#x TIMER=%#x CRYPTO=%#x VOTE=%#x)\n",
-+	    reg_read(gcc_va, GCC_OXILI_AHB_CBCR),
-+	    reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR),
++	gfx_cbcr = reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR);
++	ahb_cbcr = reg_read(gcc_va, GCC_OXILI_AHB_CBCR);
++
++	printf("adreno: step 5: clocks active (AHB=%#x [OFF=%u] GFX=%#x [OFF=%u] CMD=%#x CFG=%#x BIMC_GPU=%#x BIMC_GFX=%#x)\n",
++	    ahb_cbcr, (ahb_cbcr >> 31) & 1u,
++	    gfx_cbcr, (gfx_cbcr >> 31) & 1u,
++	    reg_read(gcc_va, GCC_GFX3D_CMD_RCGR),
++	    reg_read(gcc_va, GCC_GFX3D_CFG_RCGR),
 +	    reg_read(gcc_va, GCC_BIMC_GPU_CBCR),
-+	    reg_read(gcc_va, GCC_BIMC_GFX_CBCR),
-+	    reg_read(gcc_va, GCC_OXILI_AON_CBCR),
-+	    reg_read(gcc_va, GCC_OXILI_TIMER_CBCR),
-+	    reg_read(gcc_va, GCC_CRYPTO_CBCR),
-+	    reg_read(gcc_va, GCC_APCS_CLOCK_BRANCH_ENA_VOTE));
++	    reg_read(gcc_va, GCC_BIMC_GFX_CBCR));
++
++	delay(50);
 +	return true;
 +}
 +
-+/* Step 6: SMMU check (MSM-IOMMU V2 is managed by TrustZone via sec-id 18) */
++/* Step 6: Read Adreno 506 Core Hardware Registers (Pre-ZAP direct verification) */
 +static bool
-+step6_smmu_status(void)
++step6_read_core(void)
 +{
-+	printf("adreno: step 6: MSM-IOMMU V2 (sec-id 18) managed by TrustZone, bypassing MMIO\n");
-+	return true;
-+}
++	uint32_t ahb_cntl, status, status3, vbif_ver, int0;
++	uint32_t gfx_cbcr = reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR);
 +
-+/* Step 7: SCM Support Query */
-+static bool
-+step7_scm_check(void)
-+{
 +	uint64_t ans = 0;
-+	int32_t ret;
++	int32_t sret;
 +
-+	printf("adreno: step 7: querying TrustZone PAS_GPU support\n");
-+	ret = vince_scm_call("PAS_IS_SUPPORTED(GPU)", SCM_PAS_IS_SUPPORTED, ARGS_ONE_VALUE, PAS_GPU, 0, 0, &ans);
-+	if (ret != 0 || ans == 0) {
-+		printf("adreno: step 7: TrustZone says PAS_GPU is NOT supported (ret=%d ans=%#llx)\n", ret, ans);
++	printf("adreno: step 6: probing Adreno 506 hardware registers (GFX_CBCR=%#x, CLK_OFF=%u)\n",
++	    gfx_cbcr, (gfx_cbcr >> 31) & 1u);
++
++	/* TZ must restore the GPU's secure configuration after CX comes up, or the first access aborts */
++	sret = vince_scm_invoke("RESTORE_SEC_CFG(GPU IOMMU)", SCM_MP_RESTORE_SEC_CFG, ARGS_TWO_PLAIN,
++	    GPU_IOMMU_SEC_ID, 0, 0, &ans);
++	printf("adreno: step 6: restore_sec_cfg(%d, 0) -> ret=%d ans=%#llx\n", GPU_IOMMU_SEC_ID, sret, ans);
++	if (sret != 0) {
++		printf("adreno: step 6: TZ refused restore_sec_cfg, NOT touching GPU registers\n");
 +		return false;
 +	}
-+	printf("adreno: step 7: TrustZone PAS_GPU is SUPPORTED!\n");
-+	return true;
-+}
 +
-+/* Step 8: Zap Shader Header Signature Verification */
-+static bool
-+step8_zap_header(void)
-+{
-+	uint64_t ans = 0;
-+	vm_offset_t pa;
-+	int32_t ret;
-+
-+	/* Optionally shutdown any stale PAS state */
-+	vince_scm_call("PAS_SHUTDOWN(GPU)", SCM_PAS_SHUTDOWN, ARGS_ONE_VALUE, PAS_GPU, 0, 0, &ans);
-+
-+	printf("adreno: step 8: authenticating Zap shader header (%u bytes)\n", a506_zap_mdt_size);
-+	clean_range((vm_offset_t)&a506_zap_mdt[0], a506_zap_mdt_size);
-+	pa = kvtophys((vm_offset_t)&a506_zap_mdt[0]);
-+	printf("adreno: step 8: Zap header PA=%#lx\n", pa);
-+
-+	ans = 0;
-+	ret = vince_scm_call("PAS_INIT_IMAGE(GPU)", SCM_PAS_INIT_IMAGE, ARGS_TWO_VALUES, PAS_GPU, pa, 0, &ans);
-+	if (ret != 0) {
-+		printf("adreno: step 8: Zap header authentication FAILED (%d, ans=%#llx)\n", ret, ans);
-+		return false;
-+	}
-+	printf("adreno: step 8: Zap header authenticated successfully!\n");
-+	return true;
-+}
-+
-+/* Step 9: Zap Shader Memory Setup & Segment Load */
-+static bool
-+step9_zap_mem_setup(void)
-+{
-+	uint64_t ans = 0;
-+	int32_t ret;
-+	volatile uint8_t *dst;
-+	uint32_t i;
-+
-+	printf("adreno: step 9: setting up Zap shader memory region at PA=%#x size=%#x\n",
-+	    ZAP_SHADER_BASE_PA, ZAP_SHADER_SIZE);
-+	ret = vince_scm_call("PAS_MEM_SETUP(GPU)", SCM_PAS_MEM_SETUP, ARGS_THREE_VALUES,
-+	    PAS_GPU, ZAP_SHADER_BASE_PA, ZAP_SHADER_SIZE, &ans);
-+	if (ret != 0) {
-+		printf("adreno: step 9: PAS_MEM_SETUP FAILED (%d, ans=%#llx)\n", ret, ans);
-+		return false;
-+	}
-+	printf("adreno: step 9: PAS_MEM_SETUP SUCCESS (ret=%d, ans=%#llx)\n", ret, ans);
-+
-+	/* Map physical memory region and copy segment b02 */
-+	if (!zap_va) {
-+		zap_va = ml_io_map_wcomb(ZAP_SHADER_BASE_PA, ZAP_SHADER_SIZE);
-+		if (!zap_va) {
-+			zap_va = ml_io_map(ZAP_SHADER_BASE_PA, ZAP_SHADER_SIZE);
-+		}
-+		if (!zap_va) {
-+			printf("adreno: step 9: FAILED to map Zap shader memory\n");
-+			return false;
-+		}
-+	}
-+
-+	printf("adreno: step 9: copying Zap shader b02 segment (%u bytes) to PA=%#x (VA=%#lx)\n",
-+	    a506_zap_b02_size, ZAP_SHADER_BASE_PA, zap_va);
-+	dst = (volatile uint8_t *)zap_va;
-+	for (i = 0; i < a506_zap_b02_size; i++) {
-+		dst[i] = a506_zap_b02[i];
-+	}
-+	for (i = a506_zap_b02_size; i < ZAP_SHADER_SIZE; i++) {
-+		dst[i] = 0;
-+	}
-+
-+	clean_range(zap_va, ZAP_SHADER_SIZE);
-+	__asm__ volatile("dsb sy" ::: "memory");
-+
-+	printf("adreno: step 9: Zap shader b02 loaded and flushed to RAM\n");
-+	return true;
-+}
-+
-+/* Step 10: Authenticate & Reset GPU */
-+static bool
-+step10_zap_auth_reset(void)
-+{
-+	uint64_t ans = 0;
-+	int32_t ret;
-+
-+	/* Re-assert proxy votes and clock gates before PAS reset */
-+	reg_write(gcc_va, GCC_CRYPTO_CMD_RCGR, reg_read(gcc_va, GCC_CRYPTO_CMD_RCGR) | (1u << 1));
-+	reg_write(gcc_va, GCC_APCS_CLOCK_BRANCH_ENA_VOTE, reg_read(gcc_va, GCC_APCS_CLOCK_BRANCH_ENA_VOTE) | 0x7u);
-+	reg_write(gcc_va, GCC_CRYPTO_CBCR, reg_read(gcc_va, GCC_CRYPTO_CBCR) | 1u);
-+	reg_write(gcc_va, GCC_CRYPTO_AXI_CBCR, reg_read(gcc_va, GCC_CRYPTO_AXI_CBCR) | 1u);
-+	reg_write(gcc_va, GCC_CRYPTO_AHB_CBCR, reg_read(gcc_va, GCC_CRYPTO_AHB_CBCR) | 1u);
-+
-+	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (1u << 1));
-+	reg_write(gcc_va, GCC_OXILI_AHB_CBCR, reg_read(gcc_va, GCC_OXILI_AHB_CBCR) | 1u);
-+	reg_write(gcc_va, GCC_OXILI_GFX3D_CBCR, reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR) | 1u);
-+	reg_write(gcc_va, GCC_BIMC_GPU_CBCR, reg_read(gcc_va, GCC_BIMC_GPU_CBCR) | 1u);
-+	reg_write(gcc_va, GCC_BIMC_GFX_CBCR, reg_read(gcc_va, GCC_BIMC_GFX_CBCR) | 1u);
-+	reg_write(gcc_va, GCC_OXILI_AON_CBCR, reg_read(gcc_va, GCC_OXILI_AON_CBCR) | 1u);
-+	reg_write(gcc_va, GCC_OXILI_TIMER_CBCR, reg_read(gcc_va, GCC_OXILI_TIMER_CBCR) | 1u);
-+
-+	printf("adreno: step 10: calling PAS_AUTH_AND_RESET(GPU)\n");
-+	ret = vince_scm_call("PAS_AUTH_AND_RESET(GPU)", SCM_PAS_AUTH_AND_RESET, ARGS_ONE_VALUE, PAS_GPU, 0, 0, &ans);
-+	if (ret != 0) {
-+		printf("adreno: step 10: PAS_AUTH_AND_RESET FAILED (%d, ans=%#llx)\n", ret, ans);
-+		return false;
-+	}
-+	printf("adreno: step 10: GPU reset out of secure lock successfully!\n");
-+	return true;
-+}
-+
-+/* Step 11: Read 3D Core Registers */
-+static bool
-+step11_read_core(void)
-+{
-+	uint32_t ahb_cntl, status, status3, int_stat, ahb_cntl_after;
-+
-+	printf("adreno: step 11: reading Adreno 506 hardware registers\n");
 +	if (!gpu_va) {
 +		gpu_va = ml_io_map(GPU_CORE_BASE_PA, GPU_CORE_SIZE);
 +		if (!gpu_va) {
-+			printf("adreno: step 11: FAILED to map GPU core\n");
++			printf("adreno: step 6: FAILED to map GPU core\n");
 +			return false;
 +		}
 +	}
-+	ahb_cntl = reg_read(gpu_va, 0x024c); /* RBBM_AHB_CNTL0 */
-+	status   = reg_read(gpu_va, 0x13d4); /* RBBM_STATUS */
-+	status3  = reg_read(gpu_va, 0x14c0); /* RBBM_STATUS3 (0x530*4) */
-+	int_stat = reg_read(gpu_va, 0x00f8); /* RBBM_INT_0_STATUS */
-+	printf("adreno: step 11: RBBM_AHB_CNTL0=%#x RBBM_STATUS=%#x STATUS3=%#x INT0=%#x\n",
-+	    ahb_cntl, status, status3, int_stat);
 +
-+	/* Test write to AHB_CNTL0 */
-+	reg_write(gpu_va, 0x024c, 0x00000001u);
-+	ahb_cntl_after = reg_read(gpu_va, 0x024c);
-+	printf("adreno: step 11: RBBM_AHB_CNTL0 after write 1 = %#x\n", ahb_cntl_after);
++	/* read-only probe; the setup writes are step 7, and SECVID_TRUST_CNTL is left to the zap (step 10) */
++	ahb_cntl = reg_read(gpu_va, REG_A5XX_RBBM_AHB_CNTL0);
++	status   = reg_read(gpu_va, REG_A5XX_RBBM_STATUS);
++	status3  = reg_read(gpu_va, REG_A5XX_RBBM_STATUS3);
++	int0     = reg_read(gpu_va, REG_A5XX_RBBM_INT_0_STATUS);
++	vbif_ver = reg_read(gpu_va, REG_A5XX_VBIF_VERSION);
 +
++	printf("adreno: step 6: RBBM_AHB_CNTL0=%#x RBBM_STATUS=%#x STATUS3=%#x INT0=%#x VBIF_VER=%#x\n",
++	    ahb_cntl, status, status3, int0, vbif_ver);
++
++	printf("adreno: step 6: GPU register space readable (VBIF_VERSION should be 0x200d0000)\n");
 +	return true;
++}
++
++/* ---- GPU memory, register and ring helpers (steps 7-11) ---- */
++
++static vm_offset_t gmem_va = 0;
++static uint32_t rb_wptr = 0;
++
++static inline void
++gw(uint32_t reg, uint32_t val)
++{
++	reg_write(gpu_va, reg * 4u, val);
++}
++
++static inline uint32_t
++gr(uint32_t reg)
++{
++	return reg_read(gpu_va, reg * 4u);
++}
++
++static inline void
++gmem_w32(uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(gmem_va + off) = val;
++}
++
++static inline uint32_t
++gmem_r32(uint32_t off)
++{
++	return *(volatile uint32_t *)(gmem_va + off);
++}
++
++/* word copy: the destination is Device memory, which wants aligned accesses */
++static void
++gmem_copy(uint32_t off, const uint8_t *src, uint32_t len)
++{
++	uint32_t i, v;
++
++	for (i = 0; i < len; i += 4) {
++		v = src[i];
++		if (i + 1 < len) v |= (uint32_t)src[i + 1] << 8;
++		if (i + 2 < len) v |= (uint32_t)src[i + 2] << 16;
++		if (i + 3 < len) v |= (uint32_t)src[i + 3] << 24;
++		gmem_w32(off + i, v);
++	}
++}
++
++static uint32_t
++pm4_parity(uint32_t v)
++{
++	uint32_t x = v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28);
++
++	return (0x9669u >> (x & 0xfu)) & 1u;
++}
++
++static uint32_t
++pkt7(uint32_t op, uint32_t cnt)
++{
++	return 0x70000000u | cnt | (pm4_parity(cnt) << 15) | ((op & 0x7fu) << 16) | (pm4_parity(op) << 23);
++}
++
++static void
++rb_emit(uint32_t v)
++{
++	gmem_w32(GPU_RB_OFF + rb_wptr * 4u, v);
++	rb_wptr++;
++}
++
++/* publish WPTR and wait for the CP to consume everything (a5xx_flush + adreno_idle) */
++static bool
++rb_flush(const char *what)
++{
++	int i;
++
++	__asm__ volatile("dsb sy" ::: "memory");
++	gw(A5_CP_RB_WPTR, rb_wptr);
++	for (i = 0; i < 200; i++) {
++		if (gr(A5_CP_RB_RPTR) == rb_wptr) {
++			return true;
++		}
++		delay(1000);
++	}
++	printf("adreno: %s NOT consumed: RPTR=%u WPTR=%u RBBM_STATUS=%#x INT0=%#x CP_HW_FAULT=%#x CP_INT=%#x PROT=%#x\n",
++	    what, gr(A5_CP_RB_RPTR), rb_wptr, gr(A5_RBBM_STATUS), gr(A5_RBBM_INT_0_STATUS), gr(A5_CP_HW_FAULT),
++	    gr(A5_CP_INTERRUPT_STATUS), gr(A5_CP_PROTECT_STATUS));
++	return false;
++}
++
++static uint32_t
++protect_rw(uint32_t reg, uint32_t len)
++{
++	uint32_t lg = 0;
++
++	while ((1u << (lg + 1)) <= len) {
++		lg++;
++	}
++	return (1u << 30) | (1u << 29) | ((lg & 0x1fu) << 24) | ((reg << 2) & 0xfffffu);
++}
++
++/* Step 7: a5xx_hw_init register setup (HWCG left at its reset state) */
++static bool
++step7_hw_init(void)
++{
++	static const uint32_t prot[][2] = {
++		{ 0x04, 4 }, { 0x08, 8 }, { 0x10, 16 }, { 0x20, 32 }, { 0x40, 64 }, { 0x80, 64 },
++		{ A5_RBBM_SECVID_TSB_TRUSTED_BASE_LO, 16 }, { A5_RBBM_SECVID_TRUST_CNTL, 2 },
++		{ 0x800, 64 }, { 0x840, 8 }, { 0x880, 32 }, { 0xaa0, 1 }, { 0xcc0, 1 }, { 0xcf0, 2 },
++		{ 0xe68, 8 }, { 0xe70, 16 }, { 0xe80, 16 }, { 0x10000, 0x8000 },
++	};
++	static const uint32_t addr_mode[] = {
++		0x860, 0xbc1, 0xc81, 0xcc5, 0xd01, 0xe05, 0xe41, 0xe61, 0xe80, 0xec1, 0xf01, 0xf810,
++	};
++	const uint32_t hbb = 14 - 13;   /* qcom,highest-bank-bit = <14> */
++	uint32_t i;
++
++	printf("adreno: step 7: a5xx_hw_init registers\n");
++	gw(A5_RBBM_INT_CLEAR_CMD, 0xffffffffu);
++	gw(REG_A5XX_VBIF_ROUND_ROBIN_QOS_ARB / 4u, 3);
++	gw(A5_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffffu);
++	gw(A5_RBBM_AHB_CNTL0, 1);
++	gw(A5_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0xffffu);
++	gw(A5_RBBM_PERFCTR_CNTL, 1);
++	gw(A5_CP_PERFCTR_CP_SEL_0, 0);
++	gw(A5_RBBM_PERFCTR_RBBM_SEL_0, 6);
++	gw(A5_UCHE_CACHE_WAYS, 2);
++	gw(A5_UCHE_TRAP_BASE_LO, 0xffff0000u);          /* uche_trap_base 0x0001ffffffff0000 */
++	gw(A5_UCHE_TRAP_BASE_HI, 0x0001ffffu);
++	gw(A5_UCHE_WRITE_THRU_BASE_LO, 0xffff0000u);
++	gw(A5_UCHE_WRITE_THRU_BASE_HI, 0x0001ffffu);
++	gw(A5_UCHE_GMEM_RANGE_MIN_LO, 0x00100000u);
++	gw(A5_UCHE_GMEM_RANGE_MIN_HI, 0);
++	gw(A5_UCHE_GMEM_RANGE_MAX_LO, 0x00100000u + (128u + 8u) * 1024u - 1u);
++	gw(A5_UCHE_GMEM_RANGE_MAX_HI, 0);
++	gw(A5_CP_MEQ_THRESHOLDS, 0x20);
++	gw(A5_CP_MERCIU_SIZE, 0x400);
++	gw(A5_CP_ROQ_THRESHOLDS_2, 0x40000030u);
++	gw(A5_CP_ROQ_THRESHOLDS_1, 0x20100d0au);
++	gw(A5_PC_DBG_ECO_CNTL, (0x100u << 11) | (0x100u << 22) | (1u << 8));   /* + TWO_PASS_USE_WFI */
++	gw(A5_RB_DBG_ECO_CNTL, gr(A5_RB_DBG_ECO_CNTL) | (1u << 9));
++	gw(A5_UCHE_MODE_CNTL, 1u << 29);
++	gw(A5_CP_CHICKEN_DBG, 0x02000000u);
++	gw(A5_RBBM_AHB_CNTL1, 0xa6ffffffu);
++	gw(A5_RBBM_AHB_CNTL2, 0x3f);
++	gw(A5_TPL1_MODE_CNTL, hbb << 7);
++	gw(A5_RB_MODE_CNTL, hbb << 1);
++	gw(A5_VPC_DBG_ECO_CNTL, gr(A5_VPC_DBG_ECO_CNTL) | (1u << 10));
++	gw(A5_CP_PROTECT_CNTL, 7);
++	for (i = 0; i < sizeof(prot) / sizeof(prot[0]); i++) {
++		gw(A5_CP_PROTECT0 + i, protect_rw(prot[i][0], prot[i][1]));
++	}
++	gw(A5_RBBM_SECVID_TSB_CNTL, 0);
++	gw(A5_RBBM_SECVID_TSB_TRUSTED_BASE_LO, 0);
++	gw(A5_RBBM_SECVID_TSB_TRUSTED_BASE_HI, 0);
++	gw(A5_RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
++	for (i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
++		gw(addr_mode[i], 1);
++	}
++	gw(A5_VPC_DBG_ECO_CNTL, gr(A5_VPC_DBG_ECO_CNTL) | (1u << 23));         /* LMLOADKILL_DISABLE */
++	gw(A5_HLSQ_DBG_ECO_CNTL, gr(A5_HLSQ_DBG_ECO_CNTL) & ~(1u << 18));
++	return true;
++}
++
++/* Step 8: microcode (PM4/PFP minus their first dword) and ring buffer, then start the micro engine */
++static bool
++step8_ucode_ring(void)
++{
++	uint32_t i;
++
++	printf("adreno: step 8: loading PM4 (%u B) / PFP (%u B) and the ring at PA %#x\n",
++	    a530_pm4_fw_size, a530_pfp_fw_size, GPU_MEM_PA);
++	if (!gmem_va) {
++		gmem_va = ml_io_map(GPU_MEM_PA, GPU_MEM_SIZE);
++		if (!gmem_va) {
++			printf("adreno: step 8: FAILED to map GPU memory\n");
++			return false;
++		}
++	}
++	gmem_copy(GPU_PM4_OFF, &a530_pm4_fw[4], a530_pm4_fw_size - 4);
++	gmem_copy(GPU_PFP_OFF, &a530_pfp_fw[4], a530_pfp_fw_size - 4);
++	if (gmem_r32(GPU_PM4_OFF) != *(const uint32_t *)&a530_pm4_fw[4] ||
++	    gmem_r32(GPU_PFP_OFF) != *(const uint32_t *)&a530_pfp_fw[4]) {
++		printf("adreno: step 8: microcode readback mismatch\n");
++		return false;
++	}
++	for (i = 0; i < 0x1000u; i += 4) {
++		gmem_w32(GPU_RB_OFF + i, 0);
++	}
++	gmem_w32(GPU_SCRATCH_OFF, 0xdeaddeadu);
++	gmem_w32(GPU_SCRATCH_OFF + 4, 0xdeaddeadu);
++	rb_wptr = 0;
++
++	gw(A5_CP_ME_INSTR_BASE_LO, GPU_MEM_PA + GPU_PM4_OFF);
++	gw(A5_CP_ME_INSTR_BASE_HI, 0);
++	gw(A5_CP_PFP_INSTR_BASE_LO, GPU_MEM_PA + GPU_PFP_OFF);
++	gw(A5_CP_PFP_INSTR_BASE_HI, 0);
++	gw(A5_CP_RB_BASE, GPU_MEM_PA + GPU_RB_OFF);
++	gw(A5_CP_RB_BASE_HI, 0);
++	gw(A5_CP_RB_CNTL, 12u | (2u << 8) | 0x08000000u);   /* BUFSZ log2(32K/8), BLKSZ log2(32/8), NO_UPDATE */
++	gw(A5_CP_RB_WPTR, 0);
++	gw(A5_RBBM_INT_0_MASK, A5XX_INT_MASK);
++	__asm__ volatile("dsb sy" ::: "memory");
++	gw(A5_CP_PFP_ME_CNTL, 0);                            /* clear ME_HALT */
++	delay(10000);
++	printf("adreno: step 8: ME running, RBBM_STATUS=%#x INT0=%#x CP_HW_FAULT=%#x\n",
++	    gr(A5_RBBM_STATUS), gr(A5_RBBM_INT_0_STATUS), gr(A5_CP_HW_FAULT));
++	return true;
++}
++
++/* Step 9: CP_ME_INIT (a5xx_me_init, a506 workaround word 0xb) and the first command, a CP_MEM_WRITE */
++static bool
++step9_me_init(void)
++{
++	uint32_t got;
++
++	printf("adreno: step 9: CP_ME_INIT\n");
++	rb_emit(pkt7(CP_ME_INIT, 8));
++	rb_emit(0x2f);
++	rb_emit(0x3);
++	rb_emit(0x20000000u);
++	rb_emit(0);
++	rb_emit(0);
++	rb_emit(0xb);
++	rb_emit(0);
++	rb_emit(0);
++	if (!rb_flush("CP_ME_INIT")) {
++		return false;
++	}
++	rb_emit(pkt7(CP_MEM_WRITE, 3));
++	rb_emit(GPU_MEM_PA + GPU_SCRATCH_OFF);
++	rb_emit(0);
++	rb_emit(0xc0ffee01u);
++	if (!rb_flush("CP_MEM_WRITE")) {
++		return false;
++	}
++	delay(1000);
++	got = gmem_r32(GPU_SCRATCH_OFF);
++	printf("adreno: step 9: CP_MEM_WRITE -> %#x (%s), RPTR=%u\n", got,
++	    got == 0xc0ffee01u ? "the GPU executed its first command" : "NOT written", gr(A5_CP_RB_RPTR));
++	return got == 0xc0ffee01u;
++}
++
++/* Step 10: TZ secure page table for the GPU IOMMU, zap shader through PIL 13, then CP_SET_SECURE_MODE 0 */
++static bool
++step10_zap(void)
++{
++	uint64_t ans = 0;
++	int32_t ret;
++
++	printf("adreno: step 10: zap shader\n");
++	ret = vince_scm_invoke("IOMMU_SECURE_PTBL_SIZE", SCM_MP_PTBL_SIZE, ARGS_ONE_VALUE, 0, 0, 0, &ans);
++	printf("adreno: step 10: secure ptbl size ret=%d size=%#llx\n", ret, ans);
++	if (ret != 0 || ans == 0 || ans > GPU_SEC_PTBL_MAX) {
++		return false;
++	}
++	ret = vince_scm_invoke("IOMMU_SECURE_PTBL_INIT", SCM_MP_PTBL_INIT, ARGS_PTBL_INIT,
++	    GPU_MEM_PA + GPU_SEC_PTBL_OFF, ans, 0, NULL);
++	printf("adreno: step 10: secure ptbl init at %#x ret=%d\n", GPU_MEM_PA + GPU_SEC_PTBL_OFF, ret);
++	if (ret != 0) {
++		return false;
++	}
++
++	ret = vince_scm_invoke("PIL_IS_SUPPORTED(13)", SCM_PIL_IS_SUPPORTED, ARGS_ONE_VALUE, PAS_GPU, 0, 0, &ans);
++	if (ret != 0 || ans != 1) {
++		printf("adreno: step 10: PIL 13 not supported (ret=%d ans=%#llx)\n", ret, ans);
++		return false;
++	}
++	gmem_copy(GPU_ZAP_MDT_OFF, a506_zap_mdt, a506_zap_mdt_size);
++	ret = vince_scm_invoke("PIL_INIT_IMAGE(13)", SCM_PIL_INIT_IMAGE, ARGS_TWO_VALUES, PAS_GPU,
++	    GPU_MEM_PA + GPU_ZAP_MDT_OFF, 0, NULL);
++	printf("adreno: step 10: init_image ret=%d\n", ret);
++	if (ret != 0) {
++		return false;
++	}
++	ret = vince_scm_invoke("PIL_MEM_SETUP(13)", SCM_PIL_MEM_SETUP, ARGS_THREE_VALUES, PAS_GPU,
++	    ZAP_MEM_PA, ZAP_MEM_SIZE, NULL);
++	printf("adreno: step 10: mem_setup(%#x, %#x) ret=%d\n", ZAP_MEM_PA, ZAP_MEM_SIZE, ret);
++	if (ret != 0) {
++		return false;
++	}
++	if (!zap_va) {
++		zap_va = ml_io_map(ZAP_MEM_PA, ZAP_MEM_SIZE);
++		if (!zap_va) {
++			printf("adreno: step 10: FAILED to map the zap region\n");
++			return false;
++		}
++	}
++	{
++		/* the one PT_LOAD segment (paddr 0x5000, relocatable) goes to the start of the region */
++		const uint8_t *src = a506_zap_b02;
++		uint32_t i, v;
++
++		for (i = 0; i < a506_zap_b02_size; i += 4) {
++			v = src[i];
++			if (i + 1 < a506_zap_b02_size) v |= (uint32_t)src[i + 1] << 8;
++			if (i + 2 < a506_zap_b02_size) v |= (uint32_t)src[i + 2] << 16;
++			if (i + 3 < a506_zap_b02_size) v |= (uint32_t)src[i + 3] << 24;
++			*(volatile uint32_t *)(zap_va + i) = v;
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	ret = vince_scm_invoke("PIL_AUTH_AND_RESET(13)", SCM_PIL_AUTH_AND_RESET, ARGS_ONE_VALUE, PAS_GPU, 0, 0, &ans);
++	printf("adreno: step 10: auth_and_reset ret=%d ans=%#llx\n", ret, ans);
++	if (ret != 0) {
++		return false;
++	}
++
++	rb_emit(pkt7(CP_SET_SECURE_MODE, 1));
++	rb_emit(0);
++	if (!rb_flush("CP_SET_SECURE_MODE")) {
++		return false;
++	}
++	/* RBBM_SECVID_TRUST_CNTL is a secure register once the zap is in: a CPU read of it is an external abort */
++	printf("adreno: step 10: zap loaded, GPU out of secure mode\n");
++	return true;
++}
++
++/* Step 11: a command after leaving secure mode, and the final status */
++static bool
++step11_post_zap(void)
++{
++	uint32_t got;
++
++	rb_emit(pkt7(CP_MEM_WRITE, 3));
++	rb_emit(GPU_MEM_PA + GPU_SCRATCH_OFF + 4);
++	rb_emit(0);
++	rb_emit(0xc0ffee02u);
++	if (!rb_flush("post-zap CP_MEM_WRITE")) {
++		return false;
++	}
++	delay(1000);
++	got = gmem_r32(GPU_SCRATCH_OFF + 4);
++	printf("adreno: step 11: post-zap CP_MEM_WRITE -> %#x; RBBM_STATUS=%#x INT0=%#x RPTR=%u\n",
++	    got, gr(A5_RBBM_STATUS), gr(A5_RBBM_INT_0_STATUS), gr(A5_CP_RB_RPTR));
++	if (got == 0xc0ffee02u) {
++		printf("adreno: step 11: Adreno 506 command processor is up (ring at PA %#x)\n", GPU_MEM_PA + GPU_RB_OFF);
++	}
++	return got == 0xc0ffee02u;
 +}
 +
 +typedef bool (*step_fn)(void);
@@ -538,12 +882,12 @@ index 0000000..ed52278
 +	step3_power_cx,
 +	step4_power_gx,
 +	step5_enable_clocks,
-+	step6_smmu_status,
-+	step7_scm_check,
-+	step8_zap_header,
-+	step9_zap_mem_setup,
-+	step10_zap_auth_reset,
-+	step11_read_core,
++	step6_read_core,
++	step7_hw_init,
++	step8_ucode_ring,
++	step9_me_init,
++	step10_zap,
++	step11_post_zap,
 +};
 +
 +void
