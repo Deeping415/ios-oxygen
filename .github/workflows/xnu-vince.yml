@@ -3,15 +3,19 @@ name: xnu-msm8953
 on:
   workflow_dispatch:
     inputs:
-      macos_version:
-        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
-        default: "13.5"
       kernel_config:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
       machine_config:
         description: xnu MACHINE_CONFIG (VINCE or OXYGEN)
         default: OXYGEN
+      runner_target:
+        description: GitHub-hosted runner or a registered macOS Xcode 15 runner
+        type: choice
+        options:
+          - github-hosted
+          - self-hosted-macos
+        default: github-hosted
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -29,14 +33,15 @@ concurrency:
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
-  MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
+  # This patch set targets xnu-8796.141.3; do not expose a mismatched version input.
+  MACOS_VERSION: "13.5"
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'OXYGEN' }}
 
 jobs:
   build:
     # macos-14 ships Xcode 15.x whose iig matches the xnu-8796 IORPC ABI
-    runs-on: macos-14
+    runs-on: ${{ inputs.runner_target == 'self-hosted-macos' && fromJSON('["self-hosted", "macOS", "ARM64", "xcode15"]') || 'macos-14' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +65,12 @@ jobs:
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          if [ "${{ inputs.runner_target }}" = "self-hosted-macos" ]; then
+            XC=$(ls -d /Applications/Xcode_15*.app | sort -V | head -1)
+          else
+            XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          fi
+          test -n "$XC"
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
